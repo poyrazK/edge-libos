@@ -5,6 +5,8 @@
 //! common scaffolding so individual tests stay focused on the syscall under
 //! test.
 
+use std::path::Path;
+
 use anyhow::Result;
 use wasmtime::{Engine, Instance, Linker, Module, Store};
 
@@ -41,4 +43,10 @@ pub async fn instantiate_async(
         store.data_mut().attach_memory(mem);
     }
     Ok((store, instance))
+}
+
+/// Build a Kernel rooted at `preopen`. Use this for VFS tests that need to
+/// read/write real files on disk.
+pub fn kernel_with_preopen(preopen: impl AsRef<Path>) -> Kernel {
+    Kernel::new_with_preopen(vec![], vec![], preopen.as_ref())
 }

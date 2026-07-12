@@ -32,6 +32,7 @@ pub const ENOSPC: i64 = 28;
 pub const ESPIPE: i64 = 29;
 pub const EROFS: i64 = 30;
 pub const EPIPE: i64 = 32;
+pub const ELOOP: i64 = 40;
 pub const ERANGE: i64 = 34;
 pub const ENOSYS: i64 = 38;
 

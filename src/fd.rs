@@ -102,8 +102,7 @@ pub enum Resource {
     /// stderr — typically a `PipeWrite` preloaded by the driver.
     Stderr(PipeWrite),
     /// Opened file (Step 14).
-    #[allow(dead_code)]
-    File(std::fs::File),
+    File(crate::sys::file::FilePos),
     /// Read end of a `pipe2` (Step 15).
     #[allow(dead_code)]
     PipeRead(PipeRead),

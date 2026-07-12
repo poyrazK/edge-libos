@@ -16,6 +16,7 @@ use wasmtime::Memory;
 use crate::fd::FdTable;
 use crate::mm::LinearAllocator;
 use crate::sys::signal::SignalState;
+use crate::vfs::Vfs;
 
 #[derive(Debug)]
 pub struct ClockState {
@@ -26,6 +27,7 @@ pub struct Kernel {
     /// Linear memory reference. Attached post-instantiation.
     pub memory: Option<Memory>,
     pub fds: FdTable,
+    pub vfs: Vfs,
     pub mm: LinearAllocator,
     pub clock: ClockState,
     pub brk: u32,
@@ -41,31 +43,43 @@ pub struct Kernel {
 
 impl Kernel {
     pub fn new(args: Vec<String>, env: Vec<(String, String)>) -> Self {
-        let now = Instant::now();
-        Self {
-            memory: None,
-            fds: FdTable::with_buffered_stdio(),
-            mm: LinearAllocator::new(),
-            clock: ClockState {
-                boot_monotonic_ns: 0,
-            },
-            brk: 0,
-            args,
-            env,
-            rng: SmallRng::from_entropy(),
-            signals: SignalState::new(),
-            started_at: now,
-            exit_code: None,
-        }
+        Self::new_with_preopen(args, env, std::env::current_dir().unwrap_or_else(|_| "/".into()))
+    }
+
+    /// Build a Kernel with a specific preopen directory. The current working
+    /// directory starts at the preopen.
+    pub fn new_with_preopen(
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        preopen: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        let vfs = Vfs::new(preopen).unwrap_or_else(|_| Vfs {
+            root: "/".into(),
+            cwd: "/".into(),
+        });
+        Self::new_inner(args, env, vfs)
     }
 
     /// Construct a Kernel with no preloaded stdio. Tests that don't
     /// need guest I/O use this.
     pub fn new_without_stdio(args: Vec<String>, env: Vec<(String, String)>) -> Self {
+        let vfs = Vfs {
+            root: "/".into(),
+            cwd: "/".into(),
+        };
+        Self::new_inner(args, env, vfs)
+    }
+
+    fn new_inner(
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        vfs: Vfs,
+    ) -> Self {
         let now = Instant::now();
         Self {
             memory: None,
-            fds: FdTable::empty(),
+            fds: FdTable::with_buffered_stdio(),
+            vfs,
             mm: LinearAllocator::new(),
             clock: ClockState {
                 boot_monotonic_ns: 0,
