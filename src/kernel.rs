@@ -34,6 +34,9 @@ pub struct Kernel {
     pub rng: SmallRng,
     pub signals: SignalState,
     pub started_at: Instant,
+    /// Set by exit() / exit_group() syscalls. The host driver inspects this
+    /// after each call returns and surfaces the code in its own exit code.
+    pub exit_code: Option<i32>,
 }
 
 impl Kernel {
@@ -52,6 +55,7 @@ impl Kernel {
             rng: SmallRng::from_entropy(),
             signals: SignalState::new(),
             started_at: now,
+            exit_code: None,
         }
     }
 
