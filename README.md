@@ -7,18 +7,45 @@ sandbox, through a single async host function `(import "kernel" "syscall")`.
 The full design spec lives in [`impelementationplan`](./impelementationplan).
 This README is a build-and-run quick reference.
 
-## Status: P0 (CPython boots and prints)
+## Status: P0 complete (kernel layer)
 
-P0 DoD:
+All 24 implementation-plan steps are landed:
+
+| # | Step | Artifact |
+|---|------|----------|
+| 1-14 | Kernel + VFS | `src/{kernel,dispatch,sys,fd,vfs,mm}.rs` |
+| 15 | pipe2 | `src/sys/file.rs::pipe2` + vfs_conformance test |
+| 16 | C conformance | `tests/conformance/{syscall.h,runner.sh,21 *.c}` |
+| 17 | EFAULT fuzzer | `tests/efault_fuzz.rs` (14 tests) |
+| 18-19 | CPython guest | `guest/{syscall_shim,build.sh}` |
+| 20 | DoD #1 driver | `src/bin/edge_python.rs` + smoke tests |
+| 21 | DoD #2 examples | `examples/{print_2_plus_2,import_fastapi}.py` |
+| 22 | trace-host | `src/bin/trace_host.rs` (JSON-lines) |
+| 23 | strace baselines | `tests/strace_baselines/{strace_native.sh,diff.py,baseline.*.txt}` |
+| 24 | reproduce | `scripts/{dev_setup,reproduce_dod}.sh` |
+
+The kernel itself handles 33 syscalls; the cross-compiled CPython guest is
+the highest-risk artifact and requires `zig cc` + `git submodule` (see
+`guest/build.sh`).
+
+## P0 DoD
+
 1. `python -c "print(2+2)"` returns `4` from inside the guest.
 2. `import fastapi` succeeds from inside the guest.
+
+The DoD scripts live at `examples/print_2_plus_2.py` and
+`examples/import_fastapi.py`. The latter has a stdlib fallback (per
+user-confirmed decision #6) when fastapi's extension modules don't
+cross-compile cleanly.
 
 ## Toolchain
 
 - Rust ≥ 1.85 (pinned via `rust-toolchain.toml`)
 - `wasmtime = "=45.0.3"`, `tokio = "1.45"`
-- `zig` ≥ 0.13 (for CPython cross-compile, see `scripts/dev_setup.sh`)
+- `zig` 0.16.0 (for CPython cross-compile, see `scripts/dev_setup.sh`)
+- `wat2wasm` (wabt) for conformance .wat files
 - macOS or Linux host
+- Optional: `strace` (Linux) or `dtruss` (macOS) for native baselines
 
 ## Build
 
@@ -50,8 +77,19 @@ cargo run --release --bin edge-python -- \
 bash scripts/reproduce_dod.sh
 ```
 
-Runs in order: unit tests, conformance suite, EFAULT fuzzer, guest build, both
-DoD scripts, syscall-trace diff vs native strace goldens.
+Runs in order: dev_setup, build, full test suite, guest build (skipped if
+no submodule), DoD #1 + #2 (driver-level smoke tests if no guest), and
+syscall-trace diff vs native baselines.
+
+## Test layout
+
+- `tests/*_conformance.rs` — Rust-side per-syscall unit tests
+- `tests/conformance/` — C-side integration tests through musl libc
+- `tests/efault_fuzz.rs` — pointer-poison fuzzer across all syscalls
+- `tests/edge_python_smoke.rs` — DoD #1 driver smoke (stdout + exit code)
+- `tests/edge_python_import_smoke.rs` — DoD #2 driver smoke (realistic import mix)
+- `tests/trace_host_smoke.rs` — JSON-output contract
+- `tests/strace_baseline_diff.rs` — diff harness (auto-skips raw strace)
 
 ## Repo layout
 

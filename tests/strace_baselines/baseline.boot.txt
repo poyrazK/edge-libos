@@ -1,0 +1,55 @@
+# baseline.boot.txt — golden native trace for `python3 -c "print(2+2)"`.
+#
+# This file is a PLACEHOLDER. It lists the expected syscall NAMES (one per
+# line) that native CPython 3.13 makes when booting and evaluating
+# `print(2+2)` on Linux x86_64. The real golden trace is captured by
+# strace_native.sh on a Linux machine:
+#
+#   strace_native.sh tests/strace_baselines/baseline.boot.raw.txt -- \
+#       python3 -c "print(2+2)"
+#
+# The diff harness (diff.py) consumes either the .raw.txt (full strace
+# output) or this .boot.txt (one syscall name per line) and compares to
+# the trace-host JSON.
+#
+# Expected syscall set for `print(2+2)` on Linux x86_64:
+#   read, write, openat, close, mmap, mprotect, brk, munmap, fstat,
+#   getrandom, clock_gettime, getpid, gettid, set_tid_address,
+#   set_robust_list, rt_sigaction, rt_sigprocmask, arch_prctl, rseq,
+#   getuid, geteuid, getgid, getegid, lseek, getdents64, pipe2, fcntl,
+#   nanosleep, gettimeofday
+#
+# That set is a STRICT SUBSET of edge-libos's 33-syscall surface for P0;
+# if a baseline syscall is missing from the host trace, diff.py fails.
+# If the host trace contains syscalls the baseline doesn't have, that's
+# acceptable (edge-libos may probe extra syscalls; we log them as info).
+
+read
+write
+openat
+close
+mmap
+mprotect
+brk
+munmap
+fstat
+getrandom
+clock_gettime
+getpid
+gettid
+set_tid_address
+set_robust_list
+rt_sigaction
+rt_sigprocmask
+arch_prctl
+rseq
+getuid
+geteuid
+getgid
+getegid
+lseek
+getdents64
+pipe2
+fcntl
+nanosleep
+gettimeofday

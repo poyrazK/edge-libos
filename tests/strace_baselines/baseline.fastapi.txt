@@ -1,0 +1,51 @@
+# baseline.fastapi.txt — golden native trace for `python3 -c "import fastapi"`.
+#
+# PLACEHOLDER. Same shape as baseline.boot.txt but for the import chain
+# `import fastapi` which adds: statx (for path probing), connect (for
+# nothing in our case — no network), socket (only if fastapi tries to
+# resolve something on import; in practice no).
+#
+# The list below is a SUPERSET of baseline.boot.txt (every boot syscall
+# happens before the import completes). Syscalls present in the host
+# trace but NOT in this baseline are reported as informational, not as
+# failures — the goal is to ensure nothing in the baseline is MISSING
+# from the host (regression), not to keep the host surface minimal.
+#
+# Regenerate with:
+#   strace_native.sh tests/strace_baselines/baseline.fastapi.raw.txt -- \
+#       python3 -c "import fastapi"
+
+read
+write
+openat
+close
+mmap
+mprotect
+brk
+munmap
+fstat
+getrandom
+clock_gettime
+getpid
+gettid
+set_tid_address
+set_robust_list
+rt_sigaction
+rt_sigprocmask
+arch_prctl
+rseq
+getuid
+geteuid
+getgid
+getegid
+lseek
+getdents64
+pipe2
+fcntl
+nanosleep
+gettimeofday
+statx
+stat
+access
+faccessat
+faccessat2
