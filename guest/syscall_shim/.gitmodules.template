@@ -1,0 +1,18 @@
+; .gitmodules template — actually a real .gitmodules file is added by:
+;
+;   git submodule add https://github.com/python/cpython.git guest/cpython
+;   cd guest/cpython && git checkout v3.13.7 && git submodule update --init --recursive
+;
+; We track only this template file. To activate the submodule on a fresh
+; checkout:
+;
+;   git submodule init && git submodule update
+;
+; Until that runs, `guest/cpython/` is a populated directory by whoever
+; runs the init step. The .gitignore at the repo root excludes
+; /guest/cpython/ from git tracking.
+
+[submodule "guest/cpython"]
+	path = guest/cpython
+	url = https://github.com/python/cpython.git
+	branch = v3.13.7
