@@ -14,4 +14,5 @@ pub mod memory;
 pub mod process;
 pub mod random;
 pub mod signal;
+pub mod socket;
 pub mod time;

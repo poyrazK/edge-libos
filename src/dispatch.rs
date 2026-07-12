@@ -87,6 +87,10 @@ async fn dispatch(
         sys::file::NR_READV => sys::file::readv(&mut caller, a).await,
         sys::file::NR_WRITEV => sys::file::writev(&mut caller, a).await,
 
+        // Sockets (P1-1: socket only; bind/listen/accept/connect/recv/send
+        // land in later sub-steps).
+        sys::socket::NR_SOCKET => sys::socket::socket(&mut caller, a).await,
+
         // Identity (stubs)
         sys::identity::NR_GETUID => sys::identity::getuid(),
         sys::identity::NR_GETEUID => sys::identity::geteuid(),
@@ -149,6 +153,8 @@ pub fn syscall_name(nr: u32) -> &'static str {
         sys::file::NR_GETCWD => "getcwd",
         sys::file::NR_READV => "readv",
         sys::file::NR_WRITEV => "writev",
+
+        sys::socket::NR_SOCKET => "socket",
 
         sys::identity::NR_GETUID => "getuid",
         sys::identity::NR_GETEUID => "geteuid",

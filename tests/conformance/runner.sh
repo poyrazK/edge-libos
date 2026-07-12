@@ -58,6 +58,7 @@ expected_syscall() {
         rt_sigprocmask)    echo "rt_sigprocmask" ;;
         pipe2)             echo "pipe2" ;;
         pipe)              echo "pipe" ;;
+        socket)            echo "socket" ;;
         open)              echo "open" ;;
         stat)              echo "stat" ;;
         lstat)             echo "lstat" ;;

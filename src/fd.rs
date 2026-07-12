@@ -8,6 +8,7 @@
 //! eventually Socket/Epoll in P1).
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -93,6 +94,35 @@ pub fn make_pipe() -> (PipeRead, PipeWrite) {
     )
 }
 
+/// What kind of socket this is. P1-1 only allocates the resource; the
+/// stream-vs-datagram distinction matters once `connect`/`sendto` land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketKind {
+    Stream,
+    Datagram,
+}
+
+/// A freshly-created socket fd (P1-1). No connection state yet.
+///
+/// Future sub-steps will add fields here:
+///   P1-2: bound `SockAddr` + lazy `tokio::net::TcpListener`
+///   P1-5: connected `tokio::net::TcpStream`
+///   P1-7: `notify_read`/`notify_write` for epoll integration
+#[allow(dead_code)]
+pub struct SocketInner {
+    pub kind: SocketKind,
+    pub nonblock: AtomicBool,
+}
+
+impl SocketInner {
+    pub fn new(kind: SocketKind, nonblock: bool) -> Self {
+        Self {
+            kind,
+            nonblock: AtomicBool::new(nonblock),
+        }
+    }
+}
+
 /// A `Resource` is what's behind a fd. Variants fill in as syscalls land.
 pub enum Resource {
     /// stdin — typically a `PipeRead` preloaded by the driver.
@@ -109,6 +139,9 @@ pub enum Resource {
     /// Write end of a `pipe2` (Step 15).
     #[allow(dead_code)]
     PipeWrite(PipeWrite),
+    /// Socket fd created by `socket(2)` (P1-1).
+    #[allow(dead_code)]
+    Socket(SocketInner),
 }
 
 pub struct FdTable {

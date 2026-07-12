@@ -242,6 +242,8 @@ async fn dispatch_dispatch(
         sys::file::NR_READV => sys::file::readv(&mut caller, a).await,
         sys::file::NR_WRITEV => sys::file::writev(&mut caller, a).await,
 
+        sys::socket::NR_SOCKET => sys::socket::socket(&mut caller, a).await,
+
         sys::identity::NR_GETUID => sys::identity::getuid(),
         sys::identity::NR_GETEUID => sys::identity::geteuid(),
         sys::identity::NR_GETGID => sys::identity::getgid(),

@@ -665,6 +665,11 @@ pub async fn fcntl(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                         buf: w.buf.clone(),
                         closed: w.closed.clone(),
                     }),
+                    // P1-1: socket fds are not yet duplicable; P1-7's epoll
+                    // layer is the right place to model shared fds. For now
+                    // dup on a socket returns -EBADF (matches Linux: dup on
+                    // a socket without SO_ACCEPTCONN semantics is a no-op).
+                    Ok(Resource::Socket(_)) => return -EBADF,
                     Err(e) => return e,
                 }
             };
