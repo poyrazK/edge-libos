@@ -7,6 +7,7 @@
 //! bug (spec §8).
 
 use wasmtime::Caller;
+use wasmtime::Memory;
 
 use crate::kernel::Kernel;
 
@@ -45,6 +46,25 @@ pub fn guest_slice_mut<'a>(
     // Same Copy-handle trick: clone the `Memory` handle so the `&Kernel`
     // borrow ends before we re-borrow `caller` mutably.
     let mem = caller.data().memory()?.clone();
+    let base = mem.data_mut(caller);
+    base.get_mut(p..end).ok_or(-(crate::errno::EFAULT))
+}
+
+/// Like `guest_slice_mut`, but for callers that already cloned the `Memory`
+/// handle (e.g. when they need to access `Kernel` mutable state between
+/// snapshotting the handle and writing). The lifetime on the returned slice
+/// is tied to `caller`, not to the `Kernel` borrow.
+pub fn guest_slice_mut_via<'a>(
+    mem: &'a Memory,
+    caller: &'a mut Caller<'_, Kernel>,
+    ptr: i64,
+    len: i64,
+) -> Result<&'a mut [u8], i64> {
+    if ptr < 0 || len < 0 {
+        return Err(-(crate::errno::EFAULT));
+    }
+    let (p, l) = (ptr as usize, len as usize);
+    let end = p.checked_add(l).ok_or(-(crate::errno::EFAULT))?;
     let base = mem.data_mut(caller);
     base.get_mut(p..end).ok_or(-(crate::errno::EFAULT))
 }
