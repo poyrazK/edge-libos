@@ -24,36 +24,46 @@
 #include <stdint.h>
 
 __attribute__((import_module("kernel"), import_name("syscall")))
-long __kernel_syscall(long nr, long a1, long a2, long a3,
-                      long a4, long a5, long a6);
+int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
+                         int64_t a4, int64_t a5, int64_t a6);
 
 /* musl-style syscall wrappers. Variadic returns are not used by CPython
- * in practice; we always pass through a single long return. */
-long __syscall0(long nr) {
+ * in practice; we always pass through a single long return. Note that
+ * on wasm32 `long` is 32-bit, so we explicitly use `int64_t` everywhere
+ * to match the host's `kernel.syscall` import signature `(i64 x7) -> i64`.
+ *
+ * musl itself defines these as variadic with `long` (which is 64-bit on
+ * x86_64 native), but when cross-compiled to wasm32-musl, musl's headers
+ * redefine them via __SYSCALL_LL_E. The musl-side calls into these
+ * trampolines carry the right types via the per-architecture syscall.h.
+ */
+int64_t __syscall0(int64_t nr) {
     return __kernel_syscall(nr, 0, 0, 0, 0, 0, 0);
 }
 
-long __syscall1(long nr, long a1) {
+int64_t __syscall1(int64_t nr, int64_t a1) {
     return __kernel_syscall(nr, a1, 0, 0, 0, 0, 0);
 }
 
-long __syscall2(long nr, long a1, long a2) {
+int64_t __syscall2(int64_t nr, int64_t a1, int64_t a2) {
     return __kernel_syscall(nr, a1, a2, 0, 0, 0, 0);
 }
 
-long __syscall3(long nr, long a1, long a2, long a3) {
+int64_t __syscall3(int64_t nr, int64_t a1, int64_t a2, int64_t a3) {
     return __kernel_syscall(nr, a1, a2, a3, 0, 0, 0);
 }
 
-long __syscall4(long nr, long a1, long a2, long a3, long a4) {
+int64_t __syscall4(int64_t nr, int64_t a1, int64_t a2, int64_t a3, int64_t a4) {
     return __kernel_syscall(nr, a1, a2, a3, a4, 0, 0);
 }
 
-long __syscall5(long nr, long a1, long a2, long a3, long a4, long a5) {
+int64_t __syscall5(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
+                   int64_t a4, int64_t a5) {
     return __kernel_syscall(nr, a1, a2, a3, a4, a5, 0);
 }
 
-long __syscall6(long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
+int64_t __syscall6(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
+                   int64_t a4, int64_t a5, int64_t a6) {
     return __kernel_syscall(nr, a1, a2, a3, a4, a5, a6);
 }
 
@@ -69,8 +79,9 @@ long __syscall6(long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
  */
 struct pthread;
 
-long __syscall_cp(int (*fn)(void *), struct pthread *p, long nr,
-                  long a1, long a2, long a3, long a4, long a5, long a6) {
+int64_t __syscall_cp(int (*fn)(void *), struct pthread *p, int64_t nr,
+                     int64_t a1, int64_t a2, int64_t a3, int64_t a4,
+                     int64_t a5, int64_t a6) {
     (void)fn;
     (void)p;
     return __kernel_syscall(nr, a1, a2, a3, a4, a5, a6);

@@ -82,7 +82,7 @@ static inline void mark_fail(const char *reason) {
     mark(buf);
 }
 
-// Convenience: syscalls that take a single value.
+// Convenience wrappers for syscalls taking 1..6 args.
 static inline int64_t sc1(int64_t nr, int64_t a) {
     return __kernel_syscall(nr, a, 0, 0, 0, 0, 0);
 }
