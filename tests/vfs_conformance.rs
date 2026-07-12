@@ -164,6 +164,131 @@ const PIPE2_WAT: &str = r#"
     )
 "#;
 
+/// Legacy `pipe(fdarray)` — shim around NR_PIPE2 with flags=0.
+const PIPE_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "go") (result i64)
+        (call $syscall
+          (i64.const 22)             ;; NR_PIPE
+          (i64.const 4096)
+          (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+    )
+"#;
+
+/// Legacy `open(path, flags, mode)` — shim around NR_OPENAT(AT_FDCWD, ...).
+/// Path lives at offset 4096 in the data segment.
+const OPEN_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (data (i32.const 4096) "/file\00")
+      (func (export "go") (result i64)
+        (call $syscall
+          (i64.const 2)              ;; NR_OPEN
+          (i64.const 4096)           ;; path
+          (i64.const 0)              ;; O_RDONLY
+          (i64.const 0)              ;; mode
+          (i64.const 0) (i64.const 0) (i64.const 0)))
+    )
+"#;
+
+/// `stat(path, statbuf)` — shim around NR_NEWFSTATAT. statbuf at 8192.
+const STAT_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (data (i32.const 4096) "/file\00")
+      (func (export "go") (result i64)
+        (call $syscall
+          (i64.const 4)              ;; NR_STAT
+          (i64.const 4096)           ;; path
+          (i64.const 8192)           ;; statbuf
+          (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+    )
+"#;
+
+/// `lstat(path, statbuf)` — same shape as stat but NR 6.
+const LSTAT_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (data (i32.const 4096) "/file\00")
+      (func (export "go") (result i64)
+        (call $syscall
+          (i64.const 6)              ;; NR_LSTAT
+          (i64.const 4096)
+          (i64.const 8192)
+          (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+    )
+"#;
+
+/// `getcwd(buf, size)` — buf at 8192, size = 4096.
+const GETCWD_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "go") (param $size i64) (result i64)
+        (call $syscall
+          (i64.const 79)             ;; NR_GETCWD
+          (i64.const 8192)           ;; buf
+          (local.get $size)
+          (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+    )
+"#;
+
+/// `readv(fd, iov, iovcnt)` — iov at 4096, 2 entries pointing to 12288 and 16384.
+/// Both buffers are pre-zeroed by `(memory (data ...))`.
+const READV_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      ;; iov[0] = {base=12288, len=3}; iov[1] = {base=16384, len=3}
+      (data (i32.const 4096)
+        "\00\30\00\00"   ;; base = 12288
+        "\03\00\00\00"   ;; len  = 3
+        "\00\40\00\00"   ;; base = 16384
+        "\03\00\00\00")  ;; len  = 3
+      (func (export "go") (param $fd i64) (result i64)
+        (call $syscall
+          (i64.const 19)             ;; NR_READV
+          (local.get $fd)
+          (i64.const 4096)           ;; iov
+          (i64.const 2)              ;; iovcnt
+          (i64.const 0) (i64.const 0) (i64.const 0)))
+    )
+"#;
+
+/// `writev(stdout, iov, iovcnt)` — iov at 4096, 2 entries pointing to 12288 ("foo") and 16384 ("bar").
+const WRITEV_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (data (i32.const 4096)
+        "\00\30\00\00"
+        "\03\00\00\00"
+        "\00\40\00\00"
+        "\03\00\00\00")
+      (data (i32.const 12288) "foo")
+      (data (i32.const 16384) "bar")
+      (func (export "go") (param $fd i64) (result i64)
+        (call $syscall
+          (i64.const 20)             ;; NR_WRITEV
+          (local.get $fd)
+          (i64.const 4096)
+          (i64.const 2)
+          (i64.const 0) (i64.const 0) (i64.const 0)))
+    )
+"#;
+
 /// Helpers -----------------------------------------------------------------
 
 /// Build a WAT with a literal byte payload written at offset 4096.
@@ -530,12 +655,23 @@ fn parse_dirents(buf: &[u8]) -> Vec<String> {
 
 #[test]
 fn nr_constants_match_linux_x86_64() {
-    assert_eq!(edge_libos::sys::file::NR_OPENAT, 257);
+    assert_eq!(edge_libos::sys::file::NR_READ, 0);
+    assert_eq!(edge_libos::sys::file::NR_WRITE, 1);
+    assert_eq!(edge_libos::sys::file::NR_OPEN, 2);
     assert_eq!(edge_libos::sys::file::NR_CLOSE, 3);
-    assert_eq!(edge_libos::sys::file::NR_LSEEK, 8);
+    assert_eq!(edge_libos::sys::file::NR_STAT, 4);
     assert_eq!(edge_libos::sys::file::NR_FSTAT, 5);
+    assert_eq!(edge_libos::sys::file::NR_LSTAT, 6);
+    assert_eq!(edge_libos::sys::file::NR_LSEEK, 8);
+    assert_eq!(edge_libos::sys::file::NR_READV, 19);
+    assert_eq!(edge_libos::sys::file::NR_WRITEV, 20);
+    assert_eq!(edge_libos::sys::file::NR_PIPE, 22);
+    assert_eq!(edge_libos::sys::file::NR_FCNTL, 72);
+    assert_eq!(edge_libos::sys::file::NR_GETCWD, 79);
     assert_eq!(edge_libos::sys::file::NR_GETDENTS64, 217);
+    assert_eq!(edge_libos::sys::file::NR_NEWFSTATAT, 262);
     assert_eq!(edge_libos::sys::file::NR_PIPE2, 293);
+    assert_eq!(edge_libos::sys::file::NR_OPENAT, 257);
 }
 
 #[test]
@@ -568,5 +704,228 @@ fn pipe2_writes_pair_into_guest_array() -> Result<()> {
         "write fd should be >=3 (after stdin/stdout/stderr), got {wr_fd}"
     );
     assert_ne!(rd_fd, wr_fd, "read and write fds must differ");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Step 28: pipe (NR 22) — legacy shim over pipe2
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pipe_writes_pair_into_guest_array() -> Result<()> {
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, PIPE_WAT)?;
+
+    let (ret, rd_fd, wr_fd) = block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let inst = linker.instantiate_async(&mut store, &module).await?;
+        if let Some(mem) = inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let f = inst.get_typed_func::<(), i64>(&mut store, "go")?;
+        let r = f.call_async(&mut store, ()).await?;
+        let mem = store.data().memory().unwrap().clone();
+        let data = mem.data(&store);
+        let rd = u32::from_le_bytes(data[4096..4100].try_into().unwrap());
+        let wr = u32::from_le_bytes(data[4100..4104].try_into().unwrap());
+        Ok::<_, anyhow::Error>((r, rd, wr))
+    })?;
+    assert_eq!(ret, 0, "pipe should return 0 on success");
+    assert!(rd_fd >= 3, "read fd {rd_fd}");
+    assert!(wr_fd >= 3, "write fd {wr_fd}");
+    assert_ne!(rd_fd, wr_fd);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Step 25: open (NR 2) — legacy shim over openat
+// ---------------------------------------------------------------------------
+
+#[test]
+fn open_existing_file_returns_nonzero_fd() -> Result<()> {
+    let d = TmpDir::new();
+    std::fs::File::create(d.0.join("file")).unwrap();
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, OPEN_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, common::kernel_with_preopen(&d.0));
+        let inst = linker.instantiate_async(&mut store, &module).await?;
+        if let Some(mem) = inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let f = inst.get_typed_func::<(), i64>(&mut store, "go")?;
+        f.call_async(&mut store, ()).await
+    })?;
+    assert!(
+        ret >= 3,
+        "open() should return a new fd (>=3 after stdio), got {ret}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Step 27: stat / lstat — shims over newfstatat
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stat_existing_file_returns_zero() -> Result<()> {
+    let d = TmpDir::new();
+    std::fs::File::create(d.0.join("file")).unwrap();
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, STAT_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, common::kernel_with_preopen(&d.0));
+        let inst = linker.instantiate_async(&mut store, &module).await?;
+        if let Some(mem) = inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let f = inst.get_typed_func::<(), i64>(&mut store, "go")?;
+        f.call_async(&mut store, ()).await
+    })?;
+    assert_eq!(ret, 0, "stat() on existing file should return 0");
+    Ok(())
+}
+
+#[test]
+fn lstat_returns_zero_for_existing_file() -> Result<()> {
+    let d = TmpDir::new();
+    std::fs::File::create(d.0.join("file")).unwrap();
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, LSTAT_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, common::kernel_with_preopen(&d.0));
+        let inst = linker.instantiate_async(&mut store, &module).await?;
+        if let Some(mem) = inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let f = inst.get_typed_func::<(), i64>(&mut store, "go")?;
+        f.call_async(&mut store, ()).await
+    })?;
+    assert_eq!(ret, 0, "lstat() on existing file should return 0");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Step 26: getcwd — write cwd into guest buffer
+// ---------------------------------------------------------------------------
+
+#[test]
+fn getcwd_returns_root_path() -> Result<()> {
+    let d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, GETCWD_WAT)?;
+
+    let (ret, path_bytes) = block_on(async {
+        let mut store = edge_libos::build_store(&engine, common::kernel_with_preopen(&d.0));
+        let inst = linker.instantiate_async(&mut store, &module).await?;
+        if let Some(mem) = inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let f = inst.get_typed_func::<i64, i64>(&mut store, "go")?;
+        let r = f.call_async(&mut store, 4096_i64).await?;
+        let mem = store.data().memory().unwrap().clone();
+        let data = mem.data(&store);
+        // The kernel writes N path bytes then NUL at offset N. Walk forward
+        // from 8192 looking for the NUL terminator to find the path end.
+        let n = r as usize;
+        assert!(n <= 4096, "returned length {n} exceeds buffer");
+        let nul_pos = 8192 + n;
+        assert_eq!(data[nul_pos], 0, "kernel must NUL-terminate at byte {n}");
+        Ok::<_, anyhow::Error>((r, data[8192..nul_pos].to_vec()))
+    })?;
+    assert_eq!(ret as usize, path_bytes.len(), "returned length must match bytes written");
+    assert!(!path_bytes.is_empty(), "cwd should not be empty");
+    Ok(())
+}
+
+#[test]
+fn getcwd_truncates_returns_erange() -> Result<()> {
+    let d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, GETCWD_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, common::kernel_with_preopen(&d.0));
+        let inst = linker.instantiate_async(&mut store, &module).await?;
+        if let Some(mem) = inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        // size=4 — too small for any real path → -ERANGE.
+        let f = inst.get_typed_func::<i64, i64>(&mut store, "go")?;
+        f.call_async(&mut store, 4_i64).await
+    })?;
+    assert_eq!(ret, -edge_libos::errno::ERANGE, "tiny buf must return -ERANGE");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Step 29: readv / writev — scatter/gather I/O
+// ---------------------------------------------------------------------------
+
+#[test]
+fn readv_into_two_buffers() -> Result<()> {
+    let d = TmpDir::new();
+    std::fs::write(d.0.join("file"), b"abcdef").unwrap();
+    let (engine, linker) = common::engine_and_linker()?;
+    let readv_mod = common::compile_wat(&engine, READV_WAT)?;
+    let open_mod = common::compile_wat(&engine, OPEN_WAT)?;
+
+    let (ret, b1, b2) = block_on(async {
+        let mut store = edge_libos::build_store(&engine, common::kernel_with_preopen(&d.0));
+
+        // Instantiate open module → call → get fd.
+        let open_inst = linker.instantiate_async(&mut store, &open_mod).await?;
+        if let Some(mem) = open_inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let open_f = open_inst.get_typed_func::<(), i64>(&mut store, "go")?;
+        let fd = open_f.call_async(&mut store, ()).await?;
+
+        // Instantiate readv module → call with the fd.
+        let readv_inst = linker.instantiate_async(&mut store, &readv_mod).await?;
+        if let Some(mem) = readv_inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let f = readv_inst.get_typed_func::<i64, i64>(&mut store, "go")?;
+        let r = f.call_async(&mut store, fd).await?;
+
+        let mem = store.data().memory().unwrap().clone();
+        let data = mem.data(&store);
+        let b1 = data[12288..12291].to_vec();
+        let b2 = data[16384..16387].to_vec();
+        Ok::<_, anyhow::Error>((r, b1, b2))
+    })?;
+    assert_eq!(ret, 6, "expected 6 bytes total");
+    assert_eq!(b1, b"abc");
+    assert_eq!(b2, b"def");
+    Ok(())
+}
+
+#[test]
+fn writev_concatenates_to_stdout() -> Result<()> {
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, WRITEV_WAT)?;
+
+    let (ret, captured) = block_on(async {
+        let kernel = Kernel::new(vec![], vec![]);
+        let stdout_buf = kernel.stdout_buf();
+        let mut store = edge_libos::build_store(&engine, kernel);
+        let inst = linker.instantiate_async(&mut store, &module).await?;
+        if let Some(mem) = inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let f = inst.get_typed_func::<i64, i64>(&mut store, "go")?;
+        let r = f.call_async(&mut store, 1 /* STDOUT */).await?;
+        let bytes: Vec<u8> = match stdout_buf {
+            Some(b) => b.lock().drain(..).collect(),
+            None => Vec::new(),
+        };
+        Ok::<_, anyhow::Error>((r, bytes))
+    })?;
+    assert_eq!(ret, 6, "writev should report 6 bytes written");
+    assert_eq!(captured, b"foobar", "stdout should contain 'foobar'");
     Ok(())
 }

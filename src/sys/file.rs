@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use wasmtime::Caller;
 
-use crate::errno::{EACCES, EBADF, EFAULT, EINVAL, ESPIPE};
+use crate::errno::{EACCES, EBADF, EFAULT, EINVAL, ERANGE, ESPIPE};
 use crate::fd::Resource;
 use crate::kernel::Kernel;
 use crate::mem;
@@ -22,14 +22,21 @@ use crate::vfs::{Stat, Vfs};
 // NR_* (Linux x86-64 unistd_64.h)
 pub const NR_READ: u32 = 0;
 pub const NR_WRITE: u32 = 1;
+pub const NR_OPEN: u32 = 2;
 pub const NR_OPENAT: u32 = 257;
 pub const NR_CLOSE: u32 = 3;
+pub const NR_STAT: u32 = 4;
+pub const NR_LSTAT: u32 = 6;
 pub const NR_LSEEK: u32 = 8;
 pub const NR_FSTAT: u32 = 5;
 pub const NR_NEWFSTATAT: u32 = 262;
 pub const NR_GETDENTS64: u32 = 217;
+pub const NR_PIPE: u32 = 22;
 pub const NR_PIPE2: u32 = 293;
 pub const NR_FCNTL: u32 = 72;
+pub const NR_GETCWD: u32 = 79;
+pub const NR_READV: u32 = 19;
+pub const NR_WRITEV: u32 = 20;
 
 // open() flags (linux/fcntl.h). Keep the bare minimum CPython needs.
 pub const O_ACCMODE: i32 = 0o3;
@@ -449,6 +456,153 @@ pub async fn pipe2(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     buf[0..4].copy_from_slice(&rd_fd.to_le_bytes());
     buf[4..8].copy_from_slice(&wr_fd.to_le_bytes());
     0
+}
+
+/// `pipe(fdarray)` — legacy wrapper around `pipe2(fdarray, 0)`. musl routes
+/// the legacy `pipe(2)` syscall through `pipe2` with no flags.
+pub async fn pipe(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    pipe2(caller, [a[0], 0, 0, 0, 0, 0]).await
+}
+
+/// `open(path, flags, mode)` — legacy wrapper around
+/// `openat(AT_FDCWD, path, flags, mode)`.
+pub async fn open(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let path_ptr = a[0];
+    let flags = a[1];
+    let mode = a[2];
+    openat(caller, [-100 /*AT_FDCWD*/, path_ptr, flags, mode, 0, 0]).await
+}
+
+/// `stat(path, statbuf)` — legacy wrapper around `newfstatat(AT_FDCWD, path,
+/// statbuf, 0)`.
+pub async fn stat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let path_ptr = a[0];
+    let statbuf_ptr = a[1];
+    newfstatat(caller, [-100, path_ptr, statbuf_ptr, 0, 0, 0]).await
+}
+
+/// `lstat(path, statbuf)` — `newfstatat` with `AT_SYMLINK_NOFOLLOW = 0x100`.
+pub async fn lstat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let path_ptr = a[0];
+    let statbuf_ptr = a[1];
+    newfstatat(caller, [-100, path_ptr, statbuf_ptr, 0x100, 0, 0]).await
+}
+
+/// `getcwd(buf, size)` — write the current working directory (NUL-terminated)
+/// into the guest's `buf`. Returns the byte length excluding the NUL on
+/// success; returns `-ERANGE` if `size` is too small to fit the path + NUL;
+/// returns `-EFAULT` if `buf` doesn't fit in linear memory.
+pub async fn getcwd(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let buf_ptr = a[0];
+    let buf_len = match usize::try_from(a[1]) {
+        Ok(n) => n,
+        Err(_) => return -EFAULT,
+    };
+
+    let cwd = caller.data().vfs.cwd.clone();
+    let cwd_bytes = cwd.to_string_lossy().into_owned().into_bytes();
+    let needed = cwd_bytes.len() + 1; // +1 for trailing NUL
+    if buf_len < needed {
+        return -ERANGE;
+    }
+
+    let buf = match mem::guest_slice_mut(caller, buf_ptr, needed as i64) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    buf[..cwd_bytes.len()].copy_from_slice(&cwd_bytes);
+    buf[cwd_bytes.len()] = 0;
+    cwd_bytes.len() as i64
+}
+
+/// `readv(fd, iov, iovcnt)` — scatter read. Walks an array of
+/// `struct iovec { u32 base; u32 len; }` (8 bytes each on wasm32, per plan §3)
+/// and reads each buffer sequentially. P0 single-shot semantics: uvicorn's
+/// httptools readv pattern is two adjacent buffers which read identically
+/// via sequential `read()` calls.
+///
+/// Returns total bytes read on success; returns the partial count if a
+/// mid-vector read fails (Linux lets the caller resume).
+pub async fn readv(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let fd = a[0];
+    let iov_ptr = a[1];
+    let iov_count = match usize::try_from(a[2]) {
+        Ok(n) => n,
+        Err(_) => return -EINVAL,
+    };
+    let total_len = match (iov_count as i64).checked_mul(8) {
+        Some(n) if n >= 0 => n,
+        _ => return -EFAULT,
+    };
+    let iovs = match mem::guest_slice(caller, iov_ptr, total_len) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let entries: Vec<(i64, i64)> = iovs
+        .chunks_exact(8)
+        .map(|iov_bytes| {
+            let base = u32::from_le_bytes(iov_bytes[0..4].try_into().unwrap()) as i64;
+            let len = u32::from_le_bytes(iov_bytes[4..8].try_into().unwrap()) as i64;
+            (base, len)
+        })
+        .collect();
+    let mut total_read = 0i64;
+    for (base, len) in entries {
+        if len == 0 {
+            continue;
+        }
+        let r = read(caller, [fd, base, len, 0, 0, 0]).await;
+        if r < 0 {
+            return if total_read == 0 { r } else { total_read };
+        }
+        total_read += r;
+        if r < len {
+            break; // short read — stop, like Linux
+        }
+    }
+    total_read
+}
+
+/// `writev(fd, iov, iovcnt)` — gather write. Same `struct iovec` shape as
+/// `readv`. Chunks into separate `write()` calls; total return is the sum.
+pub async fn writev(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let fd = a[0];
+    let iov_ptr = a[1];
+    let iov_count = match usize::try_from(a[2]) {
+        Ok(n) => n,
+        Err(_) => return -EINVAL,
+    };
+    let total_len = match (iov_count as i64).checked_mul(8) {
+        Some(n) if n >= 0 => n,
+        _ => return -EFAULT,
+    };
+    let iovs = match mem::guest_slice(caller, iov_ptr, total_len) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let entries: Vec<(i64, i64)> = iovs
+        .chunks_exact(8)
+        .map(|iov_bytes| {
+            let base = u32::from_le_bytes(iov_bytes[0..4].try_into().unwrap()) as i64;
+            let len = u32::from_le_bytes(iov_bytes[4..8].try_into().unwrap()) as i64;
+            (base, len)
+        })
+        .collect();
+    let mut total_written = 0i64;
+    for (base, len) in entries {
+        if len == 0 {
+            continue;
+        }
+        let w = write(caller, [fd, base, len, 0, 0, 0]).await;
+        if w < 0 {
+            return if total_written == 0 { w } else { total_written };
+        }
+        total_written += w;
+        if w < len {
+            break; // short write — stop
+        }
+    }
+    total_written
 }
 
 /// `fcntl(fd, cmd, arg)`. Limited subset (F_GETFL/F_SETFL/F_GETFD/F_SETFD/F_DUPFD).

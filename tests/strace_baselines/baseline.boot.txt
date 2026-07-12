@@ -19,14 +19,19 @@
 #   getuid, geteuid, getgid, getegid, lseek, getdents64, pipe2, fcntl,
 #   nanosleep, gettimeofday
 #
-# That set is a STRICT SUBSET of edge-libos's 33-syscall surface for P0;
+# That set is a STRICT SUBSET of edge-libos's 40-syscall surface for P0;
 # if a baseline syscall is missing from the host trace, diff.py fails.
 # If the host trace contains syscalls the baseline doesn't have, that's
 # acceptable (edge-libos may probe extra syscalls; we log them as info).
+# Legacy glibc/musl entry points (open, stat, lstat, pipe) also appear
+# on most distros and are now handled by edge-libos.
 
 read
 write
+open
 openat
+stat
+lstat
 close
 mmap
 mprotect
@@ -49,7 +54,9 @@ getgid
 getegid
 lseek
 getdents64
+pipe
 pipe2
 fcntl
 nanosleep
 gettimeofday
+getcwd

@@ -9,13 +9,13 @@ This README is a build-and-run quick reference.
 
 ## Status: P0 complete (kernel layer)
 
-All 24 implementation-plan steps are landed:
+All 30 implementation-plan steps are landed:
 
 | # | Step | Artifact |
 |---|------|----------|
 | 1-14 | Kernel + VFS | `src/{kernel,dispatch,sys,fd,vfs,mm}.rs` |
 | 15 | pipe2 | `src/sys/file.rs::pipe2` + vfs_conformance test |
-| 16 | C conformance | `tests/conformance/{syscall.h,runner.sh,21 *.c}` |
+| 16 | C conformance | `tests/conformance/{syscall.h,runner.sh,28 *.c}` |
 | 17 | EFAULT fuzzer | `tests/efault_fuzz.rs` (14 tests) |
 | 18-19 | CPython guest | `guest/{syscall_shim,build.sh}` |
 | 20 | DoD #1 driver | `src/bin/edge_python.rs` + smoke tests |
@@ -23,8 +23,14 @@ All 24 implementation-plan steps are landed:
 | 22 | trace-host | `src/bin/trace_host.rs` (JSON-lines) |
 | 23 | strace baselines | `tests/strace_baselines/{strace_native.sh,diff.py,baseline.*.txt}` |
 | 24 | reproduce | `scripts/{dev_setup,reproduce_dod}.sh` |
+| 25 | open | `src/sys/file.rs::open` (shim over openat) |
+| 26 | getcwd | `src/sys/file.rs::getcwd` (write cwd into guest buffer) |
+| 27 | stat + lstat | `src/sys/file.rs::{stat,lstat}` (shim over newfstatat) |
+| 28 | pipe | `src/sys/file.rs::pipe` (shim over pipe2) |
+| 29 | readv + writev | `src/sys/file.rs::{readv,writev}` (scatter/gather over read/write) |
+| 30 | wire-up | strace baselines, golden range, README |
 
-The kernel itself handles 33 syscalls; the cross-compiled CPython guest is
+The kernel itself handles 40 syscalls; the cross-compiled CPython guest is
 the highest-risk artifact and requires `zig cc` + `git submodule` (see
 `guest/build.sh`).
 

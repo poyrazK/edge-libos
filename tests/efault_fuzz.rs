@@ -329,6 +329,20 @@ fn fuzz_overflow_ptr_plus_len_every_pointer_syscall() -> Result<()> {
          [0, huge, 0, 8, 0, 0]),
         (edge_libos::sys::file::NR_PIPE2, "pipe2",
          [huge, 0, 0, 0, 0, 0]),
+        (edge_libos::sys::file::NR_PIPE, "pipe",
+         [huge, 0, 0, 0, 0, 0]),
+        (edge_libos::sys::file::NR_OPEN, "open",
+         [huge, 0, 0, 0, 0, 0]),
+        (edge_libos::sys::file::NR_STAT, "stat",
+         [huge, huge, 0, 0, 0, 0]),
+        (edge_libos::sys::file::NR_LSTAT, "lstat",
+         [huge, huge, 0, 0, 0, 0]),
+        (edge_libos::sys::file::NR_GETCWD, "getcwd",
+         [huge, 256, 0, 0, 0, 0]),
+        (edge_libos::sys::file::NR_READV, "readv",
+         [1, huge, huge, 0, 0, 0]),
+        (edge_libos::sys::file::NR_WRITEV, "writev",
+         [1, huge, huge, 0, 0, 0]),
     ];
     for (nr, name, args) in cases {
         let ret = block_on(assert_efault_or_safe(

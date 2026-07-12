@@ -107,9 +107,10 @@ close(3) = 0
 
 #[test]
 fn golden_baseline_parses_to_expected_syscall_count() -> Result<()> {
-    // Sanity check on the in-repo golden file: it should parse to ~30
-    // syscalls (the P0 surface). If somebody adds or removes a syscall
-    // this number should be updated deliberately, not accidentally.
+    // Sanity check on the in-repo golden file: it should parse to ~30-50
+    // syscalls (the P0 surface, after Step 25-30 added legacy shims).
+    // If somebody adds or removes a syscall this number should be
+    // updated deliberately, not accidentally.
     let baseline_text =
         std::fs::read_to_string("tests/strace_baselines/baseline.boot.txt")?;
     let count = baseline_text
@@ -120,8 +121,8 @@ fn golden_baseline_parses_to_expected_syscall_count() -> Result<()> {
         })
         .count();
     assert!(
-        (25..=40).contains(&count),
-        "baseline.boot.txt has {count} syscalls; expected 25..=40"
+        (30..=50).contains(&count),
+        "baseline.boot.txt has {count} syscalls; expected 30..=50"
     );
     Ok(())
 }

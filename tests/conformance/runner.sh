@@ -57,6 +57,13 @@ expected_syscall() {
         rt_sigaction)      echo "rt_sigaction" ;;
         rt_sigprocmask)    echo "rt_sigprocmask" ;;
         pipe2)             echo "pipe2" ;;
+        pipe)              echo "pipe" ;;
+        open)              echo "open" ;;
+        stat)              echo "stat" ;;
+        lstat)             echo "lstat" ;;
+        getcwd)            echo "getcwd" ;;
+        readv)             echo "readv" ;;
+        writev)            echo "writev" ;;
         rseq)              echo "rseq" ;;
         arch_prctl)        echo "arch_prctl" ;;
         nanosleep)         echo "nanosleep" ;;

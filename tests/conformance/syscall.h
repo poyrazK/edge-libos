@@ -30,7 +30,14 @@ int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
 // Linux x86-64 syscall numbers. Mirrors `src/sys/*.rs`.
 #define NR_WRITE 1
 #define NR_READ 0
+#define NR_OPEN 2
+#define NR_STAT 4
+#define NR_LSTAT 6
 #define NR_OPENAT 257
+#define NR_READV 19
+#define NR_WRITEV 20
+#define NR_PIPE 22
+#define NR_GETCWD 79
 #define NR_CLOSE 3
 #define NR_LSEEK 8
 #define NR_FSTAT 5

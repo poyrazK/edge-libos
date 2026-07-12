@@ -17,7 +17,10 @@
 
 read
 write
+open
 openat
+stat
+lstat
 close
 mmap
 mprotect
@@ -40,12 +43,15 @@ getgid
 getegid
 lseek
 getdents64
+pipe
 pipe2
 fcntl
 nanosleep
 gettimeofday
+getcwd
+readv
+writev
 statx
-stat
 access
 faccessat
 faccessat2
