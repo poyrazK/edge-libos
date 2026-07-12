@@ -1,11 +1,12 @@
 //! Smoke test: load a tiny WAT module, run it, confirm our dispatch + linker
 //! wiring works end-to-end.
 //!
-//! This is Step 4 of the P0 build order. The fixture module imports
-//! `kernel.syscall` and immediately calls it with NR_WRITE + a pointer to
-//! a string constant. In P0 every syscall returns -ENOSYS, so the guest's
-//! call returns -ENOSYS, the guest stores it, and `_start` returns it as
-//! the value. The host should observe that value without panic.
+//! Step 4 of the P0 build order. The fixture module imports `kernel.syscall`
+//! and immediately calls it with NR_WRITE + a pointer to a string constant.
+//! As of Step 12 NR_WRITE is wired into the dispatch and the buffered-stdio
+//! pipe, so `_start` returns the byte count (4) instead of -ENOSYS. The
+//! companion test `dispatch_handles_a_nonexistent_syscall_number` still
+//! verifies that truly unknown numbers return -ENOSYS.
 
 mod common;
 
@@ -30,8 +31,9 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 
 /// A WAT module that:
 /// 1. Stores a 4-byte string "hi\n" in linear memory at offset 0x100.
-/// 2. Calls `kernel.syscall(NR_WRITE, 1, 0x100, 4)` — host returns -ENOSYS.
-/// 3. Returns the result as the function's return value.
+/// 2. Calls `kernel.syscall(NR_WRITE, 1, 0x100, 4)` — host writes 4 bytes
+///    into the buffered stdout pipe and returns the byte count.
+/// 3. Returns the byte count as the function's return value.
 const SMOKE_WAT: &str = r#"
     (module
       (import "kernel" "syscall"
@@ -46,7 +48,9 @@ const SMOKE_WAT: &str = r#"
 "#;
 
 #[test]
-fn dispatch_returns_enosys_for_unknown_syscall() -> Result<()> {
+fn dispatch_routes_write_to_implementation() -> Result<()> {
+    // NR_WRITE is now wired; the host must drain 4 bytes ("hi\n") into the
+    // buffered stdout pipe and return the byte count.
     let (engine, linker) = common::engine_and_linker()?;
     let module = common::compile_wat(&engine, SMOKE_WAT)?;
 
@@ -55,8 +59,8 @@ fn dispatch_returns_enosys_for_unknown_syscall() -> Result<()> {
         let start = instance.get_typed_func::<(), i64>(&mut store, "_start")?;
         let ret = start.call_async(&mut store, ()).await?;
         assert_eq!(
-            ret, -edge_libos::errno::ENOSYS,
-            "expected -ENOSYS from unimplemented NR_WRITE, got {ret}"
+            ret, 4,
+            "expected 4 bytes written from dispatched NR_WRITE, got {ret}"
         );
         assert!(store.data().memory.as_ref().is_some());
         Ok::<(), anyhow::Error>(())

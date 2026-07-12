@@ -44,7 +44,28 @@ impl Kernel {
         let now = Instant::now();
         Self {
             memory: None,
-            fds: FdTable::new(),
+            fds: FdTable::with_buffered_stdio(),
+            mm: LinearAllocator::new(),
+            clock: ClockState {
+                boot_monotonic_ns: 0,
+            },
+            brk: 0,
+            args,
+            env,
+            rng: SmallRng::from_entropy(),
+            signals: SignalState::new(),
+            started_at: now,
+            exit_code: None,
+        }
+    }
+
+    /// Construct a Kernel with no preloaded stdio. Tests that don't
+    /// need guest I/O use this.
+    pub fn new_without_stdio(args: Vec<String>, env: Vec<(String, String)>) -> Self {
+        let now = Instant::now();
+        Self {
+            memory: None,
+            fds: FdTable::empty(),
             mm: LinearAllocator::new(),
             clock: ClockState {
                 boot_monotonic_ns: 0,

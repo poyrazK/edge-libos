@@ -1,45 +1,180 @@
 //! Per-process file-descriptor table.
 //!
-//! P0 preloads 0/1/2 to host stdin/stdout/stderr. Every other fd comes from
-//! `openat` (or `pipe2` for asyncio's self-pipe).
+//! P0 covers stdin / stdout / stderr only. Each stdio fd is backed by a
+//! `BufPipe`-style buffer that lives in the kernel; tests can construct a
+//! Kernel with their own buffers, the binary driver uses the host stdio.
 //!
-//! Full implementation lands in Step 12; this is the skeleton the kernel
-//! constructor and dispatch table need.
+//! The `Resource` enum fills in as VFS lands (File, Dir, PipeRead/Write,
+//! eventually Socket/Epoll in P1).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub const AT_FDCWD: i64 = -100;
 pub const STDIN: u32 = 0;
 pub const STDOUT: u32 = 1;
 pub const STDERR: u32 = 2;
 
-/// What's behind a fd. Variants fill in as their syscalls land.
-#[allow(dead_code)]
+/// Read end of an in-kernel byte buffer. Implements `AsyncRead`.
+pub struct PipeRead {
+    pub buf: Arc<Mutex<VecDeque<u8>>>,
+    pub closed: Arc<Mutex<bool>>,
+}
+
+impl AsyncRead for PipeRead {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let mut inner = self.buf.lock();
+        if *self.closed.lock() && inner.is_empty() {
+            return std::task::Poll::Ready(Ok(())); // EOF
+        }
+        if inner.is_empty() {
+            cx.waker().wake_by_ref();
+            return std::task::Poll::Pending;
+        }
+        let n = buf.remaining().min(inner.len());
+        for dst in buf.initialize_unfilled_to(n).iter_mut() {
+            *dst = inner.pop_front().unwrap();
+        }
+        buf.advance(n);
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// Write end of an in-kernel byte buffer. Implements `AsyncWrite`.
+pub struct PipeWrite {
+    pub buf: Arc<Mutex<VecDeque<u8>>>,
+    pub closed: Arc<Mutex<bool>>,
+}
+
+impl AsyncWrite for PipeWrite {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        src: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let mut inner = self.buf.lock();
+        inner.extend(src.iter().copied());
+        std::task::Poll::Ready(Ok(src.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        *self.closed.lock() = true;
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// Construct a paired (read, write) buffer-backed pipe.
+pub fn make_pipe() -> (PipeRead, PipeWrite) {
+    let buf = Arc::new(Mutex::new(VecDeque::new()));
+    let closed = Arc::new(Mutex::new(false));
+    (
+        PipeRead {
+            buf: buf.clone(),
+            closed: closed.clone(),
+        },
+        PipeWrite { buf, closed },
+    )
+}
+
+/// A `Resource` is what's behind a fd. Variants fill in as syscalls land.
 pub enum Resource {
-    /// Placeholder for P0; the actual stdio wiring lands in Step 12.
-    StdioPlaceholder,
+    /// stdin — typically a `PipeRead` preloaded by the driver.
+    Stdin(PipeRead),
+    /// stdout — typically a `PipeWrite` preloaded by the driver.
+    Stdout(PipeWrite),
+    /// stderr — typically a `PipeWrite` preloaded by the driver.
+    Stderr(PipeWrite),
+    /// Opened file (Step 14).
+    #[allow(dead_code)]
+    File(std::fs::File),
+    /// Read end of a `pipe2` (Step 15).
+    #[allow(dead_code)]
+    PipeRead(PipeRead),
+    /// Write end of a `pipe2` (Step 15).
+    #[allow(dead_code)]
+    PipeWrite(PipeWrite),
 }
 
 pub struct FdTable {
-    #[allow(dead_code)]
     table: HashMap<u32, Resource>,
     next_fd: u32,
 }
 
 impl FdTable {
-    pub fn new() -> Self {
-        let mut table = HashMap::new();
-        table.insert(STDIN, Resource::StdioPlaceholder);
-        table.insert(STDOUT, Resource::StdioPlaceholder);
-        table.insert(STDERR, Resource::StdioPlaceholder);
+    /// Construct an empty table (no stdio preloaded). Tests use this.
+    pub fn empty() -> Self {
         Self {
-            table,
-            next_fd: STDERR + 1,
+            table: HashMap::new(),
+            next_fd: 3,
         }
     }
 
-    /// True if `fd` is currently bound. Returns `false` for unknown fds
-    /// (does not distinguish "closed" from "never opened" in v1).
+    /// Test-only: insert a resource at a specific fd.
+    #[allow(dead_code)]
+    pub fn table_mut_for_test(&mut self) -> &mut HashMap<u32, Resource> {
+        &mut self.table
+    }
+
+    /// Construct with stdin/stdout/stderr backed by buffer pipes. Tests
+    /// use this so they can inspect what the guest wrote.
+    pub fn with_buffered_stdio() -> Self {
+        let (rd, wr_out) = make_pipe();
+        let (_rd_err, wr_err) = make_pipe();
+        let mut table = HashMap::new();
+        table.insert(STDIN, Resource::Stdin(rd));
+        table.insert(STDOUT, Resource::Stdout(wr_out));
+        table.insert(STDERR, Resource::Stderr(wr_err));
+        Self {
+            table,
+            next_fd: 3,
+        }
+    }
+
+    /// Insert a resource and return its fd.
+    pub fn insert(&mut self, r: Resource) -> u32 {
+        let fd = self.next_fd;
+        self.next_fd += 1;
+        self.table.insert(fd, r);
+        fd
+    }
+
+    /// Borrow the resource behind `fd`. Returns `Err(-EBADF)` for unknown.
+    pub fn get(&self, fd: u32) -> Result<&Resource, i64> {
+        self.table.get(&fd).ok_or(-(crate::errno::EBADF))
+    }
+
+    /// Mutably borrow the resource behind `fd`.
+    pub fn get_mut(&mut self, fd: u32) -> Result<&mut Resource, i64> {
+        self.table.get_mut(&fd).ok_or(-(crate::errno::EBADF))
+    }
+
+    /// Close `fd`, returning `Err(-EBADF)` if it doesn't exist.
+    pub fn close(&mut self, fd: u32) -> Result<(), i64> {
+        if self.table.remove(&fd).is_some() {
+            Ok(())
+        } else {
+            Err(-(crate::errno::EBADF))
+        }
+    }
+
+    /// True if `fd` is currently bound.
     pub fn contains(&self, fd: u32) -> bool {
         self.table.contains_key(&fd)
     }
@@ -47,6 +182,63 @@ impl FdTable {
 
 impl Default for FdTable {
     fn default() -> Self {
-        Self::new()
+        Self::with_buffered_stdio()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_has_no_fds() {
+        let t = FdTable::empty();
+        assert!(!t.contains(STDIN));
+        assert!(!t.contains(STDOUT));
+    }
+
+    #[test]
+    fn buffered_stdio_preloads_012() {
+        let t = FdTable::with_buffered_stdio();
+        assert!(t.contains(STDIN));
+        assert!(t.contains(STDOUT));
+        assert!(t.contains(STDERR));
+    }
+
+    #[test]
+    fn insert_increments_next_fd() {
+        let mut t = FdTable::empty();
+        let (rd, wr) = make_pipe();
+        let a = t.insert(Resource::PipeRead(rd));
+        let b = t.insert(Resource::PipeWrite(wr));
+        assert_eq!(a, 3);
+        assert_eq!(b, 4);
+    }
+
+    #[test]
+    fn close_removes_fd() {
+        let mut t = FdTable::empty();
+        let (rd, _) = make_pipe();
+        let fd = t.insert(Resource::PipeRead(rd));
+        assert!(t.close(fd).is_ok());
+        assert!(!t.contains(fd));
+        assert_eq!(t.close(fd), Err(-crate::errno::EBADF));
+    }
+
+    #[test]
+    fn pipe_roundtrip() {
+        let (mut rd, mut wr) = make_pipe();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            wr.write_all(b"hello").await.unwrap();
+            wr.shutdown().await.unwrap();
+            let mut out = Vec::new();
+            rd.read_to_end(&mut out).await.unwrap();
+            assert_eq!(out, b"hello");
+        });
     }
 }
