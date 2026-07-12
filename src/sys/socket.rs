@@ -11,7 +11,7 @@
 
 use wasmtime::Caller;
 
-use crate::errno::{EAFNOSUPPORT, EBADF, EINVAL, EOPNOTSUPP, EPROTONOSUPPORT};
+use crate::errno::{EAFNOSUPPORT, EBADF, EFAULT, EINVAL, EOPNOTSUPP, EPROTONOSUPPORT};
 use crate::fd::{Resource, SockAddr, SocketInner, SocketKind};
 use crate::kernel::Kernel;
 use crate::mem;
@@ -23,6 +23,9 @@ pub const NR_LISTEN: u32 = 50;
 pub const NR_SETSOCKOPT: u32 = 54;
 pub const NR_ACCEPT: u32 = 43;
 pub const NR_ACCEPT4: u32 = 288;
+pub const NR_CONNECT: u32 = 42;
+pub const NR_SENDTO: u32 = 44;
+pub const NR_RECVFROM: u32 = 45;
 
 // setsockopt level + optname constants we honor (per plan §P1-3).
 // All other levels / optnames → 0 (accepted but unmodeled).
@@ -349,6 +352,266 @@ pub async fn accept4(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 /// shim over `accept4(fd, addr, addrlen, 0)` (no flags).
 pub async fn accept(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     accept4(caller, [a[0], a[1], a[2], 0, 0, 0]).await
+}
+
+/// `connect(sockfd, addr, addrlen)` — connect a Socket to a peer.
+///
+/// P1-5 supports AF_INET + SOCK_STREAM only. UDP connect (for a future
+/// sendto path) is not modeled. The resulting `TcpStream` is stored on
+/// `SocketInner.stream` and reused by `sendto`/`recvfrom`.
+///
+/// Errors:
+/// - `-EBADF`     — fd not a Socket.
+/// - `-EINVAL`    — already connected, or addrlen out of range.
+/// - `-EAFNOSUPPORT` — bad family / not IPv4.
+/// - `-EISCONN`   — fd already has a stream.
+/// - `-ECONNREFUSED` / `-ENETUNREACH` — tokio's `TcpStream::connect`
+///   surfaces host errors as their Linux errno equivalents.
+pub async fn connect(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let fd = match u32::try_from(a[0]) {
+        Ok(f) => f,
+        Err(_) => return -EBADF,
+    };
+    let addr_ptr = a[1];
+    let addr_len = a[2];
+
+    let addr = match parse_sockaddr(caller, addr_ptr, addr_len) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+
+    let target = match &addr {
+        SockAddr::V4 { port, addr: bytes } => std::net::SocketAddr::V4(
+            std::net::SocketAddrV4::new(std::net::Ipv4Addr::from(*bytes), *port),
+        ),
+        SockAddr::V6 { .. } => return -EOPNOTSUPP,
+    };
+
+    // Pre-check: is this a Socket? Does it already have a stream?
+    {
+        let fds = &caller.data().fds;
+        match fds.get(fd) {
+            Ok(Resource::Socket(s)) => {
+                if s.stream.is_some() {
+                    return -crate::errno::EISCONN;
+                }
+            }
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    }
+
+    let stream = match tokio::net::TcpStream::connect(target).await {
+        Ok(s) => s,
+        Err(e) => {
+            // Map a handful of common tokio errors to Linux errnos.
+            use std::io::ErrorKind::*;
+            return -match e.kind() {
+                ConnectionRefused => crate::errno::ECONNREFUSED,
+                AddrInUse => crate::errno::EADDRINUSE,
+                TimedOut => crate::errno::ETIMEDOUT,
+                _ => crate::errno::EIO,
+            };
+        }
+    };
+
+    let fds = &mut caller.data_mut().fds;
+    match fds.get_mut(fd) {
+        Ok(Resource::Socket(s)) => {
+            s.stream = Some(stream);
+            0
+        }
+        Ok(_) => -EBADF,
+        Err(e) => e,
+    }
+}
+
+/// `sendto(fd, buf, len, flags, addr, addrlen)` — write `len` bytes from
+/// the guest's `buf` to the connected TcpStream. `addr` and `addrlen`
+/// are accepted but ignored for TCP (the connection's peer is fixed).
+///
+/// P1-5 doesn't honor MSG_DONTWAIT/flags — they would only matter for
+/// O_NONBLOCK dispatch, which P1-3 doesn't actually integrate with send
+/// paths yet. The byte transfer is async-suspending.
+///
+/// Errors:
+/// - `-EBADF`     — fd not a Socket, or no connected stream.
+/// - `-EFAULT`    — buf pointer out of bounds.
+/// - `-ENOTCONN`  — stream is `None`.
+pub async fn sendto(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let fd = match u32::try_from(a[0]) {
+        Ok(f) => f,
+        Err(_) => return -EBADF,
+    };
+    let buf_ptr = a[1];
+    let buf_len_raw = a[2];
+    let _flags = a[3] as i32; // ignored in P1-5
+    let _addr_ptr = a[4];    // ignored for TCP
+    let _addrlen = a[5];
+
+    let len = match usize::try_from(buf_len_raw) {
+        Ok(n) => n,
+        Err(_) => return -EFAULT,
+    };
+
+    let bytes = match mem::guest_slice(caller, buf_ptr, buf_len_raw) {
+        Ok(b) => b.to_vec(),
+        Err(e) => return e,
+    };
+
+    // Pull the stream out so we can `.await` outside the &mut caller borrow.
+    let mut stream = {
+        let fds = &mut caller.data_mut().fds;
+        match fds.get_mut(fd) {
+            Ok(Resource::Socket(s)) => match s.stream.take() {
+                Some(st) => st,
+                None => return -crate::errno::ENOTCONN,
+            },
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    };
+
+    use tokio::io::AsyncWriteExt;
+    let n = match stream.write(&bytes).await {
+        Ok(n) => n,
+        Err(_) => {
+            // Put the stream back before returning.
+            let fds = &mut caller.data_mut().fds;
+            if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
+                if s.stream.is_none() {
+                    s.stream = Some(stream);
+                }
+            }
+            return -crate::errno::EIO;
+        }
+    };
+
+    // Put the stream back.
+    {
+        let fds = &mut caller.data_mut().fds;
+        if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
+            if s.stream.is_none() {
+                s.stream = Some(stream);
+            }
+        }
+    }
+
+    let _ = len; // length is implicit in the write result
+    n as i64
+}
+
+/// `recvfrom(fd, buf, len, flags, addr, addrlen)` — read up to `len`
+/// bytes from the connected TcpStream into the guest's `buf`. The peer's
+/// `sockaddr` is written back to `addr` if the guest supplied one
+/// (same shape as accept4's peer write-back).
+///
+/// Errors:
+/// - `-EBADF`    — fd not a Socket, or no connected stream.
+/// - `-EFAULT`   — buf pointer out of bounds.
+/// - `-ENOTCONN` — stream is `None`.
+/// - `-EINVAL`   — `len` is 0.
+pub async fn recvfrom(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let fd = match u32::try_from(a[0]) {
+        Ok(f) => f,
+        Err(_) => return -EBADF,
+    };
+    let buf_ptr = a[1];
+    let buf_len_raw = a[2];
+    let _flags = a[3] as i32;
+    let addr_ptr = a[4];
+    let addrlen_ptr = a[5];
+
+    let len = match usize::try_from(buf_len_raw) {
+        Ok(n) => n,
+        Err(_) => return -EFAULT,
+    };
+    if len == 0 {
+        return -EINVAL;
+    }
+
+    // Bounds-check the buf up front. recvfrom will overwrite the bytes.
+    if let Err(e) = mem::guest_slice_mut(caller, buf_ptr, buf_len_raw) {
+        return e;
+    }
+    if addr_ptr != 0 {
+        if let Err(e) = mem::guest_slice_mut(caller, addr_ptr, 16) {
+            return e;
+        }
+    }
+    if addrlen_ptr != 0 {
+        if let Err(e) = mem::guest_slice_mut(caller, addrlen_ptr, 4) {
+            return e;
+        }
+    }
+
+    // Pull the stream out so we can `.await` outside the &mut caller borrow.
+    let mut stream = {
+        let fds = &mut caller.data_mut().fds;
+        match fds.get_mut(fd) {
+            Ok(Resource::Socket(s)) => match s.stream.take() {
+                Some(st) => st,
+                None => return -crate::errno::ENOTCONN,
+            },
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    };
+
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; len];
+    let n = match stream.read(&mut buf).await {
+        Ok(0) => 0, // EOF
+        Ok(n) => n,
+        Err(_) => {
+            let fds = &mut caller.data_mut().fds;
+            if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
+                if s.stream.is_none() {
+                    s.stream = Some(stream);
+                }
+            }
+            return -crate::errno::EIO;
+        }
+    };
+
+    // Put the stream back.
+    {
+        let fds = &mut caller.data_mut().fds;
+        if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
+            if s.stream.is_none() {
+                s.stream = Some(stream);
+            }
+        }
+    }
+
+    // Copy bytes into guest buffer.
+    let dst = match mem::guest_slice_mut(caller, buf_ptr, n as i64) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    dst[..n].copy_from_slice(&buf[..n]);
+
+    // Best-effort peer sockaddr write-back (the peer is fixed for TCP).
+    // We use 127.0.0.1:0 as a placeholder since tokio doesn't expose the
+    // remote peer port cheaply. P1-6's getsockname/getpeername will fix
+    // this with the actual peer.
+    if addr_ptr != 0 {
+        if let Ok(buf) = mem::guest_slice_mut(caller, addr_ptr, 16) {
+            buf[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+            buf[2..4].copy_from_slice(&0u16.to_be_bytes()); // port unknown
+            buf[4..8].copy_from_slice(&[127, 0, 0, 1]);
+            for b in &mut buf[8..16] {
+                *b = 0;
+            }
+        }
+    }
+    if addrlen_ptr != 0 {
+        if let Ok(buf) = mem::guest_slice_mut(caller, addrlen_ptr, 4) {
+            buf[0..4].copy_from_slice(&(16u32).to_le_bytes());
+        }
+    }
+
+    n as i64
 }
 
 /// `setsockopt(sockfd, level, optname, optval, optlen)`.

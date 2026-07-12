@@ -685,3 +685,346 @@ fn accept4_after_host_connect_returns_valid_fd() -> Result<()> {
     })?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// P1-5: connect + sendto + recvfrom — the data path
+// ---------------------------------------------------------------------------
+
+/// `connect(fd, addr_ptr, addrlen)` — takes a pre-built sockaddr_in
+/// (assumed to already be at offset 4096 with family=AF_INET, port=0,
+/// addr=127.0.0.1).
+const CONNECT_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (data (i32.const 4096)
+        "\02\00"                   ;; family = AF_INET (2)
+        "\00\00"                   ;; port = 0
+        "\7f\00\00\01"             ;; addr = 127.0.0.1
+        "\00\00\00\00\00\00\00\00")
+      (func (export "go") (param $fd i64) (result i64)
+        (call $syscall
+          (i64.const 42)              ;; NR_CONNECT
+          (local.get $fd)
+          (i64.const 4096)            ;; addr pointer
+          (i64.const 16)              ;; addrlen
+          (i64.const 0) (i64.const 0) (i64.const 0)))
+    )
+"#;
+
+/// `sendto(fd, buf_ptr, len, flags, addr, addrlen)` — flags/addr/addrlen are
+/// unused for TCP; we accept them but ignore.
+const SENDTO_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "go") (param $fd i64) (param $len i64) (result i64)
+        (call $syscall
+          (i64.const 44)              ;; NR_SENDTO
+          (local.get $fd)
+          (i64.const 4096)            ;; buf pointer
+          (local.get $len)
+          (i64.const 0)               ;; flags
+          (i64.const 0)               ;; addr (ignored for TCP)
+          (i64.const 0)))             ;; addrlen (ignored for TCP)
+    )
+"#;
+
+/// `recvfrom(fd, buf_ptr, len, flags, addr_ptr, addrlen_ptr)` — reads up
+/// to `len` bytes; addr/addrlen written back as the peer.
+const RECVFROM_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "go") (param $fd i64) (param $len i64) (result i64)
+        (call $syscall
+          (i64.const 45)              ;; NR_RECVFROM
+          (local.get $fd)
+          (i64.const 4200)            ;; buf pointer (separate from bind's 4096)
+          (local.get $len)
+          (i64.const 0)               ;; flags
+          (i64.const 0)               ;; addr ptr (skip peer write-back)
+          (i64.const 0)))             ;; addrlen ptr (skip peer write-back)
+    )
+"#;
+
+async fn call_connect(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    module: &wasmtime::Module,
+    fd: i64,
+) -> Result<i64> {
+    let inst = linker.instantiate_async(&mut *store, module).await?;
+    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = inst.get_typed_func::<i64, i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, fd).await?)
+}
+
+async fn call_sendto(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    module: &wasmtime::Module,
+    fd: i64,
+    len: i64,
+) -> Result<i64> {
+    let inst = linker.instantiate_async(&mut *store, module).await?;
+    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = inst.get_typed_func::<(i64, i64), i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, (fd, len)).await?)
+}
+
+/// Variant of call_sendto that reuses an existing instance — needed when
+/// the test has written payload bytes into the guest memory after the
+/// instance was created (each `instantiate_async` creates a fresh memory).
+async fn call_sendto_reuse(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    instance: &wasmtime::Instance,
+    fd: i64,
+    len: i64,
+) -> Result<i64> {
+    let f = instance.get_typed_func::<(i64, i64), i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, (fd, len)).await?)
+}
+
+async fn call_recvfrom(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    module: &wasmtime::Module,
+    fd: i64,
+    len: i64,
+) -> Result<i64> {
+    let inst = linker.instantiate_async(&mut *store, module).await?;
+    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = inst.get_typed_func::<(i64, i64), i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, (fd, len)).await?)
+}
+
+/// Variant of call_recvfrom that reuses an existing instance — needed
+/// when the test wants to read the bytes back from the same memory the
+/// recvfrom wrote into.
+async fn call_recvfrom_reuse(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    instance: &wasmtime::Instance,
+    fd: i64,
+    len: i64,
+) -> Result<i64> {
+    let f = instance.get_typed_func::<(i64, i64), i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, (fd, len)).await?)
+}
+
+/// `connect` on a fd without a stream returns -ENOTCONN only after we've
+/// already established it's a Socket — but connect is a one-shot setup,
+/// so the proper negative test is: connect on a non-socket fd → -EBADF.
+#[test]
+fn connect_on_non_socket_returns_ebadf() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let conn = common::compile_wat(&engine, CONNECT_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        call_connect(&linker, &mut store, &conn, 0 /*stdin*/).await
+    })?;
+    assert_eq!(ret, -edge_libos::errno::EBADF);
+    Ok(())
+}
+
+/// `connect` to a closed port returns -ECONNREFUSED.
+#[test]
+fn connect_to_closed_port_returns_ECONNREFUSED() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let sock = common::compile_wat(&engine, SOCKET_WAT)?;
+    let conn = common::compile_wat(&engine, CONNECT_WAT)?;
+
+    // Build a custom CONNECT_WAT that uses port 1 (privileged, almost
+    // certainly closed) on 127.0.0.1. The bound BIND_WAT uses port 8080 —
+    // we need a new WAT for connect.
+    let conn_port1_wat = r#"
+        (module
+          (import "kernel" "syscall"
+            (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+          (memory (export "memory") 1)
+          (data (i32.const 4096)
+            "\02\00"                   ;; family = AF_INET (2)
+            "\00\01"                   ;; port = 1 (BE)
+            "\7f\00\00\01"             ;; addr = 127.0.0.1
+            "\00\00\00\00\00\00\00\00")
+          (func (export "go") (param $fd i64) (result i64)
+            (call $syscall
+              (i64.const 42)
+              (local.get $fd)
+              (i64.const 4096)
+              (i64.const 16)
+              (i64.const 0) (i64.const 0) (i64.const 0))))
+    "#;
+    let conn_p1 = common::compile_wat(&engine, conn_port1_wat)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let fd = call_socket(&linker, &mut store, &sock, 2, 1).await?;
+        // Note: this could also hit -EADDRNOTAVAIL on some systems, or
+        // -ETIMEDOUT if the firewall drops. We accept any of the three.
+        call_connect(&linker, &mut store, &conn_p1, fd).await
+    })?;
+    let _ = conn; // silence unused-warning
+    assert!(
+        ret == -edge_libos::errno::ECONNREFUSED
+            || ret == -edge_libos::errno::ETIMEDOUT
+            || ret == -edge_libos::errno::EIO,
+        "expected ECONNREFUSED/ETIMEDOUT/EIO, got {ret}"
+    );
+    Ok(())
+}
+
+/// End-to-end data path: kernel listen → kernel accept → host connect →
+/// host writes "hello" → kernel recvfrom returns 5 → kernel sendto
+/// "world" → host reads "world". This is the canonical P1-5 DoD test.
+#[test]
+fn sendto_then_recvfrom_roundtrips_over_loopback() -> Result<()> {
+    let _d = TmpDir::new();
+
+    // Open a host listener for an ephemeral port.
+    let host_listener_std = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind host listener");
+    let port = host_listener_std.local_addr().unwrap().port();
+    drop(host_listener_std);
+
+    let (engine, linker) = common::engine_and_linker()?;
+    let sock = common::compile_wat(&engine, SOCKET_WAT)?;
+    let bind = common::compile_wat(&engine, BIND_WAT)?;
+    let listen = common::compile_wat(&engine, LISTEN_WAT)?;
+    let acc = common::compile_wat(&engine, ACCEPT4_WAT)?;
+    let sendto = common::compile_wat(&engine, SENDTO_WAT)?;
+    let recvfrom = common::compile_wat(&engine, RECVFROM_WAT)?;
+    let close = common::compile_wat(&engine, CLOSE_WAT)?;
+
+    // Build a bind WAT for the specific port.
+    let port_be = port.to_be_bytes();
+    let bind_wat = format!(r#"
+        (module
+          (import "kernel" "syscall"
+            (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+          (memory (export "memory") 1)
+          (data (i32.const 4096)
+            "\02\00PATCH_PORT\7f\00\00\01"
+            "\00\00\00\00\00\00\00\00")
+          (func (export "go") (param $fd i64) (result i64)
+            (call $syscall
+              (i64.const 49)
+              (local.get $fd)
+              (i64.const 4096)
+              (i64.const 16)
+              (i64.const 0) (i64.const 0) (i64.const 0))))
+    "#);
+    let bind_wat = bind_wat.replace(
+        "PATCH_PORT",
+        &format!("\\{:02x}\\{:02x}", port_be[0], port_be[1]),
+    );
+    let bind_for_port = common::compile_wat(&engine, &bind_wat)?;
+
+    block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+
+        // Guest: socket + bind + listen.
+        let fd = call_socket(&linker, &mut store, &sock, 2, 1).await?;
+        assert!(call_bind(&linker, &mut store, &bind_for_port, fd).await? == 0);
+        assert!(call_listen(&linker, &mut store, &listen, fd, 1).await? == 0);
+
+        // Race: spawn host connect and the guest accept4 concurrently.
+        // The lazy TcpListener::bind inside accept4 will run first (it's
+        // synchronous up until the .await on accept), so by the time the
+        // host connect retries, the listener exists.
+        let connect_fut = async move {
+            // Brief delay to let the kernel listener come up; we'll
+            // retry a few times if the host connect gets a fast ECONNREFUSED.
+            for _ in 0..20 {
+                match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                    Ok(s) => return Ok(s),
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                }
+            }
+            Err(anyhow::anyhow!("host connect never succeeded"))
+        };
+        let accept_fut = call_accept4(&linker, &mut store, &acc, fd, 0);
+
+        let (host_res, accepted_res) = tokio::join!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), connect_fut),
+            tokio::time::timeout(std::time::Duration::from_secs(3), accept_fut),
+        );
+        let host_stream = host_res
+            .map_err(|_| anyhow::anyhow!("host connect timed out"))?
+            .map_err(|e| anyhow::anyhow!("host connect failed: {e}"))?;
+        let accepted = accepted_res
+            .map_err(|_| anyhow::anyhow!("guest accept4 timed out"))??;
+        assert!(accepted >= 3, "accept4 returned {accepted}");
+
+        let (mut host_rd, mut host_wr) = host_stream.into_split();
+
+        // Host writes "hello".
+        use tokio::io::AsyncWriteExt;
+        host_wr.write_all(b"hello").await?;
+
+        // Guest recvfrom returns 5. We instantiate the recvfrom module
+        // once and reuse it so the guest memory persists for the assertion
+        // read-back below (each fresh instantiation gets a new memory).
+        let recv_inst = linker.instantiate_async(&mut store, &recvfrom).await?;
+        if let Some(mem) = recv_inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            call_recvfrom_reuse(&linker, &mut store, &recv_inst, accepted, 16),
+        ).await
+            .map_err(|_| anyhow::anyhow!("recvfrom timed out"))??;
+        assert_eq!(n, 5, "recvfrom should return 5 bytes for 'hello'");
+
+        // Read the bytes back from the same memory (recv_inst's memory).
+        let mem = store.data().memory.ok_or_else(|| anyhow::anyhow!("no memory"))?;
+        let mut got = [0u8; 5];
+        mem.read(&mut store, 4200, &mut got)?;
+        assert_eq!(&got, b"hello", "guest buffer should contain 'hello'");
+
+        // Guest sendto "world" — instantiate sendto module, write payload
+        // into its memory at offset 4096, then call go.
+        let send_inst = linker.instantiate_async(&mut store, &sendto).await?;
+        if let Some(mem) = send_inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let mem = store.data().memory.ok_or_else(|| anyhow::anyhow!("no memory"))?;
+        let to_send = b"world";
+        mem.write(&mut store, 4096, to_send)?;
+        let sent = call_sendto_reuse(&linker, &mut store, &send_inst, accepted, 5).await?;
+        assert_eq!(sent, 5, "sendto should write 5 bytes");
+
+        // Give tokio a moment to flush the bytes through the kernel stream.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Host reads "world".
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 5];
+        let _n = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            host_rd.read_exact(&mut buf),
+        ).await
+            .map_err(|_| anyhow::anyhow!("host read timed out"))??;
+        assert_eq!(&buf, b"world", "host peer should receive 'world'");
+
+        // Clean up.
+        let _ = call_close(&linker, &mut store, &close, accepted).await?;
+        let _ = call_close(&linker, &mut store, &close, fd).await?;
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(())
+}

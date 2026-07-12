@@ -94,6 +94,9 @@ async fn dispatch(
         sys::socket::NR_LISTEN => sys::socket::listen(&mut caller, a).await,
         sys::socket::NR_ACCEPT => sys::socket::accept(&mut caller, a).await,
         sys::socket::NR_ACCEPT4 => sys::socket::accept4(&mut caller, a).await,
+        sys::socket::NR_CONNECT => sys::socket::connect(&mut caller, a).await,
+        sys::socket::NR_SENDTO => sys::socket::sendto(&mut caller, a).await,
+        sys::socket::NR_RECVFROM => sys::socket::recvfrom(&mut caller, a).await,
         sys::socket::NR_SETSOCKOPT => sys::socket::setsockopt(&mut caller, a).await,
 
         // Identity (stubs)
@@ -164,6 +167,9 @@ pub fn syscall_name(nr: u32) -> &'static str {
         sys::socket::NR_LISTEN => "listen",
         sys::socket::NR_ACCEPT => "accept",
         sys::socket::NR_ACCEPT4 => "accept4",
+        sys::socket::NR_CONNECT => "connect",
+        sys::socket::NR_SENDTO => "sendto",
+        sys::socket::NR_RECVFROM => "recvfrom",
         sys::socket::NR_SETSOCKOPT => "setsockopt",
 
         sys::identity::NR_GETUID => "getuid",

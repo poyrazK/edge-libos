@@ -40,6 +40,10 @@ pub const EOPNOTSUPP: i64 = 95;
 pub const EAFNOSUPPORT: i64 = 97;
 pub const EPROTONOSUPPORT: i64 = 93;
 pub const EADDRINUSE: i64 = 98;
+pub const ENOTCONN: i64 = 107;
+pub const ETIMEDOUT: i64 = 110;
+pub const ECONNREFUSED: i64 = 111;
+pub const EISCONN: i64 = 106;
 
 /// Return a host-style "negative errno" from a positive errno value.
 #[inline]

@@ -247,6 +247,9 @@ async fn dispatch_dispatch(
         sys::socket::NR_LISTEN => sys::socket::listen(&mut caller, a).await,
         sys::socket::NR_ACCEPT => sys::socket::accept(&mut caller, a).await,
         sys::socket::NR_ACCEPT4 => sys::socket::accept4(&mut caller, a).await,
+        sys::socket::NR_CONNECT => sys::socket::connect(&mut caller, a).await,
+        sys::socket::NR_SENDTO => sys::socket::sendto(&mut caller, a).await,
+        sys::socket::NR_RECVFROM => sys::socket::recvfrom(&mut caller, a).await,
         sys::socket::NR_SETSOCKOPT => sys::socket::setsockopt(&mut caller, a).await,
 
         sys::identity::NR_GETUID => sys::identity::getuid(),
