@@ -289,6 +289,26 @@ const WRITEV_WAT: &str = r#"
     )
 "#;
 
+/// `readv(fd, iov, 1)` with a single zero-length iov entry → returns 0.
+const READV_ZERO_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      ;; iov[0] = {base=12288, len=0}
+      (data (i32.const 4096)
+        "\00\30\00\00"   ;; base = 12288
+        "\00\00\00\00")  ;; len  = 0
+      (func (export "go") (param $fd i64) (result i64)
+        (call $syscall
+          (i64.const 19)             ;; NR_READV
+          (local.get $fd)
+          (i64.const 4096)           ;; iov
+          (i64.const 1)              ;; iovcnt
+          (i64.const 0) (i64.const 0) (i64.const 0)))
+    )
+"#;
+
 /// Helpers -----------------------------------------------------------------
 
 /// Build a WAT with a literal byte payload written at offset 4096.
@@ -927,5 +947,231 @@ fn writev_concatenates_to_stdout() -> Result<()> {
     })?;
     assert_eq!(ret, 6, "writev should report 6 bytes written");
     assert_eq!(captured, b"foobar", "stdout should contain 'foobar'");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Step 25-30 PR review gaps: negative-path tests
+// ---------------------------------------------------------------------------
+
+/// `stat("/file")` on a missing file → -ENOENT. STAT_WAT hardcodes
+/// `/file\00` at offset 4096; we simply don't create the file.
+#[test]
+fn stat_existing_missing_file_returns_enoent() -> Result<()> {
+    let d = TmpDir::new();
+    // No File::create — `/file` does not exist.
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, STAT_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, common::kernel_with_preopen(&d.0));
+        let inst = linker.instantiate_async(&mut store, &module).await?;
+        if let Some(mem) = inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let f = inst.get_typed_func::<(), i64>(&mut store, "go")?;
+        f.call_async(&mut store, ()).await
+    })?;
+    assert_eq!(ret, -edge_libos::errno::ENOENT, "stat() on missing file should return -ENOENT");
+    Ok(())
+}
+
+/// `lstat("/file")` on a missing file → -ENOENT.
+#[test]
+fn lstat_existing_missing_file_returns_enoent() -> Result<()> {
+    let d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, LSTAT_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, common::kernel_with_preopen(&d.0));
+        let inst = linker.instantiate_async(&mut store, &module).await?;
+        if let Some(mem) = inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let f = inst.get_typed_func::<(), i64>(&mut store, "go")?;
+        f.call_async(&mut store, ()).await
+    })?;
+    assert_eq!(ret, -edge_libos::errno::ENOENT, "lstat() on missing file should return -ENOENT");
+    Ok(())
+}
+
+/// `readv` short read: file has 2 bytes, iovec requests 6. Should return 2
+/// (the first read consumes everything, second loop iteration breaks on `r < len`).
+#[test]
+fn readv_short_read() -> Result<()> {
+    let d = TmpDir::new();
+    std::fs::write(d.0.join("file"), b"ab").unwrap(); // only 2 bytes
+    let (engine, linker) = common::engine_and_linker()?;
+    let readv_mod = common::compile_wat(&engine, READV_WAT)?;
+    let open_mod = common::compile_wat(&engine, OPEN_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, common::kernel_with_preopen(&d.0));
+        let open_inst = linker.instantiate_async(&mut store, &open_mod).await?;
+        if let Some(mem) = open_inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let open_f = open_inst.get_typed_func::<(), i64>(&mut store, "go")?;
+        let fd = open_f.call_async(&mut store, ()).await?;
+
+        let readv_inst = linker.instantiate_async(&mut store, &readv_mod).await?;
+        if let Some(mem) = readv_inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let f = readv_inst.get_typed_func::<i64, i64>(&mut store, "go")?;
+        f.call_async(&mut store, fd).await
+    })?;
+    assert_eq!(ret, 2, "readv into 6-byte iov from 2-byte file should return 2");
+    Ok(())
+}
+
+/// `readv` with a single zero-length iovec entry → returns 0 (the kernel
+/// skips `len == 0` entries without calling `read`).
+#[test]
+fn readv_zero_length_iov_skipped() -> Result<()> {
+    let d = TmpDir::new();
+    std::fs::write(d.0.join("file"), b"abc").unwrap();
+    let (engine, linker) = common::engine_and_linker()?;
+    let readv_mod = common::compile_wat(&engine, READV_ZERO_WAT)?;
+    let open_mod = common::compile_wat(&engine, OPEN_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, common::kernel_with_preopen(&d.0));
+        let open_inst = linker.instantiate_async(&mut store, &open_mod).await?;
+        if let Some(mem) = open_inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let open_f = open_inst.get_typed_func::<(), i64>(&mut store, "go")?;
+        let fd = open_f.call_async(&mut store, ()).await?;
+
+        let readv_inst = linker.instantiate_async(&mut store, &readv_mod).await?;
+        if let Some(mem) = readv_inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let f = readv_inst.get_typed_func::<i64, i64>(&mut store, "go")?;
+        f.call_async(&mut store, fd).await
+    })?;
+    assert_eq!(ret, 0, "readv with single zero-length iov should return 0");
+    Ok(())
+}
+
+/// `getcwd` exact-fit boundary: `size == cwd.len()+1` succeeds (room for path + NUL).
+/// Two-call pattern: probe with a generous size to learn path length, then re-invoke
+/// on the same store so cwd is stable.
+#[test]
+fn getcwd_exact_size_returns_path() -> Result<()> {
+    let d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, GETCWD_WAT)?;
+
+    let (probe, exact_fit) = block_on(async {
+        let mut store = edge_libos::build_store(&engine, common::kernel_with_preopen(&d.0));
+        let inst = linker.instantiate_async(&mut store, &module).await?;
+        if let Some(mem) = inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let f = inst.get_typed_func::<i64, i64>(&mut store, "go")?;
+        let r1 = f.call_async(&mut store, 4096_i64).await?;
+        assert!(r1 > 0, "first call must succeed, got {r1}");
+        // Re-invoke with exactly path_len + 1 (room for path + NUL).
+        let r2 = f.call_async(&mut store, r1 + 1).await?;
+        Ok::<_, anyhow::Error>((r1, r2))
+    })?;
+    assert!(probe > 0, "probe must return positive length, got {probe}");
+    assert_eq!(exact_fit, probe, "exact-fit getcwd must return the same path length as probe");
+    Ok(())
+}
+
+/// `getcwd` one-byte-short boundary: `size == cwd.len()` returns -ERANGE (no room
+/// for the trailing NUL). Same two-call pattern as `getcwd_exact_size_returns_path`.
+#[test]
+fn getcwd_one_byte_short_returns_erange() -> Result<()> {
+    let d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, GETCWD_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, common::kernel_with_preopen(&d.0));
+        let inst = linker.instantiate_async(&mut store, &module).await?;
+        if let Some(mem) = inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let f = inst.get_typed_func::<i64, i64>(&mut store, "go")?;
+        let r1 = f.call_async(&mut store, 4096_i64).await?;
+        assert!(r1 > 0, "probe must succeed, got {r1}");
+        // One byte short — no room for the trailing NUL.
+        f.call_async(&mut store, r1).await
+    })?;
+    assert_eq!(ret, -edge_libos::errno::ERANGE,
+        "size == cwd.len() must return -ERANGE (no room for NUL)");
+    Ok(())
+}
+
+/// `stat("")` returns -ENOENT (matches Linux; without AT_EMPTY_PATH flag,
+/// the empty path is treated as "no such file"). Uses an inline WAT that
+/// places a single NUL byte at offset 4096.
+#[test]
+fn stat_empty_path_returns_enoent() -> Result<()> {
+    let d = TmpDir::new();
+    let wat = r#"
+        (module
+          (import "kernel" "syscall"
+            (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+          (memory (export "memory") 1)
+          (data (i32.const 4096) "\00")
+          (func (export "go") (result i64)
+            (call $syscall
+              (i64.const 4)              ;; NR_STAT
+              (i64.const 4096)           ;; empty path
+              (i64.const 8192)           ;; statbuf
+              (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0))))
+    "#;
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, wat)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, common::kernel_with_preopen(&d.0));
+        let inst = linker.instantiate_async(&mut store, &module).await?;
+        if let Some(mem) = inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let f = inst.get_typed_func::<(), i64>(&mut store, "go")?;
+        f.call_async(&mut store, ()).await
+    })?;
+    assert_eq!(ret, -edge_libos::errno::ENOENT, "stat(\"\") should return -ENOENT");
+    Ok(())
+}
+
+/// `lstat("")` returns -ENOENT. Same reasoning as stat_empty_path.
+#[test]
+fn lstat_empty_path_returns_enoent() -> Result<()> {
+    let d = TmpDir::new();
+    let wat = r#"
+        (module
+          (import "kernel" "syscall"
+            (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+          (memory (export "memory") 1)
+          (data (i32.const 4096) "\00")
+          (func (export "go") (result i64)
+            (call $syscall
+              (i64.const 6)              ;; NR_LSTAT
+              (i64.const 4096)           ;; empty path
+              (i64.const 8192)           ;; statbuf
+              (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0))))
+    "#;
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, wat)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, common::kernel_with_preopen(&d.0));
+        let inst = linker.instantiate_async(&mut store, &module).await?;
+        if let Some(mem) = inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let f = inst.get_typed_func::<(), i64>(&mut store, "go")?;
+        f.call_async(&mut store, ()).await
+    })?;
+    assert_eq!(ret, -edge_libos::errno::ENOENT, "lstat(\"\") should return -ENOENT");
     Ok(())
 }

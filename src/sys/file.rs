@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use wasmtime::Caller;
 
-use crate::errno::{EACCES, EBADF, EFAULT, EINVAL, ERANGE, ESPIPE};
+use crate::errno::{EACCES, EBADF, EFAULT, EINVAL, ENOENT, ERANGE, ESPIPE};
 use crate::fd::Resource;
 use crate::kernel::Kernel;
 use crate::mem;
@@ -348,6 +348,11 @@ pub async fn newfstatat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         return fstat(caller, [dirfd, statbuf_ptr, 0, 0, 0, 0]).await;
     }
 
+    // Empty path without AT_EMPTY_PATH → -ENOENT (matches Linux).
+    if path.is_empty() {
+        return -ENOENT;
+    }
+
     let (root, cwd) = {
         let kern = caller.data();
         (kern.vfs.root.clone(), kern.vfs.cwd.clone())
@@ -474,7 +479,8 @@ pub async fn open(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 }
 
 /// `stat(path, statbuf)` — legacy wrapper around `newfstatat(AT_FDCWD, path,
-/// statbuf, 0)`.
+/// statbuf, 0)`. Returns `-ENOENT` if `path` is empty (matches Linux: an
+/// empty path requires `AT_EMPTY_PATH` to refer to the cwd).
 pub async fn stat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let path_ptr = a[0];
     let statbuf_ptr = a[1];
@@ -482,6 +488,7 @@ pub async fn stat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 }
 
 /// `lstat(path, statbuf)` — `newfstatat` with `AT_SYMLINK_NOFOLLOW = 0x100`.
+/// Returns `-ENOENT` if `path` is empty (matches Linux).
 pub async fn lstat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let path_ptr = a[0];
     let statbuf_ptr = a[1];

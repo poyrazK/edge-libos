@@ -3,6 +3,8 @@
 #include "syscall.h"
 #include <stdint.h>
 
+// zig cc targeting wasm32-freestanding does not expose <fcntl.h>; locally
+// define the O_* flags we need (same convention as openat_close.c).
 #ifndef O_WRONLY
 #define O_WRONLY 1
 #endif
