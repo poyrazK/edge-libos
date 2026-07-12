@@ -185,8 +185,13 @@ async fn run_guest(wasm_path: &str, _script_args: &[String]) -> Result<Vec<Trace
     if let Some(mem) = instance.get_memory(&mut store, "memory") {
         store.data_mut().attach_memory(mem);
     }
-    if let Ok(start) = instance.get_typed_func::<(), i32>(&mut store, "_start") {
-        let _ = start.call_async(&mut store, ()).await; // exit traps
+    // Try multiple `_start` signatures. zig cc emits `() -> void` (no
+    // return). Emscripten emits `() -> i32`. CPython's `_start` (when
+    // landed via Step 19-20) emits `() -> void`.
+    if let Ok(start) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+        let _ = start.call_async(&mut store, ()).await; // exit may trap
+    } else if let Ok(start) = instance.get_typed_func::<(), i32>(&mut store, "_start") {
+        let _ = start.call_async(&mut store, ()).await;
     }
 
     let entries = TRACE.with(|t| t.borrow().clone());
