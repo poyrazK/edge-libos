@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 
+use edge_libos::fd::Resource;
 use edge_libos::Kernel;
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
@@ -98,6 +99,35 @@ async fn call_close(
     }
     let f = inst.get_typed_func::<i64, i64>(&mut *store, "go")?;
     Ok(f.call_async(&mut *store, fd).await?)
+}
+
+async fn call_bind(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    module: &wasmtime::Module,
+    fd: i64,
+) -> Result<i64> {
+    let inst = linker.instantiate_async(&mut *store, module).await?;
+    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = inst.get_typed_func::<i64, i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, fd).await?)
+}
+
+async fn call_listen(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    module: &wasmtime::Module,
+    fd: i64,
+    backlog: i64,
+) -> Result<i64> {
+    let inst = linker.instantiate_async(&mut *store, module).await?;
+    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = inst.get_typed_func::<(i64, i64), i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, (fd, backlog)).await?)
 }
 
 // Tests ---------------------------------------------------------------------
@@ -260,5 +290,184 @@ fn socket_then_close_removes_fd() -> Result<()> {
         assert_eq!(fd2, fd, "second socket should reuse the freed fd slot");
         Ok::<_, anyhow::Error>(())
     })?;
+    Ok(())
+}
+// ---------------------------------------------------------------------------
+// P1-2: bind(2) + listen(2)
+// ---------------------------------------------------------------------------
+
+// sockaddr_in layout: u16 family | u16 port (BE) | u32 addr (BE) | u8 pad[8].
+// We place one at offset 4096 for bind WATs.
+
+/// `bind(fd, addr@4096, 16)` — uses a hardcoded INET sockaddr with
+/// family=AF_INET(2), port=8080 (BE), addr=127.0.0.1.
+const BIND_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      ;; struct sockaddr_in at offset 4096 (16 bytes):
+      ;; 4096: sin_family = 2 (AF_INET)
+      ;; 4098: sin_port = 8080 BE
+      ;; 4100: sin_addr = 127.0.0.1
+      ;; 4104: pad[8] = 0
+      (data (i32.const 4096)
+        "\02\00"            ;; family = AF_INET (2)
+        "\1f\90"            ;; port = 8080 BE
+        "\7f\00\00\01"      ;; addr = 127.0.0.1
+        "\00\00\00\00\00\00\00\00")
+      (func (export "go") (param $fd i64) (result i64)
+        (call $syscall
+          (i64.const 49)             ;; NR_BIND
+          (local.get $fd)
+          (i64.const 4096)           ;; addr pointer
+          (i64.const 16)             ;; addrlen
+          (i64.const 0) (i64.const 0) (i64.const 0)))
+    )
+"#;
+
+/// `listen(fd, backlog)` — no pointer args.
+const LISTEN_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "go") (param $fd i64) (param $backlog i64) (result i64)
+        (call $syscall
+          (i64.const 50)             ;; NR_LISTEN
+          (local.get $fd)
+          (local.get $backlog)
+          (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+    )
+"#;
+
+// Reuse SOCKET_WAT, CLOSE_WAT, call_socket, call_close, TmpDir, block_on from above.
+
+/// `socket → bind(127.0.0.1:8080) → listen(5) → close` returns 0 end-to-end.
+#[test]
+fn bind_listen_loopback_succeeds() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let sock = common::compile_wat(&engine, SOCKET_WAT)?;
+    let bind = common::compile_wat(&engine, BIND_WAT)?;
+    let listen = common::compile_wat(&engine, LISTEN_WAT)?;
+    let close = common::compile_wat(&engine, CLOSE_WAT)?;
+
+    block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let fd = call_socket(&linker, &mut store, &sock, 2, 1).await?;
+        assert!(fd >= 3, "socket fd should be >= 3, got {fd}");
+
+        let bind_ret = call_bind(&linker, &mut store, &bind, fd).await?;
+        assert_eq!(bind_ret, 0, "bind() should return 0");
+
+        let listen_ret = call_listen(&linker, &mut store, &listen, fd, 5).await?;
+        assert_eq!(listen_ret, 0, "listen() should return 0");
+
+        // Verify the kernel state was actually updated.
+        match store.data().fds.get(fd as u32) {
+            Ok(Resource::Socket(s)) => {
+                assert!(s.bound.is_some(), "bind should have recorded the address");
+                assert_eq!(s.listen_backlog, Some(5), "listen should have recorded the backlog");
+                assert!(s.is_listening(), "bind+listen -> is_listening");
+            }
+            Err(e) => panic!("fd {fd} was missing after bind+listen: {e}"),
+            Ok(other) => panic!("fd {fd} was not a Socket resource: found {} variant",
+                std::any::type_name::<Resource>()),
+        }
+
+        let close_ret = call_close(&linker, &mut store, &close, fd).await?;
+        assert_eq!(close_ret, 0, "close should return 0");
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// `listen(fd, -1)` returns -EINVAL.
+#[test]
+fn listen_negative_backlog_returns_einval() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let sock = common::compile_wat(&engine, SOCKET_WAT)?;
+    let listen = common::compile_wat(&engine, LISTEN_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let fd = call_socket(&linker, &mut store, &sock, 2, 1).await?;
+        call_listen(&linker, &mut store, &listen, fd, -1).await
+    })?;
+    assert_eq!(ret, -edge_libos::errno::EINVAL, "negative backlog should return -EINVAL");
+    Ok(())
+}
+
+/// `listen(fd, 5)` without prior `bind()` returns -EDESTADDRREQ.
+#[test]
+fn listen_without_bind_returns_edestaddrreq() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let sock = common::compile_wat(&engine, SOCKET_WAT)?;
+    let listen = common::compile_wat(&engine, LISTEN_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let fd = call_socket(&linker, &mut store, &sock, 2, 1).await?;
+        call_listen(&linker, &mut store, &listen, fd, 5).await
+    })?;
+    assert_eq!(ret, -edge_libos::errno::EDESTADDRREQ,
+        "listen without bind should return -EDESTADDRREQ");
+    Ok(())
+}
+
+/// `bind(fd, truncated_sockaddr_in, 8)` returns -EINVAL because
+/// `parse_sockaddr` requires the full 16 bytes for `sockaddr_in`.
+#[test]
+fn bind_truncated_sockaddr_returns_einval() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let sock = common::compile_wat(&engine, SOCKET_WAT)?;
+
+    // Same `bind` shape as BIND_WAT but with addrlen=8 (too short for sockaddr_in).
+    let bind_trunc_wat = r#"
+        (module
+          (import "kernel" "syscall"
+            (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+          (memory (export "memory") 1)
+          (data (i32.const 4096)
+            "\02\00"            ;; family = AF_INET (2)
+            "\1f\90"            ;; port = 8080 BE
+            "\7f\00\00\01")     ;; addr = 127.0.0.1
+          (func (export "go") (param $fd i64) (result i64)
+            (call $syscall
+              (i64.const 49)
+              (local.get $fd)
+              (i64.const 4096)
+              (i64.const 8)            ;; addrlen = 8 (truncated)
+              (i64.const 0) (i64.const 0) (i64.const 0))))
+    "#;
+    let bind = common::compile_wat(&engine, bind_trunc_wat)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let fd = call_socket(&linker, &mut store, &sock, 2, 1).await?;
+        call_bind(&linker, &mut store, &bind, fd).await
+    })?;
+    assert_eq!(ret, -edge_libos::errno::EINVAL,
+        "truncated sockaddr_in should return -EINVAL");
+    Ok(())
+}
+
+/// `bind` against a non-socket fd (close one to get an EBADF path) returns -EBADF.
+/// We use the stdin fd (0), which is a Stdin resource, not a Socket.
+#[test]
+fn bind_on_non_socket_returns_ebadf() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let bind = common::compile_wat(&engine, BIND_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        call_bind(&linker, &mut store, &bind, 0 /*stdin*/).await
+    })?;
+    assert_eq!(ret, -edge_libos::errno::EBADF, "bind on stdin should return -EBADF");
     Ok(())
 }

@@ -59,6 +59,8 @@ expected_syscall() {
         pipe2)             echo "pipe2" ;;
         pipe)              echo "pipe" ;;
         socket)            echo "socket" ;;
+        bind)              echo "bind" ;;
+        listen)            echo "listen" ;;
         open)              echo "open" ;;
         stat)              echo "stat" ;;
         lstat)             echo "lstat" ;;

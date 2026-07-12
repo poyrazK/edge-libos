@@ -297,6 +297,41 @@ fn fuzz_pipe2_bad_fdarray_pointer() -> Result<()> {
     Ok(())
 }
 
+/// bind(fd, addr, len) — fd is fine but addr pointer is poisoned.
+#[test]
+fn fuzz_bind_bad_sockaddr_pointer() -> Result<()> {
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, CALLER_WAT)?;
+    for ptr in POISON_PTR {
+        let r = block_on(assert_efault_or_safe(
+            &engine, &linker, &module,
+            edge_libos::sys::socket::NR_BIND as i64,
+            [3 /*fd*/, *ptr, 16, 0, 0, 0],
+            "bind",
+        ))?;
+        let _ = r;
+    }
+    Ok(())
+}
+
+/// listen(fd, backlog) — no pointer args. Surface must be EBADF/EINVAL on
+/// bogus fd values; -EOPNOTSUPP / -EDESTADDRREQ / 0 are valid for fd=0
+/// depending on state, so we just exercise fd=0 with valid backlog to make
+/// sure no panic occurs and the call returns from the safe set.
+#[test]
+fn fuzz_listen_no_pointer_args() -> Result<()> {
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, CALLER_WAT)?;
+    let r = block_on(assert_efault_or_safe(
+        &engine, &linker, &module,
+        edge_libos::sys::socket::NR_LISTEN as i64,
+        [0 /*fd (stdin, not a socket)*/, 5 /*backlog*/, 0, 0, 0, 0],
+        "listen",
+    ))?;
+    let _ = r;
+    Ok(())
+}
+
 /// Brute-force overflow: pointer = i64::MAX/2, len = i64::MAX/2.
 #[test]
 fn fuzz_overflow_ptr_plus_len_every_pointer_syscall() -> Result<()> {
@@ -343,6 +378,8 @@ fn fuzz_overflow_ptr_plus_len_every_pointer_syscall() -> Result<()> {
          [1, huge, huge, 0, 0, 0]),
         (edge_libos::sys::file::NR_WRITEV, "writev",
          [1, huge, huge, 0, 0, 0]),
+        (edge_libos::sys::socket::NR_BIND, "bind",
+         [3, huge, huge, 0, 0, 0]),
     ];
     for (nr, name, args) in cases {
         let ret = block_on(assert_efault_or_safe(

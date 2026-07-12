@@ -35,6 +35,8 @@ pub const EPIPE: i64 = 32;
 pub const ELOOP: i64 = 40;
 pub const ERANGE: i64 = 34;
 pub const ENOSYS: i64 = 38;
+pub const EDESTADDRREQ: i64 = 89;
+pub const EOPNOTSUPP: i64 = 95;
 pub const EAFNOSUPPORT: i64 = 97;
 pub const EPROTONOSUPPORT: i64 = 93;
 

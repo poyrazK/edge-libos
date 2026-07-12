@@ -11,12 +11,15 @@
 
 use wasmtime::Caller;
 
-use crate::errno::{EAFNOSUPPORT, EPROTONOSUPPORT};
-use crate::fd::{Resource, SocketInner, SocketKind};
+use crate::errno::{EAFNOSUPPORT, EBADF, EINVAL, EOPNOTSUPP, EPROTONOSUPPORT};
+use crate::fd::{Resource, SockAddr, SocketInner, SocketKind};
 use crate::kernel::Kernel;
+use crate::mem;
 
 // NR_* (Linux x86-64 unistd_64.h).
 pub const NR_SOCKET: u32 = 41;
+pub const NR_BIND: u32 = 49;
+pub const NR_LISTEN: u32 = 50;
 
 // Address families.
 pub const AF_UNIX: i32 = 1;
@@ -29,6 +32,11 @@ pub const SOCK_DGRAM: i32 = 2;
 // Flags OR'd into the type argument.
 pub const SOCK_NONBLOCK: i32 = 0o4000;
 pub const SOCK_CLOEXEC: i32 = 0o2000000;
+
+// sockaddr layout sizes (per Linux man page / plan §3).
+pub const SOCKADDR_STORAGE_SIZE: usize = 128; // sizeof(struct sockaddr_storage)
+pub const SOCKADDR_IN_SIZE: usize = 16;
+pub const SOCKADDR_IN6_SIZE: usize = 28;
 
 /// `socket(family, type_and_flags, protocol)` — allocate a fresh socket fd.
 ///
@@ -112,5 +120,195 @@ mod tests {
         let mut fds = FdTable::empty();
         // 0o205 = SOCK_SEQPACKET on Linux. Not in our P1 set.
         assert_eq!(socket_for_test(&mut fds, AF_INET, 0o205), Err(-EPROTONOSUPPORT));
+    }
+}
+
+/// Parse a `sockaddr_in` (16 bytes) or `sockaddr_in6` (28 bytes) from the
+/// guest pointer. Returns `Err(-EINVAL)` on a bad family or truncated
+/// `addrlen`; `Err(-EAFNOSUPPORT)` for families we don't model yet.
+fn parse_sockaddr(caller: &mut Caller<'_, Kernel>, addr_ptr: i64, addr_len: i64) -> Result<SockAddr, i64> {
+    if addr_ptr == 0 || addr_len == 0 {
+        return Err(-(crate::errno::EDESTADDRREQ)); // no address supplied
+    }
+    let len = match usize::try_from(addr_len) {
+        Ok(n) => n,
+        Err(_) => return Err(-EINVAL),
+    };
+    // Bounds-check the smallest possible sockaddr header (family field).
+    let header = match mem::guest_slice(caller, addr_ptr, 2) {
+        Ok(b) => b,
+        Err(e) => return Err(e),
+    };
+    let family = u16::from_le_bytes([header[0], header[1]]) as i32;
+
+    match family {
+        AF_INET => {
+            if (len as usize) < SOCKADDR_IN_SIZE {
+                return Err(-EINVAL);
+            }
+            let bytes = match mem::guest_slice(caller, addr_ptr, SOCKADDR_IN_SIZE as i64) {
+                Ok(b) => b,
+                Err(e) => return Err(e),
+            };
+            // struct sockaddr_in { sa_family_t sin_family; u16 sin_port; u32 sin_addr; u8 pad[8]; }
+            // Network byte order for port and addr.
+            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+            let addr = [bytes[4], bytes[5], bytes[6], bytes[7]];
+            Ok(SockAddr::V4 { port, addr })
+        }
+        AF_INET6 => {
+            if (len as usize) < SOCKADDR_IN6_SIZE {
+                return Err(-EINVAL);
+            }
+            let bytes = match mem::guest_slice(caller, addr_ptr, SOCKADDR_IN6_SIZE as i64) {
+                Ok(b) => b,
+                Err(e) => return Err(e),
+            };
+            // struct sockaddr_in6 { u16 sin6_family; u16 sin6_port; u32 flowinfo; u8 addr[16]; u32 scope_id; }
+            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+            let mut addr = [0u8; 16];
+            addr.copy_from_slice(&bytes[8..24]);
+            Ok(SockAddr::V6 { port, addr })
+        }
+        AF_UNIX => Err(-EOPNOTSUPP), // AF_UNIX is P2; EOPNOTSUPP is the more common errno
+        _ => Err(-EAFNOSUPPORT),
+    }
+}
+
+/// `bind(sockfd, addr, addrlen)` — record the socket's bound address.
+///
+/// P1-2 doesn't open a real `TcpListener` yet (that's lazy-built on first
+/// `accept4`, P1-4). We just validate the sockaddr, store it on the
+/// `SocketInner`, and return 0. Duplicate-bind on the same `(addr, port)`
+/// is not detected here — Linux's `EADDRINUSE` requires a real listener,
+/// which we don't have until P1-4.
+pub async fn bind(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let fd = match u32::try_from(a[0]) {
+        Ok(f) => f,
+        Err(_) => return -EBADF,
+    };
+    let addr_ptr = a[1];
+    let addr_len = a[2];
+
+    let addr = match parse_sockaddr(caller, addr_ptr, addr_len) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+
+    let fds = &mut caller.data_mut().fds;
+    match fds.get_mut(fd) {
+        Ok(Resource::Socket(s)) => {
+            s.bound = Some(addr);
+            0
+        }
+        Ok(_) => -EBADF,
+        Err(e) => e,
+    }
+}
+
+/// `listen(sockfd, backlog)` — mark the socket passive.
+///
+/// `backlog` must be non-negative (Linux clamps at `/proc/sys/net/core/somaxconn`;
+/// we accept any non-negative value without clamping for now). Sets
+/// `listen_backlog = Some(backlog)`. Returns 0 on success, -EBADF if `fd`
+/// isn't a socket, -EDESTADDRREQ if `bind()` was never called.
+pub async fn listen(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let fd = match u32::try_from(a[0]) {
+        Ok(f) => f,
+        Err(_) => return -EBADF,
+    };
+    let backlog = a[1];
+    if backlog < 0 {
+        return -EINVAL;
+    }
+
+    let fds = &mut caller.data_mut().fds;
+    match fds.get_mut(fd) {
+        Ok(Resource::Socket(s)) => {
+            if s.bound.is_none() {
+                return -(crate::errno::EDESTADDRREQ);
+            }
+            s.listen_backlog = Some(backlog as i32);
+            0
+        }
+        Ok(_) => -EBADF,
+        Err(e) => e,
+    }
+}
+
+#[cfg(test)]
+mod p1_2_tests {
+    use super::*;
+    use crate::fd::FdTable;
+
+    #[test]
+    fn listen_without_bind_returns_edestaddrreq() {
+        let mut fds = FdTable::empty();
+        let fd = socket_for_test(&mut fds, AF_INET, SOCK_STREAM).unwrap();
+        // Direct kernel-state test: build a Caller-free probe by mutating
+        // the resource directly. Equivalent to `listen(fd, 5)` against a
+        // socket that was never bound.
+        let ret = match fds.get_mut(fd).unwrap() {
+            Resource::Socket(s) => {
+                if s.bound.is_none() {
+                    -crate::errno::EDESTADDRREQ
+                } else {
+                    s.listen_backlog = Some(5);
+                    0
+                }
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(ret, -crate::errno::EDESTADDRREQ);
+    }
+
+    #[test]
+    fn bound_socket_records_address() {
+        let mut fds = FdTable::empty();
+        let fd = socket_for_test(&mut fds, AF_INET, SOCK_STREAM).unwrap();
+        match fds.get_mut(fd).unwrap() {
+            Resource::Socket(s) => {
+                s.bound = Some(SockAddr::V4 { port: 8080, addr: [127, 0, 0, 1] });
+            }
+            _ => unreachable!(),
+        }
+        // Re-borrow immutably to read back.
+        match fds.get(fd).unwrap() {
+            Resource::Socket(s) => {
+                match &s.bound {
+                    Some(SockAddr::V4 { port, addr }) => {
+                        assert_eq!(*port, 8080);
+                        assert_eq!(*addr, [127, 0, 0, 1]);
+                    }
+                    other => panic!("expected V4 bound, got {other:?}"),
+                }
+                assert!(!s.is_listening(), "not listening yet");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn is_listening_requires_both_bind_and_listen() {
+        let mut fds = FdTable::empty();
+        let fd = socket_for_test(&mut fds, AF_INET, SOCK_STREAM).unwrap();
+        match fds.get_mut(fd).unwrap() {
+            Resource::Socket(s) => {
+                assert!(!s.is_listening());
+                s.bound = Some(SockAddr::V4 { port: 0, addr: [0, 0, 0, 0] });
+                assert!(!s.is_listening(), "bind alone is not listening");
+                s.listen_backlog = Some(128);
+                assert!(s.is_listening(), "bind + listen -> listening");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn as_v4_converts_bound_address() {
+        let addr = SockAddr::V4 { port: 8080, addr: [192, 168, 1, 1] };
+        let v4 = addr.as_v4().expect("V4 -> Some");
+        assert_eq!(*v4.ip(), std::net::Ipv4Addr::new(192, 168, 1, 1));
+        assert_eq!(v4.port(), 8080);
     }
 }

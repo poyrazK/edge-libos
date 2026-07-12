@@ -8,7 +8,7 @@
 //! eventually Socket/Epoll in P1).
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -102,6 +102,29 @@ pub enum SocketKind {
     Datagram,
 }
 
+/// The bound address of a socket. Parsed from `sockaddr_in` / `sockaddr_in6`
+/// at `bind()` time, then stored on the `SocketInner` for use by `listen()`
+/// (P1-2) and `accept4` (P1-4). For now we only model IPv4; IPv6 lands with
+/// the listener work in P1-4 since they share the lazy-build path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SockAddr {
+    V4 { port: u16, addr: [u8; 4] },
+    V6 { port: u16, addr: [u8; 16] },
+}
+
+impl SockAddr {
+    /// Build a `SocketAddrV4` from a `SockAddr::V4`. Returns `None` for V6
+    /// (handled separately when we add IPv6 listener support).
+    pub fn as_v4(&self) -> Option<std::net::SocketAddrV4> {
+        match self {
+            SockAddr::V4 { port, addr } => {
+                std::net::SocketAddrV4::new(std::net::Ipv4Addr::from(*addr), *port).into()
+            }
+            SockAddr::V6 { .. } => None,
+        }
+    }
+}
+
 /// A freshly-created socket fd (P1-1). No connection state yet.
 ///
 /// Future sub-steps will add fields here:
@@ -112,6 +135,11 @@ pub enum SocketKind {
 pub struct SocketInner {
     pub kind: SocketKind,
     pub nonblock: AtomicBool,
+    /// P1-2: set by `bind()`. Until this is `Some`, the socket has no address.
+    pub bound: Option<SockAddr>,
+    /// P1-2: set by `listen()`. Until this is `Some`, the socket is not
+    /// passive and `accept4` (P1-4) will return -EINVAL.
+    pub listen_backlog: Option<i32>,
 }
 
 impl SocketInner {
@@ -119,7 +147,15 @@ impl SocketInner {
         Self {
             kind,
             nonblock: AtomicBool::new(nonblock),
+            bound: None,
+            listen_backlog: None,
         }
+    }
+
+    /// True once `bind` + `listen` have both run. P1-4 `accept4` requires this.
+    #[allow(dead_code)]
+    pub fn is_listening(&self) -> bool {
+        self.bound.is_some() && self.listen_backlog.is_some()
     }
 }
 
