@@ -1,0 +1,44 @@
+//! Shared test harness for integration tests.
+//!
+//! Most P0 tests need: an Engine, a Linker with our dispatch registered, and
+//! a tiny WAT module that imports `kernel.syscall`. This module provides the
+//! common scaffolding so individual tests stay focused on the syscall under
+//! test.
+
+use anyhow::Result;
+use wasmtime::{Engine, Instance, Linker, Module, Store};
+
+use edge_libos::{add_to_linker, build_engine, build_store, Kernel};
+
+/// Build a fresh Engine + Linker pre-registered with the dispatch.
+pub fn engine_and_linker() -> Result<(Engine, Linker<Kernel>)> {
+    let engine = build_engine()?;
+    let mut linker = Linker::new(&engine);
+    add_to_linker(&mut linker)?;
+    Ok((engine, linker))
+}
+
+/// Compile a WAT string into a Module on the given engine.
+pub fn compile_wat(engine: &Engine, wat: &str) -> Result<Module> {
+    let bytes = wat::parse_str(wat)?;
+    Ok(Module::new(engine, &bytes)?)
+}
+
+/// Instantiate a Module, attach its memory to the Kernel, and return the
+/// Store + Instance. The Kernel is freshly constructed with empty args/env.
+///
+/// **Async note:** wasmtime 45.0.3 has `Config::async_support` always on,
+/// so `Linker::instantiate` becomes `instantiate_async`. The harness is
+/// async; callers wrap with `tokio::runtime::Runtime::block_on`.
+pub async fn instantiate_async(
+    engine: &Engine,
+    linker: &Linker<Kernel>,
+    module: &Module,
+) -> Result<(Store<Kernel>, Instance)> {
+    let mut store = build_store(engine, Kernel::new(vec![], vec![]));
+    let instance = linker.instantiate_async(&mut store, module).await?;
+    if let Some(mem) = instance.get_memory(&mut store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    Ok((store, instance))
+}

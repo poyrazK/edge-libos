@@ -1,0 +1,344 @@
+# libOS Syscall Spec — CPython + FastAPI on Wasmtime
+
+**Target:** a single compiled Wasm binary (guest = CPython + the user's FastAPI app + native deps) running under Wasmtime, backed by a host-side "kernel" (libOS) that provides a Linux personality.
+
+**Audience:** the implementing agent. Everything here is meant to be built against directly. Where a value is our choice (e.g. a syscall number), it's flagged; where it must match Linux byte-for-byte (e.g. `struct stat`), it's flagged harder.
+
+---
+
+## 0. Two paths — read this first, it decides the whole build
+
+There are two things "syscall layer" can mean. They are very different amounts of work.
+
+**Path A — WASI-native (bootstrap).** Upstream CPython already has a `wasm32-wasip1` target. It emits **WASI preview 1** import calls (`fd_read`, `path_open`, `poll_oneoff`, `clock_time_get`, `random_get`, partial `sock_*`), *not* Linux syscall numbers. Stock `wasmtime-wasi` runs it today for plain scripts. What's missing for FastAPI is: **full sockets** (bind/connect/listen — only partly in p1, fully in p2 `wasi-sockets`), a **readiness/epoll layer** for asyncio, and the **ASGI host binding**. This is the small lift.
+
+**Path B — Linux personality (the moat).** Guest libc is built to emit **numbered Linux syscalls** through a single Wasm import trampoline; the host implements the numbered table below. This is what lets *unmodified Linux-targeted code and native extensions* run without per-package porting — the O(1)-kernel idea. Bigger lift (you're effectively re-treading what Emscripten/WASIX did for musl), but it's the defensible thing.
+
+**Recommendation: build Path B's numbered dispatch as the contract, but back many entries with `wasmtime-wasi` internally.** You get the Linux ABI surface (so the ecosystem targets you) without hand-writing a filesystem or RNG. The table below marks, per syscall, whether it can delegate to `wasmtime-wasi` (`wasi`), needs custom host code (`host`), or is a stub (`stub`).
+
+This doc specifies **Path B**. If you want to ship in weeks not months, implement the P0/P1 tier only and lean on `wasi` delegation.
+
+---
+
+## 1. The ABI contract
+
+### 1.1 Entry point
+
+The guest imports exactly one dispatch function:
+
+```wat
+(import "kernel" "syscall"
+  (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+```
+
+- param0 = syscall number `nr` (only low 32 bits used).
+- param1..param6 = args a1..a6. Pointers are **guest linear-memory offsets**, zero-extended into i64. 64-bit scalar args (offsets, sizes) use the full i64.
+- result = i64. **Linux kernel convention:** `>= 0` is success (return value / fd / byte count); `[-4095, -1]` is `-errno`. The guest libc does the `errno` translation. Never return a raw errno as positive.
+
+> The guest musl port must route its `__syscall0..6` through this import. That port is part of the build; it is not in this doc's scope but the table's signatures define its contract.
+
+### 1.2 Memory model — read this before touching mmap
+
+The guest has **one linear memory**. There is no virtual address space, no page table, no hardware page protection, no executable pages. Consequences the agent must internalize:
+
+- **Pointers are `u32` offsets into that one memory.** The host reads/writes guest bytes through Wasmtime's `Memory::data_mut`. Bounds-check every pointer+len against `memory.size()` and return `-EFAULT` on overflow.
+- **`mmap(MAP_ANONYMOUS)` cannot create new address space.** CPython's `obmalloc` arena allocator calls it for 256KB arenas. Back it by a host-managed **bump/free-list allocator over a reserved high region of linear memory**, growing the memory with `memory.grow` as needed. Return the offset as the "address." `munmap` returns the region to the free list. This is the single most important non-obvious piece.
+- **`mprotect` cannot actually protect.** Implement as **success no-op** (allocators call it; failing breaks them). Guard-page tricks don't exist; stack overflow is caught by Wasm traps instead.
+- **`brk`** — return the current break so musl falls through to its mmap path. Don't implement a real heap via brk.
+
+### 1.3 Blocking without blocking a thread (critical)
+
+You will run thousands of guest instances. You **cannot** block an OS thread on `read()`. Therefore:
+
+- Enable Wasmtime async: `Config::async_support(true)`, drive instances with `call_async`, run guests on Wasmtime fibers.
+- Register the dispatch as an **async host function** (`Linker::func_new_async`). When a syscall would block (socket recv with no data, `epoll_wait` with nothing ready, `nanosleep`), the host `.await`s a tokio future; Wasmtime suspends the guest fiber and lets other instances run. The guest sees an ordinary blocking call.
+- This is what makes CPython's normal blocking-looking code and asyncio's event loop both work with zero guest changes. **`epoll_wait` is the concurrency choke point** (see §5).
+
+### 1.4 Threads / reentrancy for v1
+
+Build CPython **single-threaded** (WASI single-thread build; GIL path without real pthreads). `os.cpu_count()` → 1. `pthread_create` → `-ENOSYS` (thread-pool libs must fall back or fail loudly). Real Wasm threads + shared memory are **Phase 3**; they interact badly with the fiber model and aren't needed for uvicorn-style single-process async serving. Say this out loud to users.
+
+---
+
+## 2. Host skeleton (Rust, illustrative)
+
+```rust
+use wasmtime::*;
+
+struct Kernel {
+    memory: Option<Memory>,
+    fds: FdTable,          // fd -> Resource (File | Socket | Epoll | Pipe | EventFd)
+    mm: LinearAllocator,   // §1.2 anon-mmap allocator
+    clock: ClockState,
+    // wasi delegation context lives here too
+}
+
+fn add_to_linker(linker: &mut Linker<Kernel>) -> Result<()> {
+    linker.func_new_async(
+        "kernel", "syscall",
+        FuncType::new(/* 7×I64 */ std::iter::repeat(ValType::I64).take(7), [ValType::I64]),
+        |mut caller, params, results| Box::new(async move {
+            let nr = params[0].unwrap_i64() as u32;
+            let a  = [params[1].unwrap_i64(), params[2].unwrap_i64(), params[3].unwrap_i64(),
+                      params[4].unwrap_i64(), params[5].unwrap_i64(), params[6].unwrap_i64()];
+            let ret = dispatch(&mut caller, nr, a).await; // returns i64, -errno on error
+            results[0] = Val::I64(ret);
+            Ok(())
+        }),
+    )?;
+    Ok(())
+}
+
+async fn dispatch(caller: &mut Caller<'_, Kernel>, nr: u32, a: [i64;6]) -> i64 {
+    match nr {
+        NR_WRITE        => sys_write(caller, a).await,
+        NR_READ         => sys_read(caller, a).await,
+        NR_EPOLL_WAIT   => sys_epoll_wait(caller, a).await, // .await suspends the fiber
+        NR_MMAP         => sys_mmap(caller, a),
+        // ...
+        _ => -ENOSYS,
+    }
+}
+```
+
+Guest-memory helper every syscall uses:
+
+```rust
+fn guest_slice_mut<'a>(c: &'a mut Caller<'_, Kernel>, ptr: i64, len: i64) -> Result<&'a mut [u8], i64> {
+    let mem = c.data().memory.ok_or(-EFAULT)?;
+    let (base, _store) = mem.data_and_store_mut(c);
+    let (p, l) = (ptr as usize, len as usize);
+    base.get_mut(p..p.checked_add(l).ok_or(-EFAULT)?).ok_or(-EFAULT).map_err(|_| -EFAULT)
+}
+```
+
+---
+
+## 3. Struct layouts (must be byte-exact, x86-64 layout)
+
+The guest musl expects these exact layouts. Get a field wrong and CPython crashes in obscure ways. Verify against `<asm-generic/stat.h>` etc.
+
+**`struct timespec`** (16 bytes): `i64 tv_sec; i64 tv_nsec;`
+
+**`struct iovec`** (16 bytes): `u32/u64 iov_base; u64 iov_len;` — pointer is 32-bit in-guest but the slot is pointer-width; on wasm32 the base is a 4-byte offset. **Define the guest as wasm32 → iovec is 8 bytes: `u32 base; u32 len`.** (This is the one place the wasm32 ABI diverges from x86-64; keep iovec/pointer-bearing structs at wasm32 widths, keep scalar structs like `stat` at their kernel widths.)
+
+**`struct stat`** — use the wasm32/`stat64` shape your musl port declares; the safest move is to **let the guest musl define it and have the host fill fields by name via a shared header**, rather than hardcoding offsets. At minimum populate: `st_dev, st_ino, st_mode, st_nlink, st_uid, st_gid, st_rdev, st_size, st_blksize, st_blocks, st_atim, st_mtim, st_ctim`.
+
+**`struct sockaddr_in`** (16 bytes): `u16 sin_family; u16 sin_port(BE); u32 sin_addr(BE); u8 pad[8]`.
+**`struct sockaddr_in6`** (28 bytes): `u16 family; u16 port(BE); u32 flowinfo; u8 addr[16]; u32 scope_id`.
+
+**`struct epoll_event`** (packed, **12 bytes on x86-64**, `__attribute__((packed))`): `u32 events; u64 data`. Keep it packed — this bites people.
+
+**`struct pollfd`** (8 bytes): `i32 fd; i16 events; i16 revents`.
+
+**`struct linux_dirent64`** (variable): `u64 d_ino; i64 d_off; u16 d_reclen; u8 d_type; char d_name[]` (NUL-terminated, whole record padded to 8). Used by `getdents64` — importlib scans package dirs with this, so it must be correct or imports fail.
+
+---
+
+## 4. The syscall table
+
+Legend — **Impl:** `wasi` = delegate to wasmtime-wasi; `host` = write it; `stub` = constant return; `err` = deliberate `-ENOSYS`/`-EPERM`. **P:** priority tier (§7). Numbers are Linux x86-64 (`unistd_64.h`); the agent must confirm guest/host agree, the exact values are our contract not sacred.
+
+### 4.1 Process / startup / control
+| nr | name | Impl | P | notes |
+|----|------|------|---|-------|
+| 60 | exit | host | P0 | end fiber, flush |
+| 231 | exit_group | host | P0 | same; primary exit path |
+| 39 | getpid | stub | P0 | return fixed pid (e.g. 1) |
+| 110 | getppid | stub | P1 | 0 |
+| 186 | gettid | stub | P0 | == pid in v1 |
+| 218 | set_tid_address | stub | P0 | musl startup; store & return tid |
+| 273 | set_robust_list | stub | P0 | startup no-op → 0 |
+| 158 | arch_prctl | err | P0 | ENOSYS ok on wasm |
+| 157 | prctl | stub | P1 | PR_SET_NAME etc → 0; else ENOSYS |
+| 24 | sched_yield | host | P1 | yield fiber → 0 |
+| 204 | sched_getaffinity | host | P1 | report 1 CPU |
+| 318 | getrandom | wasi | P0 | maps to `random_get`; **needed for hash seed / secrets / uuid4** |
+| 334 | rseq | err | P0 | ENOSYS; glibc registers at startup, musl usually doesn't — return cleanly |
+| 56 | clone | host | P3 | Phase 3 via snapshot; v1 ENOSYS |
+| 57 | fork | host | P3 | = CoW instance snapshot (see §6); v1 ENOSYS |
+| 59 | execve | err | — | ENOSYS, permanently unsupported |
+| 61 | wait4 | host | P3 | with fork |
+
+### 4.2 Memory (see §1.2 — the wasm caveats dominate)
+| nr | name | Impl | P | notes |
+|----|------|------|---|-------|
+| 9 | mmap | host | P0 | ANON→linear allocator; file-backed→read into region; **no exec** |
+| 11 | munmap | host | P0 | free region |
+| 10 | mprotect | stub | P0 | success no-op |
+| 25 | mremap | host | P1 | realloc region |
+| 28 | madvise | stub | P0 | 0 |
+| 12 | brk | host | P0 | return current break, force mmap path |
+| 26 | msync | stub | P1 | 0 |
+
+### 4.3 File / VFS
+| nr | name | Impl | P | notes |
+|----|------|------|---|-------|
+| 257 | openat | wasi | P0 | primary open; map dirfd |
+| 2 | open | host→openat | P0 | rewrite to openat(AT_FDCWD) |
+| 3 | close | wasi | P0 | |
+| 0 | read | wasi | P0 | async on pipes/sockets |
+| 1 | write | wasi | P0 | stdout/stderr → host log |
+| 19 | readv | host | P0 | scatter; uvicorn/httptools use it |
+| 20 | writev | host | P0 | gather; response write path |
+| 17 | pread64 | wasi | P1 | |
+| 18 | pwrite64 | wasi | P1 | |
+| 8 | lseek | wasi | P0 | |
+| 5 | fstat | wasi | P0 | |
+| 262 | newfstatat | wasi | P0 | stat/lstat rewrite here |
+| 4 | stat | host→newfstatat | P0 | |
+| 6 | lstat | host→newfstatat | P0 | |
+| 332 | statx | host | P1 | newer glibc/py; fill from fstat |
+| 217 | getdents64 | host | P0 | **importlib dir scan — must be correct** |
+| 72 | fcntl | host | P0 | F_GETFL/F_SETFL(O_NONBLOCK), F_GETFD/F_SETFD, F_DUPFD(_CLOEXEC) |
+| 16 | ioctl | host | P1 | FIONBIO, FIONREAD, TIOCGWINSZ; else ENOTTY |
+| 32 | dup | host | P1 | |
+| 33 | dup2 | host | P1 | |
+| 292 | dup3 | host | P1 | |
+| 22 | pipe | host→pipe2 | P0 | **asyncio self-pipe / signal wakeup** |
+| 293 | pipe2 | host | P0 | O_NONBLOCK/O_CLOEXEC |
+| 79 | getcwd | wasi | P0 | |
+| 80 | chdir | wasi | P1 | |
+| 21 | access | host→faccessat | P1 | |
+| 269 | faccessat | wasi | P1 | |
+| 439 | faccessat2 | host→faccessat | P1 | |
+| 83 | mkdir | wasi | P2 | |
+| 87 | unlink | wasi | P2 | |
+| 263 | unlinkat | wasi | P2 | |
+| 82 | rename | wasi | P2 | |
+| 89 | readlink | wasi | P1 | |
+| 267 | readlinkat | wasi | P1 | |
+| 77 | ftruncate | wasi | P2 | |
+| 90 | chmod | stub | P2 | 0 over VFS |
+| 95 | umask | stub | P1 | return old mask |
+| 280 | utimensat | wasi | P2 | |
+
+### 4.4 Sockets (the web-server heart — §5)
+| nr | name | Impl | P | notes |
+|----|------|------|---|-------|
+| 41 | socket | host | P0 | AF_INET/INET6 P0; AF_UNIX P2 |
+| 49 | bind | host | P0 | |
+| 50 | listen | host | P0 | |
+| 43 | accept | host→accept4 | P1 | |
+| 288 | accept4 | host | P0 | async; SOCK_NONBLOCK/CLOEXEC |
+| 42 | connect | host | P0 | async; outbound (httpx, DB) |
+| 44 | sendto | host | P0 | send path |
+| 45 | recvfrom | host | P0 | recv path; async |
+| 46 | sendmsg | host | P1 | |
+| 47 | recvmsg | host | P1 | |
+| 48 | shutdown | host | P1 | |
+| 54 | setsockopt | host | P0 | SO_REUSEADDR, TCP_NODELAY, SO_KEEPALIVE; unknowns → 0 |
+| 55 | getsockopt | host | P1 | SO_ERROR after async connect is essential |
+| 51 | getsockname | host | P1 | |
+| 52 | getpeername | host | P1 | |
+| 53 | socketpair | host | P2 | AF_UNIX |
+
+> **DNS:** `getaddrinfo` is libc-level. Two options: (a) allow UDP:53 through the socket layer and let musl resolve — simplest, but every instance does its own DNS; (b) intercept with a host-backed resolver call and a per-tenant egress policy — recommended for a FaaS. Pick (b) early; it's also your egress-security hook.
+
+### 4.5 Poll / readiness / events (§5)
+| nr | name | Impl | P | notes |
+|----|------|------|---|-------|
+| 291 | epoll_create1 | host | P0 | asyncio default loop on Linux |
+| 233 | epoll_ctl | host | P0 | ADD/MOD/DEL |
+| 232 | epoll_wait | host | P0 | **async suspend point**; timeout honored |
+| 281 | epoll_pwait | host→epoll_wait | P1 | ignore sigmask in v1 |
+| 7 | poll | host | P1 | some libs prefer poll |
+| 271 | ppoll | host→poll | P1 | |
+| 23 | select | host | P2 | legacy; map onto poll |
+| 290 | eventfd2 | host | P1 | loop wakeups |
+| 284 | eventfd | host→eventfd2 | P1 | |
+
+### 4.6 Time
+| nr | name | Impl | P | notes |
+|----|------|------|---|-------|
+| 228 | clock_gettime | wasi | P0 | REALTIME + MONOTONIC; asyncio timers, time.time, logging |
+| 229 | clock_getres | host | P1 | |
+| 96 | gettimeofday | host→clock_gettime | P0 | |
+| 35 | nanosleep | host | P0 | async sleep; time.sleep |
+| 230 | clock_nanosleep | host | P1 | |
+| 99 | sysinfo | stub | P2 | fake uptime/mem |
+| 100 | times | stub | P2 | |
+
+### 4.7 Identity / limits / info
+| nr | name | Impl | P | notes |
+|----|------|------|---|-------|
+| 102 | getuid | stub | P0 | 1000 |
+| 104 | getgid | stub | P0 | 1000 |
+| 107 | geteuid | stub | P0 | 1000 |
+| 108 | getegid | stub | P0 | 1000 |
+| 115 | getgroups | stub | P1 | 0 groups |
+| 63 | uname | host | P1 | sysname=Linux, machine=wasm32; some libs gate on this |
+| 97 | getrlimit | host | P1 | RLIMIT_NOFILE, RLIMIT_STACK |
+| 302 | prlimit64 | host | P1 | Python queries NOFILE at startup |
+| 324 | membarrier | err | P1 | ENOSYS ok |
+
+### 4.8 Signals (record-only in v1)
+| nr | name | Impl | P | notes |
+|----|------|------|---|-------|
+| 13 | rt_sigaction | host | P0 | store disposition; CPython installs SIGINT |
+| 14 | rt_sigprocmask | host | P0 | track mask |
+| 131 | sigaltstack | stub | P1 | 0 |
+| 62 | kill | host | P2 | self-target only |
+| 234 | tgkill | host | P2 | self-target only |
+| 15 | rt_sigreturn | stub | P1 | no real delivery in v1 |
+
+> v1 delivers only **synthetic** signals you generate (e.g. a shutdown SIGTERM you inject at drain time). No async POSIX signal delivery into the guest.
+
+### 4.9 Futex / threads (Phase 3 only)
+| nr | name | Impl | P | notes |
+|----|------|------|---|-------|
+| 202 | futex | host | P3 | WAIT/WAKE; only with real threads |
+| 220 | set_robust_list dup | — | — | (see 273) |
+
+---
+
+## 5. The concurrency model (epoll as the pivot)
+
+CPython's asyncio selector event loop, on a Linux personality, picks **epoll**. Everything routes through it, so implement it as the async heart:
+
+1. Guest registers listening socket + client sockets + the self-pipe/eventfd via `epoll_ctl(ADD)`.
+2. Guest calls `epoll_wait(epfd, events, maxevents, timeout)`.
+3. Host builds a tokio future = *"any registered fd readable/writable, OR timeout elapsed."* Each socket resource wraps a real tokio `TcpStream`; readiness comes from tokio's reactor. `.await` it → **Wasmtime suspends this guest's fiber**, freeing the thread for other tenants.
+4. On wake, fill the guest `epoll_event[]` array with ready fds and return the count.
+
+With that one function async-correct, a normal `uvicorn`-style ASGI serve loop runs unmodified and thousands of instances multiplex on a handful of OS threads. `nanosleep`, `connect`, `accept4`, `recvfrom` are the other suspend points and follow the same pattern.
+
+**Where your ASGI shim plugs in:** you can skip having the guest bind a real socket at all. Instead the host accepts the HTTP request, and your in-guest shim (replacing uvicorn) reads the request from a host-provided fd/import, drives the FastAPI ASGI app, and writes the response back. Sockets then matter mainly for *outbound* (httpx, DB). Both models work; the shim model is cleaner for metering and cold-start snapshotting.
+
+---
+
+## 6. Snapshot / fork (Phase 2–3, the payoff)
+
+- **Pre-init snapshot (P2):** boot the guest once at deploy — import CPython, FastAPI, pydantic, user module — then serialize linear memory + fd table + kernel state (Wizer-style). Every request restores from it → **~1 ms cold start for Python**. This is the headline feature and it only needs P0/P1 syscalls plus a serialize/restore of your `Kernel` struct.
+- **fork() as CoW (P3):** `fork` = clone the instance with copy-on-write pages over linear memory. This is the same machinery as the pre-init snapshot, which is why fork stops being "impossible." Only needed for apps that actually fork; FastAPI/uvicorn-single-worker don't.
+
+---
+
+## 7. Milestones (definition-of-done per tier)
+
+- **P0 — "CPython boots and prints."** exit/exit_group, mmap/munmap/mprotect/brk, read/write/openat/close/fstat/getdents64/lseek, clock_gettime, getrandom, getuid family, set_tid_address, rt_sigaction/procmask, rseq→ENOSYS. **DoD:** `python -c "print(2+2)"` and `import fastapi` succeed inside the guest.
+- **P1 — "serve one request."** epoll_create1/ctl/wait, socket/bind/listen/accept4/recvfrom/sendto/connect/setsockopt/getsockopt, pipe2/eventfd2, fcntl, readv/writev, nanosleep. **DoD:** a FastAPI app returns 200 to one real HTTP request end-to-end.
+- **P2 — "production-ish single instance."** snapshot pre-init (1 ms cold start), DNS resolver + egress policy, statx/dup/poll/select, mkdir/unlink/rename, AF_UNIX, metering hooks (epoch/fuel). **DoD:** existing FastAPI+pydantic+httpx+SQLAlchemy-over-your-Postgres app deploys unchanged, cold-starts <5 ms, meters CPU-ms.
+- **P3 — "scale/compat tail."** real threads (futex + shared memory), fork/clone/wait4 via CoW, live migration across machines/arch. **DoD:** an app using a thread pool and one that forks both run; drain-migrate a live instance x86→ARM.
+
+---
+
+## 8. Verification harness (build this alongside, not after)
+
+- **Golden syscall traces:** run each target app natively under `strace -f`, capture the syscall set actually hit. That *is* your real requirements list — trust it over this doc. Anything in the trace not in your table is a prioritized backlog item.
+- **Per-package upstream test suites** run inside the guest → green = auto-certified (this is the automated build-farm flywheel from earlier; wire it in from day one).
+- **Conformance micro-tests:** for each implemented syscall, a tiny C/Python program asserting the exact errno/return for success and failure paths (bad fd → EBADF, bad ptr → EFAULT, etc.). CPython breaks on wrong errnos far more than on missing calls.
+- **Fuzz the pointer/len args** of every syscall for EFAULT-safety; a host that segfaults on a bad guest pointer is a sandbox escape, not a bug.
+
+---
+
+## 9. Permanently-ENOSYS list (fail loud, document it)
+
+`execve`, `ptrace`, `mount`, `reboot`, `init_module`, `bpf`, `io_uring_*` (v1), `userfaultfd`, `perf_event_open`, `keyctl`, raw `clone` with unsupported flags. Returning a *clean* `-ENOSYS` (not a crash) for these is a feature: it turns "mysterious runtime hang" into "build-time / import-time error we can show the user." Your build farm should surface these as "package X needs syscall Y — unsupported."
+
+---
+
+## 10. The one paragraph to keep in mind
+
+None of this makes Wasm faster or denser — Wasm was already dense. This layer decides *which software is allowed through the door*. Every syscall you implement unlocks packages across **every** language at once (that's the O(1) win over per-package porting). Build P0/P1 backed by `wasmtime-wasi`, get a FastAPI app answering HTTP, add the pre-init snapshot for the 1 ms cold-start demo — that sequence is a shippable product before you ever touch threads or fork.
+

@@ -1,0 +1,7 @@
+/target
+/guest/cpython/build/
+/guest/cpython/Modules/musl_syscall.c
+/guest/build.log
+*.wasm
+!tests/conformance/fixtures/*.wasm
+.DS_Store
