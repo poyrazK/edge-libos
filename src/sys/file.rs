@@ -138,6 +138,12 @@ pub async fn read(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                     }
                 }
                 eof = tmp.is_empty() && *r.closed.lock();
+                // P1-3: if the pipe is non-blocking and empty (and not EOF),
+                // surface -EAGAIN instead of blocking. This matches the
+                // Linux semantics for `read(2)` on an O_NONBLOCK fd.
+                if tmp.is_empty() && !eof && r.nonblock.load(std::sync::atomic::Ordering::Relaxed) {
+                    return -crate::errno::EAGAIN;
+                }
             }
             Resource::File(fp) => {
                 // Read up to `len` bytes via std::io::Read at fp.pos.
@@ -173,6 +179,9 @@ pub async fn read(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         return 0;
     }
     if tmp.is_empty() {
+        // Reached only if the pipe was blocking (nonblock path returns
+        // earlier). P0 behavior: surface -EAGAIN even when blocking; a
+        // future P1-7 epoll layer will let callers block on read(2).
         return -crate::errno::EAGAIN;
     }
     let n = tmp.len();
@@ -427,10 +436,13 @@ pub async fn getdents64(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 /// pipe, inserts both ends into the FdTable, and writes the two u32 fds
 /// into the guest's `fdarray` pointer (little-endian, [read_fd, write_fd]).
 ///
-/// `flags` are honoured as best-effort for P0:
-/// * `O_CLOEXEC` (0o2000000) — accepted; FD_CLOEXEC tracked on the resource.
-/// * `O_NONBLOCK` (0o4000)   — accepted; semantically a no-op for buffer
-///   pipes (poll is not implemented yet).
+/// `flags` honored:
+/// * `O_CLOEXEC` (0o2000000) — accepted; FD_CLOEXEC tracked for fidelity.
+///   (P0 doesn't model exec; the flag is recorded but not enforced.)
+/// * `O_NONBLOCK` (0o4000)   — flips the `nonblock` bit on both ends so a
+///   subsequent `read` on the read end returns `-EAGAIN` when the buffer
+///   is empty (P1-3). Buffer pipes are unbounded on the write side, so
+///   `O_NONBLOCK` has no effect on writes today.
 pub async fn pipe2(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let fdarray_ptr = a[0];
     let flags = a[1] as i32;
@@ -441,18 +453,19 @@ pub async fn pipe2(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     }
 
     let (rd, wr) = crate::fd::make_pipe();
+    // Honour O_NONBLOCK at creation time. fcntl(F_SETFL) can flip this
+    // later; see `fn fcntl`.
+    if flags & O_NONBLOCK != 0 {
+        rd.nonblock.store(true, std::sync::atomic::Ordering::Relaxed);
+        wr.nonblock.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     let (rd_fd, wr_fd) = {
         let fds = &mut caller.data_mut().fds;
         let rd_fd = fds.insert(Resource::PipeRead(rd));
         let wr_fd = fds.insert(Resource::PipeWrite(wr));
         (rd_fd, wr_fd)
     };
-
-    // Honour O_CLOEXEC: stash the flag on the resource via FdTable so a
-    // later F_GETFD in the guest sees FD_CLOEXEC. P0 ignores the flag on
-    // exec because we don't model exec; the flag is recorded for fidelity.
-    let _ = flags & O_CLOEXEC;
-    let _ = flags & O_NONBLOCK;
 
     let buf = match mem::guest_slice_mut(caller, fdarray_ptr, 8) {
         Ok(b) => b,
@@ -624,14 +637,63 @@ pub async fn fcntl(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 
     match cmd {
         F_GETFL => {
+            // P1-3: actually read O_NONBLOCK from the resource. We don't
+            // distinguish RDONLY vs RDWR for pipes (they're full-duplex
+            // from the guest's perspective), so pipes report O_RDWR.
             let fds = &caller.data().fds;
             match fds.get(fd) {
+                Ok(Resource::Stdin(r)) | Ok(Resource::PipeRead(r)) => {
+                    let nb = r.nonblock.load(std::sync::atomic::Ordering::Relaxed);
+                    let mut fl = O_RDONLY;
+                    if nb {
+                        fl |= O_NONBLOCK;
+                    }
+                    fl as i64
+                }
+                Ok(Resource::Stdout(w)) | Ok(Resource::Stderr(w)) | Ok(Resource::PipeWrite(w)) => {
+                    let nb = w.nonblock.load(std::sync::atomic::Ordering::Relaxed);
+                    let mut fl = O_WRONLY;
+                    if nb {
+                        fl |= O_NONBLOCK;
+                    }
+                    fl as i64
+                }
                 Ok(Resource::File(_)) => O_RDWR as i64,
-                Ok(_) => O_RDONLY as i64,
+                Ok(Resource::Socket(s)) => {
+                    let nb = s.nonblock.load(std::sync::atomic::Ordering::Relaxed);
+                    let mut fl = O_RDWR;
+                    if nb {
+                        fl |= O_NONBLOCK;
+                    }
+                    fl as i64
+                }
                 Err(e) => e,
             }
         }
-        F_SETFL => 0,
+        F_SETFL => {
+            // P1-3: only O_NONBLOCK is wired through. Other bits (O_APPEND
+            // etc.) are accepted silently — matches Linux for a pipe.
+            let want_nonblock = (arg as i32) & O_NONBLOCK != 0;
+            let fds = &mut caller.data_mut().fds;
+            match fds.get_mut(fd) {
+                Ok(Resource::Stdin(r)) | Ok(Resource::PipeRead(r)) => {
+                    r.nonblock.store(want_nonblock, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(Resource::Stdout(w)) | Ok(Resource::Stderr(w)) | Ok(Resource::PipeWrite(w)) => {
+                    w.nonblock.store(want_nonblock, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(Resource::Socket(s)) => {
+                    s.nonblock.store(want_nonblock, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(Resource::File(_)) => {
+                    // Real files have no nonblock semantics on the host
+                    // (they're blocking I/O on the std::fs::File). Accept
+                    // the call and return 0.
+                }
+                Err(e) => return e,
+            }
+            0
+        }
         F_GETFD => 0,
         F_SETFD => {
             let _ = arg;
@@ -648,22 +710,27 @@ pub async fn fcntl(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                     Ok(Resource::Stdin(r)) => Resource::Stdin(crate::fd::PipeRead {
                         buf: r.buf.clone(),
                         closed: r.closed.clone(),
+                        nonblock: r.nonblock.clone(),
                     }),
                     Ok(Resource::Stdout(w)) => Resource::Stdout(crate::fd::PipeWrite {
                         buf: w.buf.clone(),
                         closed: w.closed.clone(),
+                        nonblock: w.nonblock.clone(),
                     }),
                     Ok(Resource::Stderr(w)) => Resource::Stderr(crate::fd::PipeWrite {
                         buf: w.buf.clone(),
                         closed: w.closed.clone(),
+                        nonblock: w.nonblock.clone(),
                     }),
                     Ok(Resource::PipeRead(r)) => Resource::PipeRead(crate::fd::PipeRead {
                         buf: r.buf.clone(),
                         closed: r.closed.clone(),
+                        nonblock: r.nonblock.clone(),
                     }),
                     Ok(Resource::PipeWrite(w)) => Resource::PipeWrite(crate::fd::PipeWrite {
                         buf: w.buf.clone(),
                         closed: w.closed.clone(),
+                        nonblock: w.nonblock.clone(),
                     }),
                     // P1-1: socket fds are not yet duplicable; P1-7's epoll
                     // layer is the right place to model shared fds. For now

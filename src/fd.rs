@@ -23,6 +23,8 @@ pub const STDERR: u32 = 2;
 pub struct PipeRead {
     pub buf: Arc<Mutex<VecDeque<u8>>>,
     pub closed: Arc<Mutex<bool>>,
+    /// P1-3: `O_NONBLOCK` flag, honored by `read` in `crate::sys::file`.
+    pub nonblock: Arc<AtomicBool>,
 }
 
 impl AsyncRead for PipeRead {
@@ -52,6 +54,10 @@ impl AsyncRead for PipeRead {
 pub struct PipeWrite {
     pub buf: Arc<Mutex<VecDeque<u8>>>,
     pub closed: Arc<Mutex<bool>>,
+    /// P1-3: `O_NONBLOCK` flag. Buffer pipes always accept writes today
+    /// (the buffer is unbounded), so this is recorded for fidelity but
+    /// does not currently affect `write` semantics.
+    pub nonblock: Arc<AtomicBool>,
 }
 
 impl AsyncWrite for PipeWrite {
@@ -85,12 +91,18 @@ impl AsyncWrite for PipeWrite {
 pub fn make_pipe() -> (PipeRead, PipeWrite) {
     let buf = Arc::new(Mutex::new(VecDeque::new()));
     let closed = Arc::new(Mutex::new(false));
+    let nonblock = Arc::new(AtomicBool::new(false));
     (
         PipeRead {
             buf: buf.clone(),
             closed: closed.clone(),
+            nonblock: nonblock.clone(),
         },
-        PipeWrite { buf, closed },
+        PipeWrite {
+            buf,
+            closed,
+            nonblock,
+        },
     )
 }
 
@@ -140,6 +152,15 @@ pub struct SocketInner {
     /// P1-2: set by `listen()`. Until this is `Some`, the socket is not
     /// passive and `accept4` (P1-4) will return -EINVAL.
     pub listen_backlog: Option<i32>,
+    /// P1-3: SO_REUSEADDR requested via `setsockopt`. Recorded for
+    /// fidelity; surfaced on the lazy TcpListener in P1-7.
+    pub so_reuseaddr: bool,
+    /// P1-3: SO_KEEPALIVE requested via `setsockopt`. Recorded for
+    /// fidelity; surfaced on the lazy TcpStream in P1-5/P1-7.
+    pub so_keepalive: bool,
+    /// P1-3: TCP_NODELAY requested via `setsockopt`. Recorded for
+    /// fidelity; surfaced on the lazy TcpStream in P1-5/P1-7.
+    pub tcp_nodelay: bool,
 }
 
 impl SocketInner {
@@ -149,6 +170,9 @@ impl SocketInner {
             nonblock: AtomicBool::new(nonblock),
             bound: None,
             listen_backlog: None,
+            so_reuseaddr: false,
+            so_keepalive: false,
+            tcp_nodelay: false,
         }
     }
 

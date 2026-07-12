@@ -68,6 +68,7 @@ int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
 #define NR_SOCKET 41
 #define NR_BIND 49
 #define NR_LISTEN 50
+#define NR_SETSOCKOPT 54
 
 // Pass/fail markers. Placed at offset 4096 in linear memory. The runner
 // reads back the bytes at 4096 after the run.
@@ -104,6 +105,10 @@ static inline int64_t sc3(int64_t nr, int64_t a, int64_t b, int64_t c) {
 }
 static inline int64_t sc4(int64_t nr, int64_t a, int64_t b, int64_t c, int64_t d) {
     return __kernel_syscall(nr, a, b, c, d, 0, 0);
+}
+static inline int64_t sc5(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
+                          int64_t a4, int64_t a5) {
+    return __kernel_syscall(nr, a1, a2, a3, a4, a5, 0);
 }
 static inline int64_t sc6(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
                           int64_t a4, int64_t a5, int64_t a6) {

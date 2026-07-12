@@ -20,6 +20,15 @@ use crate::mem;
 pub const NR_SOCKET: u32 = 41;
 pub const NR_BIND: u32 = 49;
 pub const NR_LISTEN: u32 = 50;
+pub const NR_SETSOCKOPT: u32 = 54;
+
+// setsockopt level + optname constants we honor (per plan §P1-3).
+// All other levels / optnames → 0 (accepted but unmodeled).
+pub const SOL_SOCKET: i32 = 1;
+pub const IPPROTO_TCP: i32 = 6;
+pub const SO_REUSEADDR: i32 = 2;
+pub const SO_KEEPALIVE: i32 = 9;
+pub const TCP_NODELAY: i32 = 1;
 
 // Address families.
 pub const AF_UNIX: i32 = 1;
@@ -199,6 +208,64 @@ pub async fn bind(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     match fds.get_mut(fd) {
         Ok(Resource::Socket(s)) => {
             s.bound = Some(addr);
+            0
+        }
+        Ok(_) => -EBADF,
+        Err(e) => e,
+    }
+}
+
+/// `setsockopt(sockfd, level, optname, optval, optlen)`.
+///
+/// P1-3 honors three opts (`SO_REUSEADDR`, `SO_KEEPALIVE`, `TCP_NODELAY`)
+/// by recording the desired state on `SocketInner`. Any other
+/// `(level, optname)` pair is accepted and returns 0 (per plan §4.4 —
+/// "unknown setsockopt opts → 0"); the optval bytes are not inspected.
+///
+/// P1-3 doesn't actually surface the recorded value to listeners or
+/// sockets — full integration (TCP_NODELY → nodelay on the kernel stream,
+/// SO_REUSEADDR → allow port reuse on the lazy TcpListener) is P1-7's
+/// epoll/listener materialization step. For now we accept the calls so
+/// guest libraries (uvicorn, FastAPI's ASGI loop) don't error out at
+/// import time, and we lay down the state for later steps.
+pub async fn setsockopt(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let fd = match u32::try_from(a[0]) {
+        Ok(f) => f,
+        Err(_) => return -EBADF,
+    };
+    let level = a[1] as i32;
+    let optname = a[2] as i32;
+    let optval_ptr = a[3];
+    let optlen = a[4];
+
+    // Bounds-check the optval pointer for the documented `optlen`. We
+    // accept any optlen (even 0); the kernel doesn't dereference the
+    // value for our three honored opts.
+    if optval_ptr != 0 && optlen > 0 {
+        if let Err(e) = mem::guest_slice(caller, optval_ptr, optlen) {
+            return e;
+        }
+    }
+
+    let is_known = matches!(
+        (level, optname),
+        (SOL_SOCKET, SO_REUSEADDR) | (SOL_SOCKET, SO_KEEPALIVE) | (IPPROTO_TCP, TCP_NODELAY)
+    );
+
+    let fds = &mut caller.data_mut().fds;
+    match fds.get_mut(fd) {
+        Ok(Resource::Socket(s)) => {
+            if is_known {
+                // Record the intent on the socket so P1-7's listener
+                // materialization can read it. We don't keep the optval
+                // bytes yet — only which opt was set.
+                match (level, optname) {
+                    (SOL_SOCKET, SO_REUSEADDR) => s.so_reuseaddr = true,
+                    (SOL_SOCKET, SO_KEEPALIVE) => s.so_keepalive = true,
+                    (IPPROTO_TCP, TCP_NODELAY) => s.tcp_nodelay = true,
+                    _ => unreachable!(),
+                }
+            }
             0
         }
         Ok(_) => -EBADF,

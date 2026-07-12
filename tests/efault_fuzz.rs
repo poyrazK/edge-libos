@@ -332,6 +332,24 @@ fn fuzz_listen_no_pointer_args() -> Result<()> {
     Ok(())
 }
 
+/// setsockopt(fd, level, optname, optval, optlen) — fd is fine but the
+/// optval pointer is poisoned.
+#[test]
+fn fuzz_setsockopt_bad_optval_pointer() -> Result<()> {
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, CALLER_WAT)?;
+    for ptr in POISON_PTR {
+        let r = block_on(assert_efault_or_safe(
+            &engine, &linker, &module,
+            edge_libos::sys::socket::NR_SETSOCKOPT as i64,
+            [3 /*fd*/, 1 /*SOL_SOCKET*/, 2 /*SO_REUSEADDR*/, *ptr, 4 /*optlen*/, 0],
+            "setsockopt",
+        ))?;
+        let _ = r;
+    }
+    Ok(())
+}
+
 /// Brute-force overflow: pointer = i64::MAX/2, len = i64::MAX/2.
 #[test]
 fn fuzz_overflow_ptr_plus_len_every_pointer_syscall() -> Result<()> {
@@ -380,6 +398,8 @@ fn fuzz_overflow_ptr_plus_len_every_pointer_syscall() -> Result<()> {
          [1, huge, huge, 0, 0, 0]),
         (edge_libos::sys::socket::NR_BIND, "bind",
          [3, huge, huge, 0, 0, 0]),
+        (edge_libos::sys::socket::NR_SETSOCKOPT, "setsockopt",
+         [3, 1, 2, huge, huge, 0]),
     ];
     for (nr, name, args) in cases {
         let ret = block_on(assert_efault_or_safe(
