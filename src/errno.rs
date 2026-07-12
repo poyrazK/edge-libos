@@ -39,6 +39,7 @@ pub const EDESTADDRREQ: i64 = 89;
 pub const EOPNOTSUPP: i64 = 95;
 pub const EAFNOSUPPORT: i64 = 97;
 pub const EPROTONOSUPPORT: i64 = 93;
+pub const EADDRINUSE: i64 = 98;
 
 /// Return a host-style "negative errno" from a positive errno value.
 #[inline]

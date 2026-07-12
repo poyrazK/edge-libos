@@ -21,6 +21,8 @@ pub const NR_SOCKET: u32 = 41;
 pub const NR_BIND: u32 = 49;
 pub const NR_LISTEN: u32 = 50;
 pub const NR_SETSOCKOPT: u32 = 54;
+pub const NR_ACCEPT: u32 = 43;
+pub const NR_ACCEPT4: u32 = 288;
 
 // setsockopt level + optname constants we honor (per plan §P1-3).
 // All other levels / optnames → 0 (accepted but unmodeled).
@@ -213,6 +215,140 @@ pub async fn bind(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         Ok(_) => -EBADF,
         Err(e) => e,
     }
+}
+
+/// `accept4(sockfd, addr, addrlen_ptr, flags)` — accept a connection on
+/// a listening socket. Returns a new fd whose `SocketInner.stream` holds
+/// the connected `TcpStream`. The first async-suspending socket syscall.
+///
+/// `flags`:
+/// * `SOCK_NONBLOCK` — propagates to the new fd's `nonblock` bit.
+/// * `SOCK_CLOEXEC` — accepted, recorded for fidelity (P1 doesn't model
+///   exec, but the value is honored if a future exec path is added).
+///
+/// Errors:
+/// - `-EBADF`   — fd not a Socket.
+/// - `-EINVAL`  — not listening (bind + listen required).
+/// - `-EFAULT`  — addr pointer out of bounds (only if addr != NULL).
+/// - `-EOPNOTSUPP` — bound address is not IPv4 (V6 listener is P1-7).
+pub async fn accept4(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let fd = match u32::try_from(a[0]) {
+        Ok(f) => f,
+        Err(_) => return -EBADF,
+    };
+    let addr_ptr = a[1];
+    let addrlen_ptr = a[2];
+    let flags = a[3] as i32;
+
+    let sock_nonblock = flags & SOCK_NONBLOCK != 0;
+    let _sock_cloexec = flags & SOCK_CLOEXEC;
+
+    // Validate output pointers up front. addr gets 16 bytes (sockaddr_in);
+    // addrlen gets 4 bytes (socklen_t). EFAULT on failure.
+    if addr_ptr != 0 {
+        if let Err(e) = mem::guest_slice_mut(caller, addr_ptr, 16) {
+            return e;
+        }
+    }
+    if addrlen_ptr != 0 {
+        if let Err(e) = mem::guest_slice_mut(caller, addrlen_ptr, 4) {
+            return e;
+        }
+    }
+
+    // Phase 1: pull the (possibly-lazy) listener out of the resource.
+    // We hold it as a local Option so we can `.await` outside the
+    // `&mut Caller` borrow.
+    let listener_opt: Option<tokio::net::TcpListener>;
+    let kind;
+    let parent_nonblock: bool;
+    {
+        let fds = &mut caller.data_mut().fds;
+        match fds.get_mut(fd) {
+            Ok(Resource::Socket(s)) => {
+                if !s.is_listening() {
+                    return -EINVAL;
+                }
+                if s.listener.is_none() {
+                    let addr = match &s.bound {
+                        Some(SockAddr::V4 { port, addr }) => std::net::SocketAddrV4::new(
+                            std::net::Ipv4Addr::from(*addr),
+                            *port,
+                        ),
+                        Some(SockAddr::V6 { .. }) => return -EOPNOTSUPP,
+                        None => return -EINVAL,
+                    };
+                    let listener = match tokio::net::TcpListener::bind(addr).await {
+                        Ok(l) => l,
+                        Err(_) => return -crate::errno::EADDRINUSE,
+                    };
+                    s.listener = Some(listener);
+                }
+                kind = s.kind;
+                parent_nonblock = s.nonblock.load(std::sync::atomic::Ordering::Relaxed);
+                listener_opt = s.listener.take();
+            }
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    }
+
+    let listener = match listener_opt {
+        Some(l) => l,
+        None => return -EINVAL,
+    };
+
+    // Phase 2: await a connection. This may suspend.
+    let (stream, peer) = match listener.accept().await {
+        Ok(pair) => pair,
+        Err(_) => return -crate::errno::EIO,
+    };
+
+    // Phase 3: write back the peer sockaddr if requested.
+    if addr_ptr != 0 {
+        if let Ok(buf) = mem::guest_slice_mut(caller, addr_ptr, 16) {
+            match peer {
+                std::net::SocketAddr::V4(v4) => {
+                    let ip = v4.ip().octets();
+                    let port = v4.port();
+                    buf[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+                    buf[2..4].copy_from_slice(&port.to_be_bytes());
+                    buf[4..8].copy_from_slice(&ip);
+                    for b in &mut buf[8..16] {
+                        *b = 0;
+                    }
+                }
+                std::net::SocketAddr::V6(_) => return -EOPNOTSUPP,
+            }
+        }
+    }
+    if addrlen_ptr != 0 {
+        if let Ok(buf) = mem::guest_slice_mut(caller, addrlen_ptr, 4) {
+            buf[0..4].copy_from_slice(&(16u32).to_le_bytes());
+        }
+    }
+
+    // Phase 4: put the listener back so subsequent accepts work.
+    {
+        let fds = &mut caller.data_mut().fds;
+        if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
+            if s.listener.is_none() {
+                s.listener = Some(listener);
+            }
+            // If a concurrent caller already restored one, drop ours.
+        }
+    }
+
+    // Phase 5: insert the accepted stream as a fresh fd.
+    let accepted = SocketInner::from_accepted(stream, kind, sock_nonblock || parent_nonblock);
+    let new_fd = caller.data_mut().fds.insert(Resource::Socket(accepted));
+    new_fd as i64
+}
+
+/// `accept(fd, addr, addrlen)` — legacy syscall. Implemented as a
+/// shim over `accept4(fd, addr, addrlen, 0)` (no flags).
+pub async fn accept(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    accept4(caller, [a[0], a[1], a[2], 0, 0, 0]).await
 }
 
 /// `setsockopt(sockfd, level, optname, optval, optlen)`.

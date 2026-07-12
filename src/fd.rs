@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 
 pub const AT_FDCWD: i64 = -100;
 pub const STDIN: u32 = 0;
@@ -161,6 +162,13 @@ pub struct SocketInner {
     /// P1-3: TCP_NODELAY requested via `setsockopt`. Recorded for
     /// fidelity; surfaced on the lazy TcpStream in P1-5/P1-7.
     pub tcp_nodelay: bool,
+    /// P1-4: lazy tokio::net::TcpListener materialized on the first
+    /// `accept4` call. Built from `bound` + `so_reuseaddr`.
+    pub listener: Option<TcpListener>,
+    /// P1-4: for accepted sockets — the connection's TcpStream. Set by
+    /// `accept4`, used by `recvfrom`/`sendto`/`close` (P1-5) and by
+    /// `epoll_wait` (P1-7).
+    pub stream: Option<TcpStream>,
 }
 
 impl SocketInner {
@@ -173,6 +181,8 @@ impl SocketInner {
             so_reuseaddr: false,
             so_keepalive: false,
             tcp_nodelay: false,
+            listener: None,
+            stream: None,
         }
     }
 
@@ -180,6 +190,14 @@ impl SocketInner {
     #[allow(dead_code)]
     pub fn is_listening(&self) -> bool {
         self.bound.is_some() && self.listen_backlog.is_some()
+    }
+
+    /// P1-4: construct a SocketInner for a freshly accepted connection.
+    #[allow(dead_code)]
+    pub fn from_accepted(stream: TcpStream, kind: SocketKind, nonblock: bool) -> Self {
+        let mut s = Self::new(kind, nonblock);
+        s.stream = Some(stream);
+        s
     }
 }
 

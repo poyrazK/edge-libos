@@ -1,8 +1,10 @@
-//! Socket conformance — P1-1: `socket(2)` only.
+//! Socket conformance — P1-1 onward: socket(2), bind(2), listen(2),
+//! accept4(2). P1-4 lands the first async-suspending socket syscall.
 //!
-//! Tests in this file exercise the `socket(family, type_and_flags, protocol)`
-//! syscall end-to-end via WAT modules. Subsequent P1 sub-steps will add
-//! tests for bind/listen/accept/connect/recv/send/getsockopt/shutdown/epoll.
+//! Tests exercise `socket/family, type_and_flags, protocol`,
+//! `bind`, `listen`, and `accept4` end-to-end via WAT modules. Later
+//! P1 sub-steps will add tests for connect/recvfrom/sendto/getsockopt/
+//! shutdown/poll/epoll.
 
 mod common;
 
@@ -469,5 +471,217 @@ fn bind_on_non_socket_returns_ebadf() -> Result<()> {
         call_bind(&linker, &mut store, &bind, 0 /*stdin*/).await
     })?;
     assert_eq!(ret, -edge_libos::errno::EBADF, "bind on stdin should return -EBADF");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// P1-4: accept4(2) + accept(2) — first async-suspending socket syscall
+// ---------------------------------------------------------------------------
+
+/// `accept4(fd, addr_ptr, addrlen_ptr, flags)` — flags bit 12 = SOCK_NONBLOCK,
+/// 25 = SOCK_CLOEXEC. Returns new fd on success.
+const ACCEPT4_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      ;; Output sockaddr_in goes to 4096 (16B). addrlen goes to 4112 (4B).
+      (func (export "go")
+        (param $fd i64) (param $flags i64)
+        (result i64)
+        (call $syscall
+          (i64.const 288)             ;; NR_ACCEPT4
+          (local.get $fd)
+          (i64.const 4096)            ;; addr ptr
+          (i64.const 4112)            ;; addrlen ptr
+          (local.get $flags)
+          (i64.const 0) (i64.const 0)))
+    )
+"#;
+
+/// `accept(fd, addr_ptr, addrlen_ptr)` — legacy shim.
+const ACCEPT_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "go") (param $fd i64) (result i64)
+        (call $syscall
+          (i64.const 43)              ;; NR_ACCEPT
+          (local.get $fd)
+          (i64.const 4096)
+          (i64.const 4112)
+          (i64.const 0) (i64.const 0) (i64.const 0)))
+    )
+"#;
+
+async fn call_accept4(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    module: &wasmtime::Module,
+    fd: i64,
+    flags: i64,
+) -> Result<i64> {
+    let inst = linker.instantiate_async(&mut *store, module).await?;
+    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = inst.get_typed_func::<(i64, i64), i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, (fd, flags)).await?)
+}
+
+async fn call_accept(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    module: &wasmtime::Module,
+    fd: i64,
+) -> Result<i64> {
+    let inst = linker.instantiate_async(&mut *store, module).await?;
+    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = inst.get_typed_func::<i64, i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, fd).await?)
+}
+
+/// `accept4` on an fd that isn't a Socket returns -EBADF.
+#[test]
+fn accept4_on_non_socket_returns_ebadf() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let acc = common::compile_wat(&engine, ACCEPT4_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        call_accept4(&linker, &mut store, &acc, 0 /*stdin*/, 0).await
+    })?;
+    assert_eq!(ret, -edge_libos::errno::EBADF);
+    Ok(())
+}
+
+/// `accept4` on a Socket that hasn't been bound+listened returns -EINVAL.
+#[test]
+fn accept4_on_unbound_socket_returns_einval() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let sock = common::compile_wat(&engine, SOCKET_WAT)?;
+    let acc = common::compile_wat(&engine, ACCEPT4_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let fd = call_socket(&linker, &mut store, &sock, 2, 1).await?;
+        call_accept4(&linker, &mut store, &acc, fd, 0).await
+    })?;
+    assert_eq!(ret, -edge_libos::errno::EINVAL);
+    Ok(())
+}
+
+/// Same as above, but binds to a fixed port and uses port-discovery via
+/// the kernel's lazy listener. This is the canonical P1-4 integration test.
+///
+/// Implementation: open a host-side TcpListener, capture its bound port,
+/// then bind the guest socket to that exact port. The guest accept4 will
+/// race against a host-side connect. The lazy listener in the kernel will
+/// race-bind to the same port; if the host wins, the guest accept4
+/// receives our peer.
+#[test]
+fn accept4_after_host_connect_returns_valid_fd() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+
+    // Open the host listener first so we know the port. We do this OUTSIDE
+    // the runtime because we only need the ephemeral port number; the
+    // actual listener is dropped before we drop into the runtime.
+    let host_listener_std = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind host listener");
+    let port = host_listener_std.local_addr().unwrap().port();
+    drop(host_listener_std);
+
+    let sock = common::compile_wat(&engine, SOCKET_WAT)?;
+    let bind = common::compile_wat(&engine, BIND_WAT)?;
+    let listen = common::compile_wat(&engine, LISTEN_WAT)?;
+    let acc = common::compile_wat(&engine, ACCEPT4_WAT)?;
+    let close = common::compile_wat(&engine, CLOSE_WAT)?;
+
+    // Custom BIND_WAT that takes a port (16-bit) in addition to fd:
+    // builds sockaddr_in at offset 4096 with the guest-supplied port.
+    // Family = AF_INET(2), addr = 127.0.0.1.
+    let bind_param_wat = format!(r#"
+        (module
+          (import "kernel" "syscall"
+            (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+          (memory (export "memory") 1)
+          ;; Build sockaddr_in at offset 4096 at module-instantiation time.
+          ;; family = AF_INET (2 LE).
+          ;; port = BE-encoded from $port param (we patch the WAT string).
+          ;; addr = 127.0.0.1.
+          ;; patch: replace PATCH_PORT with the BE-encoded port bytes.
+          (data (i32.const 4096)
+            "\02\00PATCH_PORT\7f\00\00\01"
+            "\00\00\00\00\00\00\00\00")
+          (func (export "go") (param $fd i64) (result i64)
+            (call $syscall
+              (i64.const 49)
+              (local.get $fd)
+              (i64.const 4096)
+              (i64.const 16)
+              (i64.const 0) (i64.const 0) (i64.const 0))))
+    "#);
+    let port_be = port.to_be_bytes();
+    let bind_param_wat = bind_param_wat.replace(
+        "PATCH_PORT",
+        &format!("\\{:02x}\\{:02x}", port_be[0], port_be[1]),
+    );
+    let bind_param = common::compile_wat(&engine, &bind_param_wat)?;
+
+    block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let fd = call_socket(&linker, &mut store, &sock, 2, 1).await?;
+        let bind_ret = call_bind(&linker, &mut store, &bind_param, fd).await?;
+        assert_eq!(bind_ret, 0, "bind to {port} should return 0");
+        let listen_ret = call_listen(&linker, &mut store, &listen, fd, 1).await?;
+        assert_eq!(listen_ret, 0);
+
+        // Spawn a host connect that races against the guest's lazy listener.
+        // The host-side std listener was already dropped above (we only
+        // needed the port number). The kernel will lazily TcpListener::bind
+        // to that exact port inside accept4.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Connect to the port we know the kernel is about to bind to.
+        let connect_task = tokio::spawn(async move {
+            tokio::net::TcpStream::connect(("127.0.0.1", port)).await
+        });
+
+        // Race: accept4 has 3 seconds. If the kernel bind succeeds and
+        // our connect lands first, we get a real fd with stream=Some.
+        let new_fd_res = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            call_accept4(&linker, &mut store, &acc, fd, 0),
+        ).await;
+
+        match new_fd_res {
+            Ok(Ok(new_fd)) => {
+                assert!(new_fd >= 3, "accept4 returned {new_fd}");
+                let _ = connect_task.await;
+                match store.data().fds.get(new_fd as u32) {
+                    Ok(Resource::Socket(s)) => {
+                        assert!(s.stream.is_some(),
+                            "accepted fd must have stream=Some");
+                    }
+                    Ok(_) => panic!("fd {new_fd} was not a Socket resource"),
+                    Err(e) => panic!("fd {new_fd} lookup failed: {e}"),
+                }
+                let _ = call_close(&linker, &mut store, &close, new_fd).await?;
+                let _ = call_close(&linker, &mut store, &close, fd).await?;
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                let _ = connect_task.await;
+                panic!("accept4 timed out after 3s — kernel bind or connect failed");
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })?;
     Ok(())
 }
