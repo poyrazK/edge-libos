@@ -23,3 +23,4 @@ pub mod sys;
 
 pub use kernel::Kernel;
 pub use host::{add_to_linker, build_engine, build_store};
+pub use sys::signal::SigAction;
