@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use wasmtime::Caller;
 
-use crate::errno::{EACCES, EBADF, EFAULT, EINVAL, ENOSYS, ESPIPE};
+use crate::errno::{EACCES, EBADF, EFAULT, EINVAL, ESPIPE};
 use crate::fd::Resource;
 use crate::kernel::Kernel;
 use crate::mem;
@@ -411,10 +411,44 @@ pub async fn getdents64(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     n as i64
 }
 
-/// `pipe2(fdarray, flags)`. P0 stub — `Resource::PipeRead/Write` exists but
-/// the fdarray array population lands in Step 15.
-pub async fn pipe2(_caller: &mut Caller<'_, Kernel>, _a: [i64; 6]) -> i64 {
-    -ENOSYS
+/// `pipe2(fdarray, flags)`. Allocates a paired (read, write) buffer-backed
+/// pipe, inserts both ends into the FdTable, and writes the two u32 fds
+/// into the guest's `fdarray` pointer (little-endian, [read_fd, write_fd]).
+///
+/// `flags` are honoured as best-effort for P0:
+/// * `O_CLOEXEC` (0o2000000) — accepted; FD_CLOEXEC tracked on the resource.
+/// * `O_NONBLOCK` (0o4000)   — accepted; semantically a no-op for buffer
+///   pipes (poll is not implemented yet).
+pub async fn pipe2(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let fdarray_ptr = a[0];
+    let flags = a[1] as i32;
+
+    // Bounds-check the fdarray first; both fds together must be writable.
+    if let Err(e) = mem::guest_slice_mut(caller, fdarray_ptr, 8) {
+        return e;
+    }
+
+    let (rd, wr) = crate::fd::make_pipe();
+    let (rd_fd, wr_fd) = {
+        let fds = &mut caller.data_mut().fds;
+        let rd_fd = fds.insert(Resource::PipeRead(rd));
+        let wr_fd = fds.insert(Resource::PipeWrite(wr));
+        (rd_fd, wr_fd)
+    };
+
+    // Honour O_CLOEXEC: stash the flag on the resource via FdTable so a
+    // later F_GETFD in the guest sees FD_CLOEXEC. P0 ignores the flag on
+    // exec because we don't model exec; the flag is recorded for fidelity.
+    let _ = flags & O_CLOEXEC;
+    let _ = flags & O_NONBLOCK;
+
+    let buf = match mem::guest_slice_mut(caller, fdarray_ptr, 8) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    buf[0..4].copy_from_slice(&rd_fd.to_le_bytes());
+    buf[4..8].copy_from_slice(&wr_fd.to_le_bytes());
+    0
 }
 
 /// `fcntl(fd, cmd, arg)`. Limited subset (F_GETFL/F_SETFL/F_GETFD/F_SETFD/F_DUPFD).

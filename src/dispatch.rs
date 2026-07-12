@@ -105,3 +105,50 @@ async fn dispatch(
         }
     }
 }
+
+/// Resolve a syscall number to a short name. Returns `"?"` for unknown.
+/// Used by the trace-host binary for human-friendly JSON output.
+pub fn syscall_name(nr: u32) -> &'static str {
+    match nr {
+        sys::process::NR_EXIT => "exit",
+        sys::process::NR_EXIT_GROUP => "exit_group",
+        sys::process::NR_GETPID => "getpid",
+        sys::process::NR_GETTID => "gettid",
+        sys::process::NR_SET_TID_ADDRESS => "set_tid_address",
+        sys::process::NR_SET_ROBUST_LIST => "set_robust_list",
+        sys::process::NR_ARCH_PRCTL => "arch_prctl",
+        sys::process::NR_RSEQ => "rseq",
+
+        sys::memory::NR_MMAP => "mmap",
+        sys::memory::NR_MUNMAP => "munmap",
+        sys::memory::NR_MPROTECT => "mprotect",
+        sys::memory::NR_MADVISE => "madvise",
+        sys::memory::NR_BRK => "brk",
+
+        sys::file::NR_READ => "read",
+        sys::file::NR_WRITE => "write",
+        sys::file::NR_OPENAT => "openat",
+        sys::file::NR_CLOSE => "close",
+        sys::file::NR_LSEEK => "lseek",
+        sys::file::NR_FSTAT => "fstat",
+        sys::file::NR_NEWFSTATAT => "newfstatat",
+        sys::file::NR_GETDENTS64 => "getdents64",
+        sys::file::NR_PIPE2 => "pipe2",
+        sys::file::NR_FCNTL => "fcntl",
+
+        sys::identity::NR_GETUID => "getuid",
+        sys::identity::NR_GETEUID => "geteuid",
+        sys::identity::NR_GETGID => "getgid",
+        sys::identity::NR_GETEGID => "getegid",
+
+        sys::time::NR_CLOCK_GETTIME => "clock_gettime",
+        sys::time::NR_GETTIMEOFDAY => "gettimeofday",
+        sys::time::NR_NANOSLEEP => "nanosleep",
+
+        sys::random::NR_GETRANDOM => "getrandom",
+
+        sys::signal::NR_RT_SIGACTION => "rt_sigaction",
+        sys::signal::NR_RT_SIGPROCMASK => "rt_sigprocmask",
+        _ => "?",
+    }
+}

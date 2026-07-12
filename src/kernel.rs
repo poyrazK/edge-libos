@@ -103,4 +103,21 @@ impl Kernel {
     pub fn memory(&self) -> Result<&Memory, i64> {
         self.memory.as_ref().ok_or(-(crate::errno::EFAULT))
     }
+
+    /// Clone the stdout buffer Arc (for draining after the guest exits).
+    /// Returns None if fd=1 has been closed or replaced.
+    pub fn stdout_buf(&self) -> Option<std::sync::Arc<parking_lot::Mutex<std::collections::VecDeque<u8>>>> {
+        match self.fds.get(crate::fd::STDOUT) {
+            Ok(crate::fd::Resource::Stdout(w)) => Some(w.buf.clone()),
+            _ => None,
+        }
+    }
+
+    /// Clone the stderr buffer Arc (for draining after the guest exits).
+    pub fn stderr_buf(&self) -> Option<std::sync::Arc<parking_lot::Mutex<std::collections::VecDeque<u8>>>> {
+        match self.fds.get(crate::fd::STDERR) {
+            Ok(crate::fd::Resource::Stderr(w)) => Some(w.buf.clone()),
+            _ => None,
+        }
+    }
 }

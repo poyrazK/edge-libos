@@ -149,6 +149,21 @@ const WRITE_WAT: &str = r#"
     )
 "#;
 
+/// pipe2(fdarray@4096, flags) → 0. Writes [rd_fd, wr_fd] as i32 little-endian.
+const PIPE2_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "go") (result i64)
+        (call $syscall
+          (i64.const 293)            ;; NR_PIPE2
+          (i64.const 4096)           ;; fdarray pointer
+          (i64.const 0)              ;; flags (no CLOEXEC / NONBLOCK)
+          (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+    )
+"#;
+
 /// Helpers -----------------------------------------------------------------
 
 /// Build a WAT with a literal byte payload written at offset 4096.
@@ -520,4 +535,38 @@ fn nr_constants_match_linux_x86_64() {
     assert_eq!(edge_libos::sys::file::NR_LSEEK, 8);
     assert_eq!(edge_libos::sys::file::NR_FSTAT, 5);
     assert_eq!(edge_libos::sys::file::NR_GETDENTS64, 217);
+    assert_eq!(edge_libos::sys::file::NR_PIPE2, 293);
+}
+
+#[test]
+fn pipe2_writes_pair_into_guest_array() -> Result<()> {
+    let (engine, linker) = common::engine_and_linker()?;
+    let pipe2_mod = common::compile_wat(&engine, PIPE2_WAT)?;
+
+    let (ret, rd_fd, wr_fd) = block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let inst = linker.instantiate_async(&mut store, &pipe2_mod).await?;
+        if let Some(mem) = inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let f = inst.get_typed_func::<(), i64>(&mut store, "go")?;
+        let r = f.call_async(&mut store, ()).await?;
+
+        let mem = store.data().memory().unwrap().clone();
+        let data = mem.data(&store);
+        let rd = u32::from_le_bytes(data[4096..4100].try_into().unwrap());
+        let wr = u32::from_le_bytes(data[4100..4104].try_into().unwrap());
+        Ok::<_, anyhow::Error>((r, rd, wr))
+    })?;
+    assert_eq!(ret, 0, "pipe2 should return 0 on success");
+    assert!(
+        rd_fd >= 3,
+        "read fd should be >=3 (after stdin/stdout/stderr), got {rd_fd}"
+    );
+    assert!(
+        wr_fd >= 3,
+        "write fd should be >=3 (after stdin/stdout/stderr), got {wr_fd}"
+    );
+    assert_ne!(rd_fd, wr_fd, "read and write fds must differ");
+    Ok(())
 }
