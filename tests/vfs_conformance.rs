@@ -954,6 +954,50 @@ fn writev_concatenates_to_stdout() -> Result<()> {
 // Step 25-30 PR review gaps: negative-path tests
 // ---------------------------------------------------------------------------
 
+/// Regression: `stat(path_ptr, ...)` with an out-of-bounds path pointer must
+/// return `-EFAULT`, not `-ENOENT`. The empty-path guard added in this PR
+/// runs *after* `mem::guest_str`, so an unreadable path is still surfaced
+/// as EFAULT (matches Linux: the pointer is checked before the path is
+/// interpreted).
+#[test]
+fn stat_faulty_path_returns_efault_not_enoent() -> Result<()> {
+    let d = TmpDir::new();
+    // 0xFFFFFFFC is one page beyond the 1-page (64KiB) linear memory.
+    // mem::guest_str clamps length to 4096 so we read uninitialised bytes,
+    // but any non-NUL byte yields a non-empty path and any NUL stops
+    // reading — either way the pointer is OOB and the kernel must EFAULT
+    // before evaluating path semantics. We pick a NUL-only region to also
+    // exercise the empty-path code path: the kernel must still EFAULT
+    // because the pointer itself is invalid, not because the path is empty.
+    let wat = r#"
+        (module
+          (import "kernel" "syscall"
+            (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+          (memory (export "memory") 1)
+          (func (export "go") (result i64)
+            (call $syscall
+              (i64.const 4)              ;; NR_STAT
+              (i64.const 4294967292)     ;; 0xFFFFFFFC — beyond linear memory
+              (i64.const 8192)           ;; statbuf
+              (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0))))
+    "#;
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, wat)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, common::kernel_with_preopen(&d.0));
+        let inst = linker.instantiate_async(&mut store, &module).await?;
+        if let Some(mem) = inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let f = inst.get_typed_func::<(), i64>(&mut store, "go")?;
+        f.call_async(&mut store, ()).await
+    })?;
+    assert_eq!(ret, -edge_libos::errno::EFAULT,
+        "stat() with OOB path pointer must return -EFAULT (not -ENOENT)");
+    Ok(())
+}
+
 /// `stat("/file")` on a missing file → -ENOENT. STAT_WAT hardcodes
 /// `/file\00` at offset 4096; we simply don't create the file.
 #[test]

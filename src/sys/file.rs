@@ -488,7 +488,8 @@ pub async fn stat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 }
 
 /// `lstat(path, statbuf)` — `newfstatat` with `AT_SYMLINK_NOFOLLOW = 0x100`.
-/// Returns `-ENOENT` if `path` is empty (matches Linux).
+/// Returns `-ENOENT` if `path` is empty (matches Linux: an empty path
+/// requires `AT_EMPTY_PATH` to refer to the cwd).
 pub async fn lstat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let path_ptr = a[0];
     let statbuf_ptr = a[1];
