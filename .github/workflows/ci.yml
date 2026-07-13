@@ -139,7 +139,15 @@ jobs:
             ~/.cargo/git
             target
 
-      - name: 4. cargo test --profile ci (full Rust suite, one compile)
+      - name: 4. NR-consistency check (Rust ↔ C ↔ dispatch)
+        # Cheap (no cargo), fail-fast gate that catches silent NR-table
+        # drift across the three sources of truth. See
+        # scripts/check_nr_consistency.sh for details.
+        run: |
+          set -euo pipefail
+          bash scripts/check_nr_consistency.sh
+
+      - name: 5. cargo test --profile ci (full Rust suite, one compile)
         # Compiles the whole graph ONCE (unwind + no LTO). Includes the
         # strace_baseline_diff and edge_python_* integration tests, so
         # they don't need separate invocations.
