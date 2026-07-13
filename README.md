@@ -51,12 +51,12 @@ artifact and requires `zig cc` + a git submodule — see `guest/build.sh`.
 ## Test totals
 
 - **42** Rust unit tests (in `#[cfg(test)]` modules under `src/`)
-- **~200** Rust integration tests (across `tests/*.rs`)
-- **49** C conformance tests (`tests/conformance/*.c`, marker-enforced)
-- **Total: ~290 tests, all green.**
+- **158** Rust integration tests (across `tests/*.rs`)
+- **50** C conformance tests (`tests/conformance/*.c`, marker-enforced)
+- **Total: 250 tests, all green.**
 
 P2-B4 added `statx(2)` + a C test. P2-B5 added `dup/dup2/dup3` +
-shared-state refactor + 4 new C tests.
+shared-state refactor + 5 new C tests.
 
 Source of truth: `bash tests/count_tests.sh`. The conformance runner
 also prints the total at the end of its run.

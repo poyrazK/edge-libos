@@ -1240,7 +1240,14 @@ pub async fn fcntl(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         }
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let want_cloexec = cmd == F_DUPFD_CLOEXEC;
-            let min_fd = arg as u32;
+            // POSIX glibc: F_DUPFD rejects negative `arg`. Cast as i32
+            // first to detect the sign, then widen to u32 only on the
+            // happy path.
+            let min_fd = if (arg as i32) < 0 {
+                return -EINVAL;
+            } else {
+                arg as u32
+            };
             let cloned = {
                 let fds = &caller.data().fds;
                 match fds.get(fd) {
@@ -1374,51 +1381,47 @@ async fn internal_dup(
     // Phase 1: clone-by-Arc (or per-field for pipes). We do this under a
     // shared borrow so the cloned `Resource` is detached by the time we
     // mutate the FdTable.
-    let cloned: Option<Resource> = {
+    let cloned: Resource = {
         let fds = &caller.data().fds;
         match fds.get(oldfd) {
             Err(e) => return e,
-            Ok(Resource::File(fp)) => Some(Resource::File(std::sync::Arc::clone(fp))),
-            Ok(Resource::Socket(s)) => Some(Resource::Socket(std::sync::Arc::clone(s))),
-            Ok(Resource::Stdin(r)) => Some(Resource::Stdin(crate::fd::PipeRead {
+            Ok(Resource::File(fp)) => Resource::File(std::sync::Arc::clone(fp)),
+            Ok(Resource::Socket(s)) => Resource::Socket(std::sync::Arc::clone(s)),
+            Ok(Resource::Stdin(r)) => Resource::Stdin(crate::fd::PipeRead {
                 buf: r.buf.clone(),
                 closed: r.closed.clone(),
                 nonblock: r.nonblock.clone(),
                 notify: r.notify.clone(),
-            })),
-            Ok(Resource::Stdout(w)) => Some(Resource::Stdout(crate::fd::PipeWrite {
+            }),
+            Ok(Resource::Stdout(w)) => Resource::Stdout(crate::fd::PipeWrite {
                 buf: w.buf.clone(),
                 closed: w.closed.clone(),
                 nonblock: w.nonblock.clone(),
                 notify: w.notify.clone(),
-            })),
-            Ok(Resource::Stderr(w)) => Some(Resource::Stderr(crate::fd::PipeWrite {
+            }),
+            Ok(Resource::Stderr(w)) => Resource::Stderr(crate::fd::PipeWrite {
                 buf: w.buf.clone(),
                 closed: w.closed.clone(),
                 nonblock: w.nonblock.clone(),
                 notify: w.notify.clone(),
-            })),
-            Ok(Resource::PipeRead(r)) => Some(Resource::PipeRead(crate::fd::PipeRead {
+            }),
+            Ok(Resource::PipeRead(r)) => Resource::PipeRead(crate::fd::PipeRead {
                 buf: r.buf.clone(),
                 closed: r.closed.clone(),
                 nonblock: r.nonblock.clone(),
                 notify: r.notify.clone(),
-            })),
-            Ok(Resource::PipeWrite(w)) => Some(Resource::PipeWrite(crate::fd::PipeWrite {
+            }),
+            Ok(Resource::PipeWrite(w)) => Resource::PipeWrite(crate::fd::PipeWrite {
                 buf: w.buf.clone(),
                 closed: w.closed.clone(),
                 nonblock: w.nonblock.clone(),
                 notify: w.notify.clone(),
-            })),
+            }),
             // P2-B5: dup(epfd) and dup(eventfd) are not modeled. Linux
             // permits them historically but they aren't meaningful for
             // our epoll implementation.
             Ok(Resource::Epoll(_)) | Ok(Resource::EventFd(_)) => return -crate::errno::EBADF,
         }
-    };
-    let cloned = match cloned {
-        Some(c) => c,
-        None => return -crate::errno::EFAULT,
     };
 
     // Phase 2: install the cloned resource. For dup2/dup3, close the

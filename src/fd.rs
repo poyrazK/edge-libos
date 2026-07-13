@@ -324,6 +324,12 @@ pub enum Resource {
 
 /// P2-B5: shared-state wrappers for dup-able resource variants. Both
 /// use `parking_lot::Mutex` (sync; **never hold across `.await`**).
+///
+/// Locking rule (every site in `sys/socket.rs`, `sys/file.rs`,
+/// `sys/poll.rs`, `sys/epoll.rs` follows this):
+///   1. Lock briefly to read/copy state out (or `Option::take()` it).
+///   2. Drop the guard before any `.await`.
+///   3. Re-acquire the lock briefly to write the result back.
 pub type SharedFilePos = std::sync::Arc<parking_lot::Mutex<crate::sys::file::FilePos>>;
 pub type SharedSocket = std::sync::Arc<parking_lot::Mutex<SocketInner>>;
 
@@ -388,11 +394,14 @@ impl FdTable {
         Ok(fd)
     }
 
-    /// P2-B5: insert at the lowest free fd ≥ `min`. Bumps `next_fd` if
-    /// the chosen fd exceeds it. Used by `fcntl(F_DUPFD, min_fd)` so
-    /// the returned fd honors the minimum-fd argument.
+    /// P2-B5: insert at the lowest free fd ≥ `min`. Used by
+    /// `fcntl(F_DUPFD, min_fd)` so the returned fd honors the
+    /// minimum-fd argument per Linux semantics: the kernel does not
+    /// pre-fill slots below `min` — if `min` is free it IS the answer,
+    /// even when `next_fd` is higher. We bump `next_fd` only if the
+    /// chosen fd exceeds it.
     pub fn insert_at_least(&mut self, min: u32, r: Resource) -> u32 {
-        let mut fd = min.max(self.next_fd);
+        let mut fd = min;
         while self.table.contains_key(&fd) {
             fd = fd.saturating_add(1);
         }

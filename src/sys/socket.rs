@@ -282,33 +282,29 @@ pub async fn accept4(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     // `&mut Caller` borrow.
     // P2-B5: take the listening TcpListener out under a short-lived lock;
     // never hold the guard across `.await`. We materialize the listener
-    // (which involves a `.await`) outside any lock.
-    let listener_opt: Option<tokio::net::TcpListener>;
+    // (which involves a `.await`) outside any lock, then leave the
+    // listener installed in SocketInner so a concurrent accept4 caller
+    // doesn't race a duplicate TcpListener::bind. The actual take-out
+    // for `accept().await` happens just below, also under a brief lock.
     let kind;
     let parent_nonblock: bool;
     let bound_addr: Option<std::net::SocketAddrV4> = {
         let fds = &mut caller.data_mut().fds;
         match fds.get_mut(fd) {
             Ok(Resource::Socket(s)) => {
-                let mut gs = s.lock();
+                let gs = s.lock();
                 if !gs.is_listening() {
                     return -EINVAL;
                 }
                 kind = gs.kind;
                 parent_nonblock = gs.nonblock.load(std::sync::atomic::Ordering::Relaxed);
-                if gs.listener.is_some() {
-                    listener_opt = gs.listener.take();
-                    None
-                } else {
-                    listener_opt = None;
-                    match &gs.bound {
-                        Some(SockAddr::V4 { port, addr }) => Some(std::net::SocketAddrV4::new(
-                            std::net::Ipv4Addr::from(*addr),
-                            *port,
-                        )),
-                        Some(SockAddr::V6 { .. }) => return -EOPNOTSUPP,
-                        None => return -EINVAL,
-                    }
+                match &gs.bound {
+                    Some(SockAddr::V4 { port, addr }) => Some(std::net::SocketAddrV4::new(
+                        std::net::Ipv4Addr::from(*addr),
+                        *port,
+                    )),
+                    Some(SockAddr::V6 { .. }) => return -EOPNOTSUPP,
+                    None => return -EINVAL,
                 }
             }
             Ok(_) => return -EBADF,
@@ -316,41 +312,60 @@ pub async fn accept4(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         }
     };
 
-    // If we still need to materialize, await the bind outside any lock.
-    let listener_opt = if let Some(addr) = bound_addr {
+    // Phase 1a: bind the host TcpListener if we don't already have one.
+    // We do this OUTSIDE the lock; a concurrent accept4 hitting the
+    // empty-listener branch would race a second TcpListener::bind and
+    // most likely get EADDRINUSE, but we accept that and propagate.
+    // P2-B5 fix: instead of installing and immediately re-taking the
+    // listener (which invited a race between install and take), we let
+    // Phase 1b handle install-vs-take atomically under one lock.
+    let need_bind = {
+        let fds = &mut caller.data_mut().fds;
+        match fds.get_mut(fd) {
+            Ok(Resource::Socket(s)) => s.lock().listener.is_none(),
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    };
+    if need_bind && bound_addr.is_none() {
+        return -EINVAL;
+    }
+    if need_bind {
+        let addr = bound_addr.expect("checked above");
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
             Err(_) => return -crate::errno::EADDRINUSE,
         };
-        // Re-acquire the lock briefly to install the listener and the
-        // `is_acceptor` flag. Don't worry about races — if a concurrent
-        // accept4 caller already installed one, ours gets dropped below.
+        // Install the listener under a brief lock; if a concurrent
+        // accept4 already installed one, drop ours.
         let fds = &mut caller.data_mut().fds;
-        if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
-            let mut gs = s.lock();
-            if gs.listener.is_none() {
-                gs.listener = Some(listener);
-                gs.is_acceptor = true;
-                // Re-take out under the same lock so the rest of accept4
-                // sees the listener; concurrent accept4 will get None
-                // and re-bind (rare; we accept the duplicate listener
-                // for P2 simplicity).
-            } else {
-                // Drop our listener; someone else installed one.
-                drop(listener);
+        match fds.get_mut(fd) {
+            Ok(Resource::Socket(s)) => {
+                let mut gs = s.lock();
+                if gs.listener.is_none() {
+                    gs.listener = Some(listener);
+                    gs.is_acceptor = true;
+                } else {
+                    drop(listener);
+                }
             }
-            gs.listener.take()
-        } else {
-            return -EBADF;
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
         }
-    } else {
-        listener_opt
-    };
-    let listener_opt = listener_opt;
+    }
 
-    let listener = match listener_opt {
-        Some(l) => l,
-        None => return -EINVAL,
+    // Phase 1b: take the listener out (so we can `.await` outside any
+    // lock). Phase 4 below restores it after `accept().await` returns.
+    let listener = {
+        let fds = &mut caller.data_mut().fds;
+        match fds.get_mut(fd) {
+            Ok(Resource::Socket(s)) => match s.lock().listener.take() {
+                Some(l) => l,
+                None => return -EINVAL,
+            },
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
     };
 
     // Phase 2: await a connection. This may suspend.
