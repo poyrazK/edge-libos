@@ -83,6 +83,9 @@ int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
 #define NR_EPOLL_WAIT 232
 #define NR_EVENTFD2 290
 
+// Standard *at() dirfd values. AT_FDCWD = -100 means "use cwd".
+#define AT_FDCWD (-100)
+
 // Pass/fail markers. Placed at offset 4096 in linear memory. The runner
 // reads back the bytes at 4096 after the run.
 #define MARKER_ADDR 4096
