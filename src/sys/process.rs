@@ -23,6 +23,12 @@ pub const NR_PRCTL: u32 = 157;
 pub const NR_KILL: u32 = 62;
 pub const NR_TGKILL: u32 = 234;
 
+// P3 reservation: clone / fork / wait4. P2-D snapshot machinery will
+// back fork() as CoW; clone() needs futex support (see ADR 0001).
+pub const NR_CLONE: u32 = 56;
+pub const NR_FORK: u32 = 57;
+pub const NR_WAIT4: u32 = 61;
+
 // prctl(2) options we recognize (subset — others return -EINVAL).
 pub const PR_SET_NAME: i32 = 15;
 pub const PR_GET_NAME: i32 = 16;
@@ -219,6 +225,9 @@ mod tests {
         assert_eq!(NR_PRCTL, 157);
         assert_eq!(NR_KILL, 62);
         assert_eq!(NR_TGKILL, 234);
+        assert_eq!(NR_CLONE, 56);
+        assert_eq!(NR_FORK, 57);
+        assert_eq!(NR_WAIT4, 61);
     }
 
     #[test]
