@@ -11,6 +11,7 @@
 pub mod epoll;
 pub mod eventfd;
 pub mod file;
+pub mod futex;
 pub mod identity;
 pub mod ioctl;
 pub mod memory;
