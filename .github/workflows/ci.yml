@@ -98,11 +98,14 @@ jobs:
       - name: 5. Install zig 0.16.0 via release tarball
         # apt-get's zig on Ubuntu 22.04 is 0.10 — not sufficient for the
         # zig cc-based C conformance runner. scripts/dev_setup.sh flags this.
+        # Tarball name is `zig-x86_64-linux-<ver>.tar.xz` (NOT
+        # `zig-linux-x86_64-<ver>.tar.xz` — that URL 404s). Verified via
+        # https://ziglang.org/download/index.json on 2026-07-13.
         env:
           ZIG_VERSION: ${{ env.ZIG_VERSION }}
         run: |
           set -euo pipefail
-          ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
+          ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
           echo "Downloading $ZIG_URL"
           curl -fSL --retry 3 -o /tmp/zig.tar.xz "$ZIG_URL"
           sudo mkdir -p /opt/zig
