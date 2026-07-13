@@ -38,6 +38,8 @@ trap 'rm -rf "$TMP"' EXIT
 
 # Per-test name → expected syscall name to observe in trace-host JSON.
 # Implemented as a function (bash 3.2 on macOS doesn't have associative arrays).
+# The default arm fails loudly for unregistered names — it used to silently
+# fall back to "exit", which masked forgotten registrations.
 expected_syscall() {
     case "$1" in
         getpid)            echo "getpid" ;;
@@ -54,6 +56,7 @@ expected_syscall() {
         lseek)             echo "lseek" ;;
         fstat)             echo "fstat" ;;
         getdents64)        echo "getdents64" ;;
+        getdents64_stream_position) echo "getdents64" ;;
         rt_sigaction)      echo "rt_sigaction" ;;
         rt_sigprocmask)    echo "rt_sigprocmask" ;;
         pipe2)             echo "pipe2" ;;
@@ -66,6 +69,7 @@ expected_syscall() {
         getsockname)       echo "getsockname" ;;
         shutdown)          echo "shutdown" ;;
         poll)              echo "poll" ;;
+        poll_timeout)      echo "poll" ;;
         epoll_create1)     echo "epoll_create1" ;;
         epoll_ctl)         echo "epoll_ctl" ;;
         epoll_wait)        echo "epoll_wait" ;;
@@ -82,13 +86,32 @@ expected_syscall() {
         arch_prctl)        echo "arch_prctl" ;;
         nanosleep)         echo "nanosleep" ;;
         exit)              echo "exit" ;;
-        *)                 echo "exit" ;;
+        *) echo "UNREGISTERED: $1" >&2; return 1 ;;
     esac
 }
 
 PASS=0
 FAIL=0
 FAIL_NAMES=()
+SOFT_PASS_NAMES=()
+
+# Default to soft mode: tests without a mark_pass/mark_fail marker fall back
+# to the syscall-name grep. STRICT=1 makes missing markers a hard fail; flip
+# the default once all C tests have been migrated (post-B1).
+STRICT="${STRICT:-0}"
+
+# Pre-create the directory used by getdents64_stream_position.c.
+# P2-B2: this test asserts the kernel tracks dir-stream position across
+# multiple getdents64 calls. We create the dir under $ROOT (the trace-host
+# process's cwd, which becomes the kernel's cwd) and clean it up at exit.
+GD_DIR="$ROOT/getdents64_dir"
+mkdir -p "$GD_DIR"
+echo "foo" > "$GD_DIR/foo"
+echo "bar" > "$GD_DIR/bar"
+echo "baz" > "$GD_DIR/baz"
+# Schedule cleanup even if we exit non-zero.
+existing_trap=$(trap -p EXIT)
+trap 'rm -rf "$GD_DIR"' EXIT
 
 for c in "$ROOT"/tests/conformance/*.c; do
     name=$(basename "$c" .c)
@@ -101,22 +124,85 @@ for c in "$ROOT"/tests/conformance/*.c; do
         continue
     fi
 
-    trace_json=$("$TRACE_HOST" "$wasm" 2>/dev/null || true)
+    # Note: removed `|| true` — a guest trap is a real failure now.
+    trace_json=$("$TRACE_HOST" "$wasm" 2>/dev/null)
+    trace_rc=$?
 
-    expected=$(expected_syscall "$name")
-    if echo "$trace_json" | grep -q "\"name\":\"$expected\""; then
-        PASS=$((PASS + 1))
-        echo "PASS  $name"
-    else
+    if [[ $trace_rc -ne 0 ]]; then
         FAIL=$((FAIL + 1))
         FAIL_NAMES+=("$name")
-        echo "FAIL  $name (expected syscall '$expected' in trace)"
-        echo "$trace_json" | head -3 | sed 's/^/    /'
+        echo "FAIL  $name (trace-host exited $trace_rc; guest likely trapped)"
+        echo "$trace_json" | tail -3 | sed 's/^/    /'
+        continue
+    fi
+
+    # Extract marker from the trailing JSON line emitted by trace-host.
+    marker=$(echo "$trace_json" | grep -oE '\{"marker":"[^"]*"' | head -1 | sed 's/^{"marker":"//; s/"$//')
+    expected=$(expected_syscall "$name") || {
+        FAIL=$((FAIL + 1))
+        FAIL_NAMES+=("$name (unregistered)")
+        echo "FAIL  $name (no expected_syscall mapping)"
+        continue
+    }
+
+    if [[ -n "$marker" ]]; then
+        # Test wrote a marker — trust it.
+        case "$marker" in
+            PASS)
+                PASS=$((PASS + 1))
+                echo "PASS  $name"
+                ;;
+            FAIL:*)
+                FAIL=$((FAIL + 1))
+                FAIL_NAMES+=("$name")
+                reason="${marker#FAIL:}"
+                echo "FAIL  $name ($reason)"
+                ;;
+            *)
+                # Unrecognized marker prefix. Treat as fail.
+                FAIL=$((FAIL + 1))
+                FAIL_NAMES+=("$name")
+                echo "FAIL  $name (unrecognized marker: $marker)"
+                ;;
+        esac
+    else
+        # No marker — old-style test. Fall back to syscall-name grep in
+        # soft mode; fail outright in strict mode.
+        if [[ "$STRICT" == "1" ]]; then
+            FAIL=$((FAIL + 1))
+            FAIL_NAMES+=("$name")
+            echo "FAIL  $name (no marker; STRICT=1 requires mark_pass/mark_fail)"
+        else
+            if echo "$trace_json" | grep -q "\"name\":\"$expected\""; then
+                PASS=$((PASS + 1))
+                SOFT_PASS_NAMES+=("$name")
+                echo "PASS* $name  (no marker; syscall '$expected' found)"
+            else
+                FAIL=$((FAIL + 1))
+                FAIL_NAMES+=("$name")
+                echo "FAIL  $name (no marker, expected syscall '$expected' not in trace)"
+            fi
+        fi
     fi
 done
 
 echo
-echo "Pass: $PASS  Fail: $FAIL"
+echo "Pass: $PASS  Fail: $FAIL  Soft: ${#SOFT_PASS_NAMES[@]}"
+if [[ ${#SOFT_PASS_NAMES[@]} -gt 0 ]]; then
+    echo "Soft passes (no marker; migrate to mark_pass): ${SOFT_PASS_NAMES[*]}"
+fi
+
+# Total test count (kept in sync with tests/count_tests.sh). Printed on
+# every run, success or failure, so the operator sees the same number the
+# HANDOFF and README claim.
+list_output=$(cd "$ROOT" && cargo test --release -- --list 2>&1 || true)
+rust_unit=$(printf '%s\n' "$list_output" | grep ': test$' | sed 's/^[[:space:]]*//' | grep -c '::' || true)
+rust_integ=$(printf '%s\n' "$list_output" | grep ': test$' | sed 's/^[[:space:]]*//' | grep -cv '::' || true)
+rust_total=$((rust_unit + rust_integ))
+c_total=$(ls "$ROOT"/tests/conformance/*.c 2>/dev/null | wc -l | tr -d ' ')
+grand=$((rust_total + c_total))
+echo "Test totals: Rust=$rust_total (unit=$rust_unit, integ=$rust_integ), C=$c_total, Grand=$grand"
+
 if [[ $FAIL -gt 0 ]]; then
     echo "Failed: ${FAIL_NAMES[*]}"
     exit 1

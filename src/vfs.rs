@@ -141,10 +141,10 @@ impl Vfs {
 
     /// `getdents64(abs, len)`. Reads the directory entries in sorted order
     /// and packs them into `linux_dirent64` records, capped at `len` bytes.
-    pub fn getdents(&self, abs: &Path, len: usize) -> VfsResult<Vec<u8>> {
-        if len == 0 {
-            return Err(-(crate::errno::EINVAL));
-        }
+    /// Read the full directory listing into pre-encoded dirent64 records
+    /// (sorted by name, no offset slicing). Used by `getdents_at` and the
+    /// dir-stream position path in `sys::file::getdents64`.
+    pub fn readdir_all(&self, abs: &Path) -> VfsResult<Vec<u8>> {
         let mut out: Vec<u8> = Vec::new();
         let entries = fs::read_dir(abs).map_err(io_to_errno)?;
         let mut names: Vec<(String, Option<FileType>, u64)> = entries
@@ -165,10 +165,41 @@ impl Vfs {
                 name: name.into_bytes(),
             };
             let bytes = rec.encode();
-            if out.len() + bytes.len() > len {
-                break;
-            }
             out.extend_from_slice(&bytes);
+        }
+        Ok(out)
+    }
+
+    /// Return the dirent64 slice starting at byte offset `start` (relative
+    /// to the dir's own encoding, not the guest buffer). Caller controls
+    /// the buffer size via `len`. Returns the encoded slice and the total
+    /// length of the dir's encoding so the caller can advance its position.
+    pub fn getdents_at(
+        &self,
+        abs: &Path,
+        start: usize,
+        len: usize,
+    ) -> VfsResult<(Vec<u8>, usize)> {
+        if len == 0 {
+            return Err(-(crate::errno::EINVAL));
+        }
+        let all = self.readdir_all(abs)?;
+        let total = all.len();
+        if start >= total {
+            return Ok((Vec::new(), total));
+        }
+        // Slice `all[start..]` but cap to `len` bytes.
+        let end = (start + len).min(total);
+        Ok((all[start..end].to_vec(), total))
+    }
+
+    /// Backwards-compatible wrapper: full dirent64 encoding (start = 0).
+    /// Used by callers that don't track position across calls.
+    pub fn getdents(&self, abs: &Path, len: usize) -> VfsResult<Vec<u8>> {
+        let (mut out, _total) = self.getdents_at(abs, 0, len)?;
+        // Mirror the old behavior: stop at len if the encoding exceeds it.
+        if out.len() > len {
+            out.truncate(len);
         }
         Ok(out)
     }

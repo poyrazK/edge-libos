@@ -26,6 +26,10 @@ pub struct PipeRead {
     pub closed: Arc<Mutex<bool>>,
     /// P1-3: `O_NONBLOCK` flag, honored by `read` in `crate::sys::file`.
     pub nonblock: Arc<AtomicBool>,
+    /// P2-B3: fires when the pipe read-side becomes ready (data
+    /// available, or close). `poll` subscribes to this for async
+    /// readiness waits.
+    pub notify: Arc<tokio::sync::Notify>,
 }
 
 impl AsyncRead for PipeRead {
@@ -59,6 +63,9 @@ pub struct PipeWrite {
     /// (the buffer is unbounded), so this is recorded for fidelity but
     /// does not currently affect `write` semantics.
     pub nonblock: Arc<AtomicBool>,
+    /// P2-B3: fires when bytes are pushed onto the pipe (wakes any
+    /// `poll` waiting for POLLIN on the read side).
+    pub notify: Arc<tokio::sync::Notify>,
 }
 
 impl AsyncWrite for PipeWrite {
@@ -93,16 +100,20 @@ pub fn make_pipe() -> (PipeRead, PipeWrite) {
     let buf = Arc::new(Mutex::new(VecDeque::new()));
     let closed = Arc::new(Mutex::new(false));
     let nonblock = Arc::new(AtomicBool::new(false));
+    let notify_rd = Arc::new(tokio::sync::Notify::new());
+    let notify_wr = Arc::new(tokio::sync::Notify::new());
     (
         PipeRead {
             buf: buf.clone(),
             closed: closed.clone(),
             nonblock: nonblock.clone(),
+            notify: notify_rd,
         },
         PipeWrite {
             buf,
             closed,
             nonblock,
+            notify: notify_wr,
         },
     )
 }

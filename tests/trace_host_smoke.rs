@@ -38,9 +38,12 @@ fn trace_host_emits_json_per_syscall() -> Result<()> {
         std::fs::write(&wasm_path, &bytes)?;
     }
 
-    // Invoke trace-host.
+    // Invoke trace-host. `--no-marker` suppresses the trailing
+    // `{"marker":""}` line that the C conformance runner reads but that
+    // would otherwise pollute a zero-syscall stdout.
     let bin = env!("CARGO_BIN_EXE_trace-host");
     let output = Command::new(bin)
+        .arg("--no-marker")
         .arg(wasm_path.to_str().unwrap())
         .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -121,7 +124,12 @@ fn trace_host_emits_well_formed_json_for_getpid() -> Result<()> {
     std::fs::write(&wasm_path, &bytes)?;
 
     let bin = env!("CARGO_BIN_EXE_trace-host");
-    let output = Command::new(bin).arg(wasm_path.to_str().unwrap()).output()?;
+    // `--no-marker` keeps the marker line out of stdout so lines[0] is the
+    // first syscall JSON entry, not a marker line.
+    let output = Command::new(bin)
+        .arg("--no-marker")
+        .arg(wasm_path.to_str().unwrap())
+        .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 

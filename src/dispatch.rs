@@ -4,6 +4,12 @@
 //! is `-ENOSYS` (clean, not a crash) — per `impelementationplan` §9, this
 //! turns "mysterious runtime hang" into "build-time / import-time error we
 //! can show the user."
+//!
+//! P2-A2: an optional `SyscallObserver` is invoked before and after the
+//! handler runs. The default observer is a no-op. Tools like
+//! `trace-host` install a thread-local observer that records each call.
+
+use std::sync::Arc;
 
 use anyhow::Result;
 use wasmtime::{FuncType, Linker, Val, ValType};
@@ -16,6 +22,53 @@ use crate::sys;
 const N_PARAMS: usize = 7;
 /// Return type: i64.
 const N_RESULTS: usize = 1;
+
+/// Hook for tools (e.g. trace-host) that need to observe every syscall.
+///
+/// `on_enter` runs before the handler; `on_exit` runs after. Both must
+/// be non-blocking. `on_enter` receives a snapshot of the syscall args
+/// (the array is owned by the observer). `on_exit` receives the return
+/// value (the same `i64` that the wasm guest sees).
+pub trait SyscallObserver: Send + Sync {
+    fn on_enter(&self, _nr: u32, _args: [i64; 6]) {}
+    fn on_exit(&self, _nr: u32, _ret: i64) {}
+}
+
+impl<T: SyscallObserver + ?Sized> SyscallObserver for Arc<T> {
+    fn on_enter(&self, nr: u32, args: [i64; 6]) {
+        (**self).on_enter(nr, args);
+    }
+    fn on_exit(&self, nr: u32, ret: i64) {
+        (**self).on_exit(nr, ret);
+    }
+}
+
+thread_local! {
+    /// Thread-local observer installed by trace-host (or any other tool).
+    /// `None` is the fast path (no observer).
+    static OBSERVER: std::cell::RefCell<Option<Arc<dyn SyscallObserver>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install an observer for the current thread. The previous observer
+/// (if any) is returned. Pass `None` to clear.
+pub fn install_observer(o: Option<Arc<dyn SyscallObserver>>) -> Option<Arc<dyn SyscallObserver>> {
+    OBSERVER.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), o))
+}
+
+/// Read-only access to the current thread's observer (if any).
+pub fn with_observer<F, R>(f: F) -> R
+where
+    F: FnOnce(Option<&dyn SyscallObserver>) -> R,
+{
+    OBSERVER.with(|cell| {
+        let borrow = cell.borrow();
+        match &*borrow {
+            Some(o) => f(Some(o.as_ref())),
+            None => f(None),
+        }
+    })
+}
 
 /// Register the dispatch function on the linker.
 pub fn register(linker: &mut Linker<Kernel>) -> Result<()> {
@@ -32,8 +85,20 @@ pub fn register(linker: &mut Linker<Kernel>) -> Result<()> {
             let nr = params[0].unwrap_i64() as u32;
             let a: [i64; 6] = std::array::from_fn(|i| params[i + 1].unwrap_i64());
 
+            with_observer(|o| {
+                if let Some(o) = o {
+                    o.on_enter(nr, a);
+                }
+            });
+
             let ret = dispatch(caller, nr, a).await;
             results[0] = Val::I64(ret);
+
+            with_observer(|o| {
+                if let Some(o) = o {
+                    o.on_exit(nr, ret);
+                }
+            });
             Ok(())
         })
     })?;
@@ -43,9 +108,12 @@ pub fn register(linker: &mut Linker<Kernel>) -> Result<()> {
 
 /// Match a syscall number onto its handler. The default is `-ENOSYS`.
 ///
+/// P2-A2: `pub` so tools can dispatch directly (used by unit tests
+/// and the trace-host refactor).
+///
 /// This function is `async` so P1 socket work drops in without re-architecture.
 /// Sync syscalls simply return immediately inside the future.
-async fn dispatch(
+pub async fn dispatch(
     mut caller: wasmtime::Caller<'_, Kernel>,
     nr: u32,
     a: [i64; 6],

@@ -5,8 +5,8 @@
 
 // zig cc targeting wasm32-freestanding does not expose <fcntl.h>; locally
 // define the O_* flags we need (same convention as openat_close.c).
-#ifndef O_WRONLY
-#define O_WRONLY 1
+#ifndef O_RDWR
+#define O_RDWR 2
 #endif
 #ifndef O_CREAT
 #define O_CREAT 0100
@@ -20,9 +20,11 @@ void _start(void) {
     char *path = (char *)(intptr_t)(MARKER_ADDR + 1024);
     path[0] = '/'; path[1] = 'r'; path[2] = 'v'; path[3] = 0;
 
-    // Create /rv with 6 bytes of content.
+    // Create /rv with 6 bytes of content. Open with O_RDWR because we
+    // will both write and read (readv) on the same fd; O_WRONLY would
+    // make readv return -EBADF per Linux semantics.
     int64_t fd = sc3(NR_OPEN, (int64_t)(intptr_t)path,
-                     O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                     O_RDWR | O_CREAT | O_TRUNC, 0666);
     if (fd < 3) { mark_fail("open(O_CREAT) failed"); return; }
 
     char *src = (char *)(intptr_t)(MARKER_ADDR + 1100);

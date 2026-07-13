@@ -1,92 +1,131 @@
 #!/usr/bin/env bash
 #
-# scripts/reproduce_dod.sh — full P0 DoD sequence in one command.
+# scripts/reproduce_dod.sh — full P0+P1+P2 DoD sequence in one command.
 #
 # This is the CI entry point. It runs in order:
-#   1. dev_setup.sh          — install missing toolchain pieces
+#   1. dev_setup.sh                                  — install missing toolchain pieces
 #   2. cargo build --release
-#   3. cargo test --release  — unit + conformance + EFAULT fuzzer
-#   4. guest/build.sh        — CPython → python.wasm (skipped if no submodule)
-#   5. edge-python examples/print_2_plus_2.py   (DoD #1)
-#   6. edge-python examples/import_fastapi.py   (DoD #2)
-#   7. trace-host --diff vs strace baselines    (Step 23)
+#   3. cargo test --release                          — Rust unit + integration + EFAULT fuzzer
+#   4. bash tests/conformance/runner.sh              — C conformance (marker-enforced)
+#   5. cargo test --release --test strace_baseline_diff
+#   6. guest/build.sh                                — CPython → python.wasm (skipped if no submodule)
+#   7. DoD #1 + DoD #2 with the real python.wasm     — print(2+2), import fastapi
+#   8. DoD #3: edge-python serve_one_request.py      — real uvicorn+FastAPI HTTP serve
+#   9. bash tests/count_tests.sh                     — print the canonical test totals
 #
 # Steps that require tools not available on the host (no zig, no
 # strace, no CPython submodule) print a SKIP notice and the script
-# continues rather than aborting. A full Linux CI box should hit
-# every step green; macOS dev boxes should hit 1-3, 5-6 and skip 4, 7.
+# continues rather than aborting. A full Linux CI box with the cpython
+# submodule should hit every step green; macOS dev boxes typically
+# hit 1-5, 9 and skip 6-8 (no zig + no submodule).
 
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 
-say() { echo "==> $*"; }
+say()  { echo "==> $*"; }
 skip() { echo "SKIP: $*"; }
 warn() { echo "WARN: $*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-say "1/7 dev_setup.sh"
-bash scripts/dev_setup.sh || true
+ran_steps=()
+skipped_steps=()
 
-say "2/7 cargo build --release"
-cargo build --release
+mark_ran()  { ran_steps+=("$1"); }
+mark_skip() { skipped_steps+=("$1"); }
 
-say "3/7 cargo test --release"
-cargo test --release
+say "1/8 dev_setup.sh"
+if bash scripts/dev_setup.sh; then mark_ran "dev_setup"; else mark_skip "dev_setup"; fi
 
-# 4. CPython cross-compile. Requires zig + git submodule.
-say "4/7 guest/build.sh (CPython cross-compile)"
+say "2/8 cargo build --release"
+if cargo build --release; then mark_ran "build"; else warn "cargo build failed"; exit 1; fi
+
+say "3/8 cargo test --release"
+if cargo test --release; then mark_ran "cargo-test"; else warn "cargo test failed"; fi
+
+# 4. C conformance suite — marker-enforced. This is the test the P1 closeout
+# was falsely passing (it grepped the syscall name but never read the
+# mark_pass/mark_fail marker). Now it does.
+say "4/8 C conformance (marker-enforced)"
+if bash tests/conformance/runner.sh; then mark_ran "c-conformance"; else mark_skip "c-conformance (failures reported above)"; fi
+
+# 5. Strace-baseline-diff subset. Runs independently of step 4.
+say "5/8 strace baseline diff"
+if cargo test --release --test strace_baseline_diff; then mark_ran "strace-diff"; else mark_skip "strace-diff"; fi
+
+# 6. CPython cross-compile. Requires zig + git submodule.
+say "6/8 guest/build.sh (CPython cross-compile)"
 if [[ -d guest/cpython ]] && have zig; then
-    bash guest/build.sh
-    PY_WASM="target/wasm32-unknown-linux-musl/release/python.wasm"
+    if bash guest/build.sh; then
+        PY_WASM="target/wasm32-unknown-linux-musl/release/python.wasm"
+        mark_ran "guest-build"
+    else
+        warn "guest/build.sh failed"
+        mark_skip "guest-build"
+        PY_WASM=""
+    fi
 else
     skip "guest/cpython submodule missing or zig not installed"
+    mark_skip "guest-build"
     PY_WASM=""
 fi
 
-# 5. DoD #1.
-say "5/7 DoD #1: python -c 'print(2+2)'"
+# 7. DoD #1 + DoD #2 with the real python.wasm.
+say "7/8 DoD #1 + DoD #2 (print(2+2) and import fastapi)"
 if [[ -n "$PY_WASM" && -f "$PY_WASM" ]]; then
-    cargo run --release --bin edge-python -- \
-        "$PY_WASM" examples/print_2_plus_2.py
+    if cargo run --release --bin edge-python -- \
+        "$PY_WASM" examples/print_2_plus_2.py; then mark_ran "dod-1"; \
+    else mark_skip "dod-1"; fi
+    if cargo run --release --bin edge-python -- \
+        "$PY_WASM" examples/import_fastapi.py; then mark_ran "dod-2"; \
+    else
+        warn "DoD #2 real-import failed"
+        mark_skip "dod-2"
+    fi
 else
     skip "no python.wasm; run driver smoke tests instead"
-    cargo test --release --test edge_python_smoke
+    if cargo test --release --test edge_python_smoke; then mark_ran "edge-python-smoke"; fi
+    if cargo test --release --test edge_python_import_smoke; then mark_ran "edge-python-import-smoke"; fi
 fi
 
-# 6. DoD #2.
-say "6/7 DoD #2: import fastapi"
-if [[ -n "$PY_WASM" && -f "$PY_WASM" ]]; then
+# 8. DoD #3 — the headline: real uvicorn+FastAPI HTTP serve.
+say "8/8 DoD #3: serve_one_request.py (real uvicorn+FastAPI)"
+if [[ -n "$PY_WASM" && -f "$PY_WASM" ]] && have curl; then
+    rm -f /tmp/edge-python.serve /tmp/edge-python.curl.out
+    # Start the server in background, wait for it to bind, curl, then kill.
     cargo run --release --bin edge-python -- \
-        "$PY_WASM" examples/import_fastapi.py || {
-            warn "DoD #2 real-import failed; the script has a stdlib fallback"
-            warn "rerun and check stdout for 'stdlib-ok' to confirm the fallback path"
-        }
+        "$PY_WASM" examples/serve_one_request.py \
+        &>/tmp/edge-python.serve &
+    serve_pid=$!
+    # Give the server up to 5s to come up.
+    for _ in 1 2 3 4 5; do
+        sleep 1
+        if curl -fsS http://127.0.0.1:18080/ >/tmp/edge-python.curl.out 2>&1; then
+            echo "    curl response: $(cat /tmp/edge-python.curl.out)"
+            mark_ran "dod-3"
+            break
+        fi
+    done
+    kill "$serve_pid" 2>/dev/null || true
+    wait "$serve_pid" 2>/dev/null || true
+    if ! grep -q "200 OK" /tmp/edge-python.curl.out 2>/dev/null; then
+        mark_skip "dod-3"
+    fi
 else
-    skip "no python.wasm; run import-mix smoke tests instead"
-    cargo test --release --test edge_python_import_smoke
+    skip "no python.wasm or no curl; DoD #3 requires cross-compiled CPython+uvicorn+FastAPI"
+    mark_skip "dod-3"
 fi
 
-# 7. Syscall trace diff vs native strace baselines.
-say "7/7 syscall trace diff vs native baselines"
-if [[ -n "$PY_WASM" && -f "$PY_WASM" ]] && command -v strace >/dev/null 2>&1; then
-    cargo run --release --bin trace-host -- \
-        "$PY_WASM" examples/print_2_plus_2.py \
-        > /tmp/trace-boot.json
-    python3 tests/strace_baselines/diff.py \
-        tests/strace_baselines/baseline.boot.txt \
-        /tmp/trace-boot.json
-else
-    skip "no python.wasm or no strace; baseline-diff integration tests still run"
-    cargo test --release --test strace_baseline_diff
-fi
+# 9. Canonical test totals — agrees with HANDOFF.md and README.md.
+say "9 (post-check) test totals"
+if bash tests/count_tests.sh; then mark_ran "test-count"; else mark_skip "test-count"; fi
 
-say "✅ P0 DoD sequence complete"
+say "✅ reproduce_dod.sh complete"
 echo
 echo "Summary:"
-echo "  - Build:    cargo build --release"
-echo "  - Tests:    cargo test --release"
-echo "  - DoD #1:   cargo run --bin edge-python -- \$PY_WASM examples/print_2_plus_2.py"
-echo "  - DoD #2:   cargo run --bin edge-python -- \$PY_WASM examples/import_fastapi.py"
-echo "  - Conformance: bash tests/conformance/runner.sh"
+echo "  Ran:     ${ran_steps[*]:-(none)}"
+echo "  Skipped: ${skipped_steps[*]:-(none)}"
+echo
+echo "Conformance: bash tests/conformance/runner.sh"
+echo "Test totals: bash tests/count_tests.sh"

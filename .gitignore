@@ -5,3 +5,7 @@
 *.wasm
 !tests/conformance/fixtures/*.wasm
 .DS_Store
+# Session-local handoff (regenerated, not committed).
+/HANDOFF.md
+# Stray noise file from past session.
+/rv

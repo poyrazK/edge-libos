@@ -10,7 +10,7 @@
 //! ## CLI
 //!
 //! ```text
-//! trace-host <python.wasm> [--diff <baseline>] [--] [args...]
+//! trace-host <python.wasm> [--diff <baseline>] [--no-marker] [--] [args...]
 //! ```
 //!
 //! `--diff <baseline>` reads a baseline file (one syscall name per line,
@@ -18,16 +18,26 @@
 //! syscall is missing from the host trace. Host-only syscalls (those in
 //! the trace but not in the baseline) are reported on stderr but do not
 //! cause failure — they are simply backlog for the baseline author.
+//!
+//! `--no-marker` suppresses the trailing `{"marker":"..."}` JSON line so
+//! callers that consume only syscall entries can pipe stdout cleanly.
+//!
+//! ## P2-A2: dispatch dedup
+//!
+//! Previously this binary hand-mirrored the entire NR dispatch table.
+//! Now it installs a `SyscallObserver` via `install_observer` and calls
+//! `add_to_linker` like any other consumer. New syscalls added to
+//! `dispatch::dispatch` are picked up automatically.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use wasmtime::{Caller, FuncType, Linker, Val, ValType};
+use wasmtime::Linker;
 
-use edge_libos::errno::{to_ret, ENOSYS};
 use edge_libos::{
-    build_engine, build_store, dispatch, kernel::Kernel, sys,
+    add_to_linker, build_engine, build_store, install_observer, syscall_name,
+    Kernel, SyscallObserver,
 };
 
 /// One traced syscall.
@@ -40,10 +50,55 @@ struct TraceEntry {
     ret: i64,
 }
 
+/// P2-A2: the observer that records syscalls into a thread-local buffer.
+/// We pair the captured args with the returned ret in `on_exit` using
+/// the `nr` as the correlation key. A single-threaded wasm guest cannot
+/// have two concurrent syscalls in flight, so a single `PENDING` slot is
+/// sufficient.
+struct TraceObserver;
+
+thread_local! {
+    static TRACE: std::cell::RefCell<Vec<TraceEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Most recent (ts_ns, nr, args) seen by `on_enter` — flushed in
+    /// `on_exit` when the matching `ret` arrives.
+    static PENDING: std::cell::RefCell<Option<(u128, u32, [i64; 6])>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl SyscallObserver for TraceObserver {
+    fn on_enter(&self, nr: u32, args: [i64; 6]) {
+        let ts_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        PENDING.with(|p| *p.borrow_mut() = Some((ts_ns, nr, args)));
+    }
+    fn on_exit(&self, nr: u32, ret: i64) {
+        PENDING.with(|p| {
+            if let Some((ts_ns, pending_nr, args)) = p.borrow_mut().take() {
+                // Only pair if the same syscall (defensive).
+                if pending_nr == nr {
+                    TRACE.with(|t| {
+                        t.borrow_mut().push(TraceEntry {
+                            ts_ns,
+                            nr,
+                            name: syscall_name(nr),
+                            args,
+                            ret,
+                        });
+                    });
+                }
+            }
+        });
+    }
+}
+
 fn main() -> Result<()> {
-    // Parse CLI: pull --diff out of the front.
+    // Parse CLI: pull --diff and --no-marker out of the front.
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut baseline: Option<PathBuf> = None;
+    let mut emit_marker = true;
     let mut positional: Vec<String> = Vec::with_capacity(raw.len());
     let mut it = raw.into_iter();
     while let Some(a) = it.next() {
@@ -51,6 +106,8 @@ fn main() -> Result<()> {
             baseline = Some(PathBuf::from(
                 it.next().context("--diff requires a path argument")?,
             ));
+        } else if a == "--no-marker" {
+            emit_marker = false;
         } else {
             positional.push(a);
         }
@@ -60,7 +117,7 @@ fn main() -> Result<()> {
         .first()
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "usage: trace-host <python.wasm> [--diff <baseline>] [--] [args...]"
+                "usage: trace-host <python.wasm> [--diff <baseline>] [--no-marker] [--] [args...]"
             )
         })?
         .clone();
@@ -73,7 +130,7 @@ fn main() -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let entries = rt.block_on(run_guest(&wasm_path, &script_args))?;
+    let (entries, marker) = rt.block_on(run_guest(&wasm_path, &script_args))?;
 
     // Emit one JSON line per syscall.
     let mut names_seen: BTreeSet<&'static str> = BTreeSet::new();
@@ -87,6 +144,10 @@ fn main() -> Result<()> {
             e.args[0], e.args[1], e.args[2], e.args[3], e.args[4], e.args[5],
             e.ret,
         );
+    }
+    if emit_marker {
+        let escaped = marker.replace('\\', "\\\\").replace('"', "\\\"");
+        println!("{{\"marker\":\"{}\"}}", escaped);
     }
     eprintln!("trace-host: {} syscalls captured", entries.len());
 
@@ -124,159 +185,81 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Drive the guest and return the captured trace. Mirrors the edge-python
-/// stub driver (Step 20 will share this code path). The trace layer wraps
-/// the dispatcher via a custom `Linker` definition rather than the default
-/// one — see `register_traced_linker` for the wiring.
-async fn run_guest(wasm_path: &str, _script_args: &[String]) -> Result<Vec<TraceEntry>> {
+/// Read the pass/fail marker that C conformance tests write at
+/// `MARKER_ADDR` (offset 4096) before the final `_start` return.
+///
+/// Returns the marker text. Empty string means "no marker written".
+///
+/// **Important:** several existing C conformance tests use bytes 4-62 of
+/// the marker region as scratch space for sockaddr layouts (e.g. `bind.c`
+/// writes `0x02` — the AF_INET family byte — at offset 4100). So we do
+/// NOT walk the buffer until the first NUL; we read the literal prefix:
+///   - bytes 0..4 == b"PASS"         → "PASS"
+///   - bytes 0..5 == b"FAIL:"        → "FAIL:<reason up to first NUL>"
+///   - anything else                 → "" (no marker)
+fn read_marker(store: &wasmtime::Store<Kernel>) -> String {
+    const MARKER_ADDR: usize = 4096;
+    const MARKER_LEN: usize = 64;
+    let mem = match store.data().memory.as_ref() {
+        Some(m) => m,
+        None => return String::new(),
+    };
+    let mut buf = [0u8; MARKER_LEN];
+    if mem.read(store, MARKER_ADDR, &mut buf).is_err() {
+        return String::new();
+    }
+    if &buf[0..4] == b"PASS" {
+        return "PASS".to_string();
+    }
+    if &buf[0..5] == b"FAIL:" {
+        let end = buf[5..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|p| p + 5)
+            .unwrap_or(buf.len());
+        let reason_bytes = &buf[5..end];
+        return format!("FAIL:{}", String::from_utf8_lossy(reason_bytes));
+    }
+    String::new()
+}
+
+/// Drive the guest and return the captured trace.
+///
+/// P2-A2: we use the standard `add_to_linker` (no custom dispatch) and
+/// install a thread-local `TraceObserver` for the duration of the run.
+async fn run_guest(
+    wasm_path: &str,
+    _script_args: &[String],
+) -> Result<(Vec<TraceEntry>, String)> {
     let engine = build_engine()?;
     let mut linker: Linker<Kernel> = Linker::new(&engine);
+    add_to_linker(&mut linker)?;
 
-    // Custom dispatch that records (nr, args, ret) into a buffer that we
-    // return by leaking an Arc through Caller::data(). Easier path: stash
-    // the buffer in a thread-local we drain at the end.
-    thread_local! {
-        static TRACE: std::cell::RefCell<Vec<TraceEntry>> = const { std::cell::RefCell::new(Vec::new()) };
-    }
-
-    let params: [ValType; 7] = [const { ValType::I64 }; 7];
-    let results: [ValType; 1] = [const { ValType::I64 }; 1];
-    let func_ty = FuncType::new(&engine, params, results);
-    linker.func_new_async("kernel", "syscall", func_ty, move |caller, params, results| {
-        Box::new(async move {
-            let nr = params[0].unwrap_i64() as u32;
-            let a: [i64; 6] = std::array::from_fn(|i| params[i + 1].unwrap_i64());
-
-            let ret = dispatch_dispatch(caller, nr, a).await;
-            let name = dispatch::syscall_name(nr);
-
-            let ts_ns = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            TRACE.with(|t| {
-                t.borrow_mut().push(TraceEntry {
-                    ts_ns,
-                    nr,
-                    name,
-                    args: a,
-                    ret,
-                });
-            });
-
-            results[0] = Val::I64(ret);
-            Ok(())
-        })
-    })?;
+    // Install the observer for this thread. We restore the prior (likely
+    // None) observer on return so this binary is re-entrant-safe.
+    let prev = install_observer(Some(std::sync::Arc::new(TraceObserver)));
 
     let kernel = Kernel::new(vec![], vec![]);
     let mut store = build_store(&engine, kernel);
     let bytes = std::fs::read(wasm_path)
         .map_err(|e| anyhow::anyhow!("reading {wasm_path}: {e}"))?;
-    // Detect precompiled artifact by magic. wasmtime's precompiled artifacts
-    // begin with a version tag; raw wasm begins with `\0asm`.
     let module = if bytes.len() >= 4 && &bytes[0..4] == b"\0asm" {
         wasmtime::Module::new(&engine, &bytes)?
     } else {
-        // Treat as a precompiled artifact.
         unsafe { wasmtime::Module::deserialize(&engine, &bytes)? }
     };
     let instance = linker.instantiate_async(&mut store, &module).await?;
     if let Some(mem) = instance.get_memory(&mut store, "memory") {
         store.data_mut().attach_memory(mem);
     }
-    // Try multiple `_start` signatures. zig cc emits `() -> void` (no
-    // return). Emscripten emits `() -> i32`. CPython's `_start` (when
-    // landed via Step 19-20) emits `() -> void`.
     if let Ok(start) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-        let _ = start.call_async(&mut store, ()).await; // exit may trap
+        let _ = start.call_async(&mut store, ()).await;
     } else if let Ok(start) = instance.get_typed_func::<(), i32>(&mut store, "_start") {
         let _ = start.call_async(&mut store, ()).await;
     }
 
     let entries = TRACE.with(|t| t.borrow().clone());
-    Ok(entries)
-}
-
-/// Mirror of `dispatch::dispatch` — kept inline here so the trace layer
-/// owns the dispatch decision and can record the return value. New syscalls
-/// added to `dispatch::dispatch` must be mirrored here.
-async fn dispatch_dispatch(
-    mut caller: Caller<'_, Kernel>,
-    nr: u32,
-    a: [i64; 6],
-) -> i64 {
-    match nr {
-        sys::process::NR_EXIT => sys::process::exit(&mut caller, a).await,
-        sys::process::NR_EXIT_GROUP => sys::process::exit_group(&mut caller, a).await,
-        sys::process::NR_GETPID => sys::process::getpid(),
-        sys::process::NR_GETTID => sys::process::gettid(),
-        sys::process::NR_SET_TID_ADDRESS => {
-            sys::process::set_tid_address(&mut caller, a)
-        }
-        sys::process::NR_SET_ROBUST_LIST => sys::process::set_robust_list(),
-        sys::process::NR_ARCH_PRCTL => to_ret(ENOSYS),
-        sys::process::NR_RSEQ => to_ret(ENOSYS),
-
-        sys::memory::NR_MMAP => sys::memory::mmap(&mut caller, a).await,
-        sys::memory::NR_MUNMAP => sys::memory::munmap(&mut caller, a).await,
-        sys::memory::NR_MPROTECT => sys::memory::mprotect(),
-        sys::memory::NR_MADVISE => sys::memory::madvise(),
-        sys::memory::NR_BRK => sys::memory::brk(&mut caller, a),
-
-        sys::file::NR_READ => sys::file::read(&mut caller, a).await,
-        sys::file::NR_WRITE => sys::file::write(&mut caller, a).await,
-        sys::file::NR_OPEN => sys::file::open(&mut caller, a).await,
-        sys::file::NR_OPENAT => sys::file::openat(&mut caller, a).await,
-        sys::file::NR_CLOSE => sys::file::close(&mut caller, a).await,
-        sys::file::NR_STAT => sys::file::stat(&mut caller, a).await,
-        sys::file::NR_LSTAT => sys::file::lstat(&mut caller, a).await,
-        sys::file::NR_LSEEK => sys::file::lseek(&mut caller, a).await,
-        sys::file::NR_FSTAT => sys::file::fstat(&mut caller, a).await,
-        sys::file::NR_NEWFSTATAT => sys::file::newfstatat(&mut caller, a).await,
-        sys::file::NR_GETDENTS64 => sys::file::getdents64(&mut caller, a).await,
-        sys::file::NR_PIPE => sys::file::pipe(&mut caller, a).await,
-        sys::file::NR_PIPE2 => sys::file::pipe2(&mut caller, a).await,
-        sys::file::NR_FCNTL => sys::file::fcntl(&mut caller, a).await,
-        sys::file::NR_GETCWD => sys::file::getcwd(&mut caller, a).await,
-        sys::file::NR_READV => sys::file::readv(&mut caller, a).await,
-        sys::file::NR_WRITEV => sys::file::writev(&mut caller, a).await,
-
-        sys::socket::NR_SOCKET => sys::socket::socket(&mut caller, a).await,
-        sys::socket::NR_BIND => sys::socket::bind(&mut caller, a).await,
-        sys::socket::NR_LISTEN => sys::socket::listen(&mut caller, a).await,
-        sys::socket::NR_ACCEPT => sys::socket::accept(&mut caller, a).await,
-        sys::socket::NR_ACCEPT4 => sys::socket::accept4(&mut caller, a).await,
-        sys::socket::NR_CONNECT => sys::socket::connect(&mut caller, a).await,
-        sys::socket::NR_SENDTO => sys::socket::sendto(&mut caller, a).await,
-        sys::socket::NR_RECVFROM => sys::socket::recvfrom(&mut caller, a).await,
-        sys::socket::NR_SETSOCKOPT => sys::socket::setsockopt(&mut caller, a).await,
-        sys::socket::NR_GETSOCKOPT => sys::socket::getsockopt(&mut caller, a).await,
-        sys::socket::NR_GETSOCKNAME => sys::socket::getsockname(&mut caller, a).await,
-        sys::socket::NR_GETPEERNAME => sys::socket::getpeername(&mut caller, a).await,
-        sys::socket::NR_SHUTDOWN => sys::socket::shutdown(&mut caller, a).await,
-
-        sys::poll::NR_POLL => sys::poll::poll(&mut caller, a).await,
-
-        sys::epoll::NR_EPOLL_CREATE1 => sys::epoll::epoll_create1(&mut caller, a).await,
-        sys::epoll::NR_EPOLL_CTL => sys::epoll::epoll_ctl(&mut caller, a).await,
-        sys::epoll::NR_EPOLL_WAIT => sys::epoll::epoll_wait(&mut caller, a).await,
-        sys::eventfd::NR_EVENTFD2 => sys::eventfd::eventfd2(&mut caller, a).await,
-
-        sys::identity::NR_GETUID => sys::identity::getuid(),
-        sys::identity::NR_GETEUID => sys::identity::geteuid(),
-        sys::identity::NR_GETGID => sys::identity::getgid(),
-        sys::identity::NR_GETEGID => sys::identity::getegid(),
-
-        sys::time::NR_CLOCK_GETTIME => sys::time::clock_gettime(&mut caller, a).await,
-        sys::time::NR_GETTIMEOFDAY => sys::time::gettimeofday(&mut caller, a).await,
-        sys::time::NR_NANOSLEEP => sys::time::nanosleep(&mut caller, a).await,
-
-        sys::random::NR_GETRANDOM => sys::random::getrandom(&mut caller, a).await,
-
-        sys::signal::NR_RT_SIGACTION => sys::signal::rt_sigaction(&mut caller, a),
-        sys::signal::NR_RT_SIGPROCMASK => sys::signal::rt_sigprocmask(&mut caller, a),
-
-        _ => to_ret(ENOSYS),
-    }
+    let marker = read_marker(&store);
+    install_observer(prev);
+    Ok((entries, marker))
 }

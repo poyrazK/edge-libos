@@ -1,8 +1,9 @@
 //! `poll(2)` — poll a set of fds for readiness.
 //!
-//! P1-6's `poll` is non-suspending: it inspects the current state of each
-//! fd and reports readiness synchronously. Async-suspending readiness
-//! waits go through `epoll_wait` (P1-7), which builds on this primitive.
+//! P2-B3: now async-suspending. Builds a `tokio::select!` over per-fd
+//! readiness notifies (pipes have a `notify` field; sockets reuse the
+//! P1-7 `notify_read`) plus `tokio::time::sleep(timeout)`. `timeout_ms`
+//! < 0 omits the timer (wait indefinitely); 0 returns immediately.
 //!
 //! ## struct pollfd on wasm32
 //!
@@ -16,6 +17,9 @@
 //!
 //! Each entry is 8 bytes. The guest passes a pointer to `nfds` entries.
 
+use std::sync::Arc;
+
+use tokio::sync::Notify;
 use wasmtime::Caller;
 
 use crate::errno::EINVAL;
@@ -40,24 +44,20 @@ pub const POLLWRBAND: i16 = 0x0200;
 
 const POLLFD_SIZE: usize = 8; // sizeof(struct pollfd)
 
-/// `poll(fds_ptr, nfds, timeout_ms)` — inspect readiness of `nfds` fds in
-/// the guest buffer starting at `fds_ptr`. Each entry is an 8-byte
-/// `struct pollfd { int fd; short events; short revents; }`.
+/// `poll(fds_ptr, nfds, timeout_ms)`.
 ///
-/// **P1-6 scope**: poll is synchronous. `timeout_ms` is honored only as
-/// "0" vs non-zero: we always return immediately with the current
-/// snapshot, which is fine for the CPython/FastAPI DoD since Python's
-/// `select.select` already uses `epoll` on Linux. The non-suspending
-/// variant is sufficient for the bootstrap path where the guest calls
-/// `poll` to detect readiness on already-connected fds.
+/// P2-B3: real async. Inspects the current snapshot of each fd; if any
+/// has a non-zero revents matching `events`, returns immediately.
+/// Otherwise builds a `tokio::select!` over per-fd readiness notifies
+/// and a sleep timer. The select! body just falls through (the outer
+/// loop re-checks the snapshot).
 ///
-/// Returns: number of fds with non-zero `revents` (success), 0 on no
-/// events ready. `-EFAULT` if the buffer is out of bounds, `-EINVAL`
-/// if `nfds < 0` or `nfds` would overflow the buffer.
+/// Returns: number of fds with non-zero `revents` (success), 0 on
+/// timeout, negative errno on bad args.
 pub async fn poll(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let fds_ptr = a[0];
     let nfds_raw = a[1];
-    let _timeout_ms = a[2]; // ignored in P1-6 (synchronous only)
+    let timeout_ms = a[2];
 
     let nfds = match usize::try_from(nfds_raw) {
         Ok(n) => n,
@@ -73,52 +73,142 @@ pub async fn poll(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         None => return -EINVAL,
     };
 
-    // Pre-validate the entire buffer up front. We re-slice per-entry below.
+    // Pre-validate the entire buffer up front.
     if let Err(e) = mem::guest_slice_mut(caller, fds_ptr, total) {
         return e;
     }
 
-    // Phase 1: snapshot which fds are ready, given the guest's request
-    // bits. Done before any write-back so we don't race with our own
-    // updates.
-    let readiness: Vec<i16> = {
-        let fds_table: &FdTable = &caller.data().fds;
+    // Snapshot the (fd, events) pairs upfront so we can iterate the
+    // poll loop without re-reading guest memory on every wake.
+    let entries: Vec<(i32, i16)> = {
         let mut out = Vec::with_capacity(nfds);
         for i in 0..nfds {
             let entry_ptr = fds_ptr + (i * POLLFD_SIZE) as i64;
-            // Re-slice — the read-only path lets us share the snapshot.
             let entry = match mem::guest_slice(caller, entry_ptr, POLLFD_SIZE as i64) {
                 Ok(b) => b,
                 Err(_) => {
-                    out.push(POLLNVAL);
+                    out.push((0, POLLNVAL));
                     continue;
                 }
             };
             let fd = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
             let events = i16::from_le_bytes([entry[4], entry[5]]);
-
-            let revents = poll_one(fds_table, fd, events);
-            out.push(revents);
+            out.push((fd, events));
         }
         out
     };
 
-    // Phase 2: write revents back into the guest buffer.
-    let mut ready_count: i64 = 0;
+    // Collect the wake notifiers for the fds the guest is asking about.
+    // (POLLNVAL/Epoll/EventFd fds don't get a wake source — they're
+    // reported synchronously.)
+    let mut wakes: Vec<Arc<Notify>> = Vec::new();
     {
-        let buf = match mem::guest_slice_mut(caller, fds_ptr, total) {
-            Ok(b) => b,
-            Err(e) => return e,
-        };
-        for (i, revents) in readiness.iter().enumerate() {
-            let off = i * POLLFD_SIZE;
-            buf[off + 6..off + 8].copy_from_slice(&revents.to_le_bytes());
-            if *revents != 0 {
-                ready_count += 1;
+        let fds_table: &FdTable = &caller.data().fds;
+        for &(fd, _) in &entries {
+            let fd_u = match u32::try_from(fd) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            match fds_table.get(fd_u) {
+                Ok(Resource::PipeRead(p)) => wakes.push(p.notify.clone()),
+                Ok(Resource::PipeWrite(p)) => wakes.push(p.notify.clone()),
+                Ok(Resource::Socket(s)) => wakes.push(s.notify_read.clone()),
+                _ => {}
             }
         }
     }
 
+    // Polling loop: re-snapshot readiness until something becomes ready
+    // or the timer expires.
+    let deadline = if timeout_ms == 0 {
+        Some(tokio::time::Instant::now()) // already expired
+    } else if timeout_ms > 0 {
+        Some(tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64))
+    } else {
+        None
+    };
+
+    loop {
+        // Snapshot readiness now.
+        let readiness: Vec<i16> = {
+            let fds_table: &FdTable = &caller.data().fds;
+            entries
+                .iter()
+                .map(|&(fd, events)| poll_one(fds_table, fd, events))
+                .collect()
+        };
+        // Anything ready (incl. POLLNVAL/POLLERR/POLLHUP) → write and return.
+        if readiness.iter().any(|r| *r != 0) {
+            return write_revents(caller, fds_ptr, &readiness);
+        }
+        // Timeout = 0 → we already checked, no wake; return 0.
+        if timeout_ms == 0 {
+            return write_revents(caller, fds_ptr, &readiness);
+        }
+        // Build the select! over wakes + (optional) timer.
+        if let Some(dl) = deadline {
+            let timeout_fut = tokio::time::sleep_until(dl);
+            tokio::select! {
+                biased;
+                _ = timeout_fut => {
+                    // Final snapshot — anything become ready just now?
+                    let readiness: Vec<i16> = {
+                        let fds_table: &FdTable = &caller.data().fds;
+                        entries
+                            .iter()
+                            .map(|&(fd, events)| poll_one(fds_table, fd, events))
+                            .collect()
+                    };
+                    return write_revents(caller, fds_ptr, &readiness);
+                }
+                _ = wait_any(&wakes) => {
+                    // A wake fired; loop and re-check.
+                    continue;
+                }
+            }
+        } else {
+            // No timeout → wait indefinitely on any wake.
+            wait_any(&wakes).await;
+            continue;
+        }
+    }
+}
+
+/// Wait until any of `wakes` fires. If `wakes` is empty, sleep forever.
+async fn wait_any(wakes: &[Arc<Notify>]) {
+    if wakes.is_empty() {
+        // No fd to wait on; never wake. Matches Linux `poll` with no
+        // valid fds and a -1 timeout (sleeps indefinitely).
+        std::future::pending::<()>().await;
+        return;
+    }
+    let futs: Vec<_> = wakes
+        .iter()
+        .map(|n| {
+            Box::pin(n.notified())
+                as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>
+        })
+        .collect();
+    let (_winner, _idx, _rest) = futures::future::select_all(futs).await;
+}
+
+/// Write the readiness bits back into the guest buffer and return the
+/// count of fds with non-zero revents.
+fn write_revents(caller: &mut Caller<'_, Kernel>, fds_ptr: i64, readiness: &[i16]) -> i64 {
+    let nfds = readiness.len();
+    let total = (nfds * POLLFD_SIZE) as i64;
+    let mut ready_count: i64 = 0;
+    let buf = match mem::guest_slice_mut(caller, fds_ptr, total) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    for (i, revents) in readiness.iter().enumerate() {
+        let off = i * POLLFD_SIZE;
+        buf[off + 6..off + 8].copy_from_slice(&revents.to_le_bytes());
+        if *revents != 0 {
+            ready_count += 1;
+        }
+    }
     ready_count
 }
 

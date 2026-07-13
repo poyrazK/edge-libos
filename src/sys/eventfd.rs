@@ -4,6 +4,12 @@
 //! eventfd is an 8-byte counter readable via `read(2)` (returns the u64
 //! and resets to 0) and writable via `write(2)` (adds to the counter).
 //! The associated `Notify` lets `epoll_wait` await counter changes.
+//!
+//! P2-B1: `read(2)`/`write(2)` on an eventfd fd now work via the
+//! `Resource::EventFd` arm in `crate::sys::file::{read,write}`. The
+//! helpers `eventfd_read`/`eventfd_write` operate on the inner counter
+//! directly (no fd-table borrow), so the caller in `file.rs` can drop
+//! the `&mut fds` borrow before invoking them.
 
 use std::sync::Arc;
 
@@ -47,30 +53,57 @@ pub async fn eventfd2(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     fd as i64
 }
 
-/// `read(fd, buf, len, ...)` — when fd is an EventFd, drains the counter
-/// into a u64 at `buf`. Called from `crate::sys::file::read` after it
-/// detects the fd is an EventFd.
+/// Drain the counter into a u64.
 ///
-/// Returns 8 on success, -EINVAL if buf is too small.
-pub async fn eventfd_read(caller: &mut Caller<'_, Kernel>, fd: u32, buf_ptr: i64, buf_len: i64) -> i64 {
-    if buf_len < 8 {
-        return -EINVAL;
+/// Called from `crate::sys::file::read` after it detects the fd is an
+/// EventFd and extracts the inner (so the `&mut fds` borrow is dropped
+/// before this call). Returns the previous counter value.
+///
+/// `EFD_SEMAPHORE` is not honored: we always drain, not decrement-by-one.
+pub(crate) fn eventfd_read(e: &EventFdInner) -> u64 {
+    let mut c = e.counter.lock();
+    let v = *c;
+    *c = 0;
+    v
+}
+
+/// Add the u64 at `addend` to the counter and notify waiters.
+///
+/// Returns the new counter value (saturating at u64::MAX). Called from
+/// `crate::sys::file::write` after it detects the fd is an EventFd.
+pub(crate) fn eventfd_write(e: &EventFdInner, addend: u64) -> u64 {
+    let new = e.counter.lock().checked_add(addend).unwrap_or(u64::MAX);
+    *e.counter.lock() = new;
+    e.notify.notify_waiters();
+    new
+}
+
+/// Validate that a generic read/write buf is at least 8 bytes for an eventfd.
+pub(crate) fn require_u64_buf(buf_len: i64) -> Result<(), i64> {
+    if buf_len < 8 { Err(-EINVAL) } else { Ok(()) }
+}
+
+/// Backwards-compatible wrapper: `eventfd2` syscall -> `eventfd2_init`
+/// no-op (kept for symmetry; not used by the generic read/write path).
+#[allow(dead_code)]
+pub async fn eventfd_read_compat(
+    caller: &mut Caller<'_, Kernel>,
+    fd: u32,
+    buf_ptr: i64,
+    buf_len: i64,
+) -> i64 {
+    if let Err(e) = require_u64_buf(buf_len) {
+        return e;
     }
     let val = {
         let fds = &mut caller.data_mut().fds;
         match fds.get_mut(fd) {
-            Ok(Resource::EventFd(e)) => {
-                let mut c = e.counter.lock();
-                let v = *c;
-                *c = 0;
-                v
-            }
+            Ok(Resource::EventFd(e)) => eventfd_read(e),
             Ok(_) => return -crate::errno::EBADF,
             Err(e) => return e,
         }
     };
-    // Write the u64 into the guest buffer.
-    let bytes = val.to_ne_bytes(); // LE on x86, BE on wasm — but P1 writes to wasm only
+    let bytes = val.to_ne_bytes();
     let buf = match crate::mem::guest_slice_mut(caller, buf_ptr, 8) {
         Ok(b) => b,
         Err(e) => return e,
@@ -79,32 +112,33 @@ pub async fn eventfd_read(caller: &mut Caller<'_, Kernel>, fd: u32, buf_ptr: i64
     8
 }
 
-/// `write(fd, buf, len, ...)` — when fd is an EventFd, adds the u64 at
-/// `buf` to the counter and notifies waiters.
-pub async fn eventfd_write(caller: &mut Caller<'_, Kernel>, fd: u32, buf_ptr: i64, buf_len: i64) -> i64 {
-    if buf_len < 8 {
-        return -EINVAL;
+/// Backwards-compatible wrapper for write.
+#[allow(dead_code)]
+pub async fn eventfd_write_compat(
+    caller: &mut Caller<'_, Kernel>,
+    fd: u32,
+    buf_ptr: i64,
+    buf_len: i64,
+) -> i64 {
+    if let Err(e) = require_u64_buf(buf_len) {
+        return e;
     }
     let addend = {
         let buf = match crate::mem::guest_slice(caller, buf_ptr, 8) {
             Ok(b) => b,
             Err(e) => return e,
         };
-        u64::from_ne_bytes([
-            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-        ])
+        u64::from_ne_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]])
     };
-    let notify = {
+    {
         let fds = &mut caller.data_mut().fds;
         match fds.get_mut(fd) {
             Ok(Resource::EventFd(e)) => {
-                *e.counter.lock() = e.counter.lock().checked_add(addend).unwrap_or(u64::MAX);
-                e.notify.clone()
+                let _ = eventfd_write(e, addend);
             }
             Ok(_) => return -crate::errno::EBADF,
             Err(e) => return e,
         }
-    };
-    notify.notify_waiters();
+    }
     8
 }

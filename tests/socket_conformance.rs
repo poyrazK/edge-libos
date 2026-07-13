@@ -1677,6 +1677,7 @@ fn poll_ready_pipe_marks_pollin() -> Result<()> {
             buf: buf.clone(),
             closed: closed.clone(),
             nonblock: nonblock.clone(),
+            notify: Arc::new(tokio::sync::Notify::new()),
         };
         let pipe_fd = store.data_mut().fds.insert(Resource::PipeRead(pr));
         let inst = linker.instantiate_async(&mut store, &poll).await?;

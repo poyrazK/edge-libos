@@ -751,6 +751,18 @@ pub async fn getsockopt(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         return -crate::errno::EFAULT;
     }
 
+    // P2-B6: a non-socket fd must fail with -EBADF (matches
+    // tests/conformance/getsockopt.c line 49-53). Linux semantics is
+    // actually -ENOTSOCK, but our conformance test contracts to
+    // -EBADF; preserve that contract for now.
+    {
+        let fds_table = &caller.data().fds;
+        match fds_table.get(fd) {
+            Ok(Resource::Socket(_)) => {}
+            Ok(_) | Err(_) => return -crate::errno::EBADF,
+        }
+    }
+
     // Phase 1: compute the value to write. We do this while holding only
     // an immutable borrow on `caller` so the borrow checker is happy.
     // SO_ERROR swaps atomically, so we mutate here — that's fine because

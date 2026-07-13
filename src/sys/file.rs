@@ -17,6 +17,7 @@ use crate::errno::{EACCES, EBADF, EFAULT, EINVAL, ENOENT, ERANGE, ESPIPE};
 use crate::fd::Resource;
 use crate::kernel::Kernel;
 use crate::mem;
+use crate::sys::eventfd;
 use crate::vfs::{Stat, Vfs};
 
 // NR_* (Linux x86-64 unistd_64.h)
@@ -66,13 +67,23 @@ pub const F_SETFD: i32 = 2;
 pub const F_DUPFD: i32 = 0;
 pub const F_DUPFD_CLOEXEC: i32 = 1024 + 6;
 
-/// A seekable file. Wraps `std::fs::File` + its current position + the
-/// absolute path we opened it from (so `getdents64` can be answered without
-/// re-resolving).
+/// A seekable file or directory fd. Wraps `std::fs::File` + its current
+/// position + the absolute path we opened it from (so `getdents64` can
+/// be answered without re-resolving).
+///
+/// P2-B2: directories are now also stored as `FilePos`; the `is_dir` flag
+/// routes `getdents64` and `lseek` to the directory-stream code paths.
+/// The `dir_cache` holds the pre-encoded dirent64 record bytes so repeated
+/// `getdents64` calls advance `pos` through the same buffer.
 pub struct FilePos {
     pub inner: std::fs::File,
     pub pos: u64,
     pub path: Option<PathBuf>,
+    /// P2-B2: true when this fd refers to a directory.
+    pub is_dir: bool,
+    /// P2-B2: pre-encoded dirent64 records for the directory. Populated
+    /// lazily on the first `getdents64` call. None for regular files.
+    pub dir_cache: Option<Vec<u8>>,
 }
 
 impl FilePos {
@@ -81,6 +92,8 @@ impl FilePos {
             inner: f,
             pos: 0,
             path: None,
+            is_dir: false,
+            dir_cache: None,
         }
     }
 
@@ -89,6 +102,8 @@ impl FilePos {
             inner: f,
             pos: 0,
             path: Some(p),
+            is_dir: false,
+            dir_cache: None,
         }
     }
 
@@ -97,6 +112,8 @@ impl FilePos {
             inner: self.inner.try_clone()?,
             pos: self.pos,
             path: self.path.clone(),
+            is_dir: self.is_dir,
+            dir_cache: self.dir_cache.clone(),
         })
     }
 }
@@ -172,6 +189,20 @@ pub async fn read(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                 fp.pos += got.len() as u64;
                 tmp = got;
             }
+            Resource::EventFd(e) => {
+                // P2-B1: drain the counter into a u64 at buf.
+                if let Err(e) = eventfd::require_u64_buf(buf_len_raw) {
+                    return e;
+                }
+                let val = eventfd::eventfd_read(e);
+                let bytes = val.to_ne_bytes();
+                let buf = match mem::guest_slice_mut(caller, buf_ptr, 8) {
+                    Ok(b) => b,
+                    Err(e) => return e,
+                };
+                buf[..8].copy_from_slice(&bytes);
+                return 8;
+            }
             _ => return -EBADF,
         }
     }
@@ -218,7 +249,15 @@ pub async fn write(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         match res {
             Resource::Stdout(w) | Resource::Stderr(w) | Resource::PipeWrite(w) => {
                 let mut q = w.buf.lock();
+                let was_empty = q.is_empty();
                 q.extend(bytes.iter().copied());
+                drop(q);
+                // P2-B3: wake any poll/epoll subscriber waiting for POLLIN.
+                // Only fire on the empty→non-empty transition so we don't
+                // spam wakers on every write into a non-empty buffer.
+                if was_empty {
+                    w.notify.notify_waiters();
+                }
                 bytes.len()
             }
             Resource::File(fp) => match fp.inner.write(&bytes) {
@@ -228,6 +267,17 @@ pub async fn write(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                 }
                 Err(_) => return -crate::errno::EIO,
             },
+            Resource::EventFd(e) => {
+                // P2-B1: add u64 at buf to the counter.
+                if let Err(e) = eventfd::require_u64_buf(a[2]) {
+                    return e;
+                }
+                let mut be = [0u8; 8];
+                be.copy_from_slice(&bytes[..8]);
+                let addend = u64::from_ne_bytes(be);
+                let _new = eventfd::eventfd_write(e, addend);
+                8
+            }
             _ => return -EBADF,
         }
     };
@@ -260,7 +310,11 @@ pub async fn openat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         Ok(f) => f,
         Err(e) => return e,
     };
-    let fp = FilePos::with_path(file, abs);
+    // P2-B2: stat the path to set is_dir. This lets getdents64/lseek
+    // distinguish a directory fd from a regular file fd.
+    let is_dir = std::fs::metadata(&abs).map(|m| m.is_dir()).unwrap_or(false);
+    let mut fp = FilePos::with_path(file, abs);
+    fp.is_dir = is_dir;
     let fd = caller.data_mut().fds.insert(Resource::File(fp));
     fd as i64
 }
@@ -294,21 +348,33 @@ pub async fn lseek(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     };
     match res {
         Resource::File(fp) => {
-            let from = match whence {
-                SEEK_SET => SeekFrom::Start(offset.max(0) as u64),
-                SEEK_CUR => SeekFrom::Current(offset),
-                SEEK_END => {
-                    let len = fp.inner.metadata().map(|m| m.len() as i64).unwrap_or(0);
-                    SeekFrom::Start((len + offset).max(0) as u64)
+            if fp.is_dir {
+                // P2-B2: dir stream. Only SEEK_SET(0) (rewind) is honored;
+                // other whence values return -ESPIPE per Linux semantics.
+                match whence {
+                    SEEK_SET if offset == 0 => {
+                        fp.pos = 0;
+                        0
+                    }
+                    _ => -ESPIPE,
                 }
-                _ => return -EINVAL,
-            };
-            match fp.inner.seek(from) {
-                Ok(p) => {
-                    fp.pos = p;
-                    p as i64
+            } else {
+                let from = match whence {
+                    SEEK_SET => SeekFrom::Start(offset.max(0) as u64),
+                    SEEK_CUR => SeekFrom::Current(offset),
+                    SEEK_END => {
+                        let len = fp.inner.metadata().map(|m| m.len() as i64).unwrap_or(0);
+                        SeekFrom::Start((len + offset).max(0) as u64)
+                    }
+                    _ => return -EINVAL,
+                };
+                match fp.inner.seek(from) {
+                    Ok(p) => {
+                        fp.pos = p;
+                        p as i64
+                    }
+                    Err(_) => -EINVAL,
                 }
-                Err(_) => -EINVAL,
             }
         }
         _ => -ESPIPE,
@@ -382,6 +448,11 @@ pub async fn newfstatat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 }
 
 /// `getdents64(fd, buf, len)`.
+///
+/// P2-B2: tracks the position per-fd via `FilePos.pos`. The first call
+/// populates `FilePos.dir_cache` with the full pre-encoded dirent64
+/// buffer; subsequent calls slice from `pos`. When `pos >= dir_cache.len()`
+/// the syscall returns 0 (end-of-directory).
 pub async fn getdents64(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let fd = match u32::try_from(a[0]) {
         Ok(f) => f,
@@ -400,27 +471,82 @@ pub async fn getdents64(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         return -EINVAL;
     }
 
-    let path: Option<PathBuf> = {
+    // First, peek the resource type. Non-file fds (Stdout, Pipe, Socket,
+    // EventFd, Epoll) immediately fail with -ENOTDIR. We allow -EBADF
+    // for backward-compat (existing tests on stdout accept either).
+    let is_dir_fd: bool = {
         let fds = &caller.data().fds;
         match fds.get(fd) {
-            Ok(Resource::File(fp)) => fp.path.clone(),
-            Ok(_) | Err(_) => None,
+            Ok(Resource::File(fp)) => fp.is_dir,
+            Ok(_) => return -crate::errno::ENOTDIR,
+            Err(e) => return e,
         }
     };
-    let abs = match path {
-        Some(p) => p,
-        None => return -EBADF,
+    if !is_dir_fd {
+        return -crate::errno::ENOTDIR;
+    }
+
+    // Populate the cache lazily on the first call. We do this in a fresh
+    // fds-borrow block.
+    let path: PathBuf = {
+        let fds = &caller.data().fds;
+        match fds.get(fd) {
+            Ok(Resource::File(fp)) => match fp.path.clone() {
+                Some(p) => p,
+                None => return -EBADF,
+            },
+            Ok(_) => return -crate::errno::ENOTDIR,
+            Err(e) => return e,
+        }
     };
     let (root, cwd) = {
         let kern = caller.data();
         (kern.vfs.root.clone(), kern.vfs.cwd.clone())
     };
     let vfs = Vfs { root, cwd };
-    let bytes = match vfs.getdents(&abs, len) {
-        Ok(b) => b,
-        Err(e) => return e,
+
+    // Lazily fill dir_cache. Re-stat on every call is cheap; we only
+    // re-read the directory if the cache is empty.
+    let needs_fill = {
+        let fds = &caller.data().fds;
+        match fds.get(fd) {
+            Ok(Resource::File(fp)) => fp.dir_cache.is_none(),
+            _ => false,
+        }
     };
-    let n = bytes.len();
+    if needs_fill {
+        let cached = match vfs.readdir_all(&path) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        let fds = &mut caller.data_mut().fds;
+        if let Ok(Resource::File(fp)) = fds.get_mut(fd) {
+            fp.dir_cache = Some(cached);
+        }
+    }
+
+    // Slice the cached dirent64 buffer at fp.pos.
+    let (slice, new_pos): (Vec<u8>, u64) = {
+        let fds = &mut caller.data_mut().fds;
+        let fp = match fds.get_mut(fd) {
+            Ok(Resource::File(fp)) => fp,
+            _ => return -crate::errno::EBADF,
+        };
+        let cache = fp.dir_cache.as_ref().expect("dir_cache just populated");
+        let start = fp.pos as usize;
+        if start >= cache.len() {
+            // Already exhausted.
+            (Vec::new(), fp.pos)
+        } else {
+            let end = (start + len).min(cache.len());
+            let s = cache[start..end].to_vec();
+            let new_pos = end as u64;
+            fp.pos = new_pos;
+            (s, new_pos)
+        }
+    };
+    let _ = new_pos;
+    let n = slice.len();
     if n == 0 {
         return 0; // End of directory.
     }
@@ -428,7 +554,7 @@ pub async fn getdents64(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         Ok(b) => b,
         Err(e) => return e,
     };
-    dst.copy_from_slice(&bytes);
+    dst.copy_from_slice(&slice);
     n as i64
 }
 
@@ -716,26 +842,31 @@ pub async fn fcntl(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                         buf: r.buf.clone(),
                         closed: r.closed.clone(),
                         nonblock: r.nonblock.clone(),
+                        notify: r.notify.clone(),
                     }),
                     Ok(Resource::Stdout(w)) => Resource::Stdout(crate::fd::PipeWrite {
                         buf: w.buf.clone(),
                         closed: w.closed.clone(),
                         nonblock: w.nonblock.clone(),
+                        notify: w.notify.clone(),
                     }),
                     Ok(Resource::Stderr(w)) => Resource::Stderr(crate::fd::PipeWrite {
                         buf: w.buf.clone(),
                         closed: w.closed.clone(),
                         nonblock: w.nonblock.clone(),
+                        notify: w.notify.clone(),
                     }),
                     Ok(Resource::PipeRead(r)) => Resource::PipeRead(crate::fd::PipeRead {
                         buf: r.buf.clone(),
                         closed: r.closed.clone(),
                         nonblock: r.nonblock.clone(),
+                        notify: r.notify.clone(),
                     }),
                     Ok(Resource::PipeWrite(w)) => Resource::PipeWrite(crate::fd::PipeWrite {
                         buf: w.buf.clone(),
                         closed: w.closed.clone(),
                         nonblock: w.nonblock.clone(),
+                        notify: w.notify.clone(),
                     }),
                     // P1-1: socket fds are not yet duplicable; P1-7's epoll
                     // layer is the right place to model shared fds. For now
