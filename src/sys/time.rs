@@ -19,6 +19,27 @@ pub const NR_NANOSLEEP: u32 = 35;
 pub const NR_CLOCK_GETRES: u32 = 229;
 pub const NR_CLOCK_NANOSLEEP: u32 = 230;
 
+// P2 closing: sysinfo + times stubs.
+pub const NR_SYSINFO: u32 = 99;
+pub const NR_TIMES: u32 = 100;
+
+/// `struct sysinfo` on x86-64 native (which is what musl was compiled
+/// against for `wasm32-musl`): 11 × u64 fields + mem_unit(u32) + pad = 96 B.
+/// We size our buffer generously to cover both x86-64 and 32-bit layouts.
+pub const SYSINFO_SIZE: i64 = 128;
+// Sysinfo offsets are architecture-defined by Linux's `<linux/sysinfo.h>`.
+// On x86-64 (the canonical Linux personality): uptime is the first u64.
+const SYSINFO_UPTIME_OFF: usize = 0;
+// 1×8 (uptime) + 3×8 (loads) = 32, then totalram.
+const SYSINFO_TOTALRAM_OFF: usize = 32;
+const SYSINFO_FREERAM_OFF: usize = 40;
+// 1×8 + 3×8 + 5×8 = 72, then sharedram/bufferram/totalswap/freeswap/procs at 72/80/88/96/104.
+const SYSINFO_PROCS_OFF: usize = 104;
+
+/// `struct tms` on x86-64: 4 × clock_t(8) = 32 bytes.
+/// We zero-fill a generous 32-byte buffer.
+pub const TMS_SIZE: i64 = 32;
+
 pub const TIMER_ABSTIME: i32 = 1;
 
 /// `clock_gettime`'s `clockid_t` values (the ones we honour). Anything else
@@ -222,6 +243,61 @@ pub async fn nanosleep(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     0
 }
 
+/// `sysinfo(info)` — stub returning fake uptime/memory. Per
+/// impelementationplan §4.6, P2 stubs return plausible values; CPython
+/// reads this on startup but tolerates dummy data.
+///
+/// Returns 0 on success. `info == NULL` → -EFAULT.
+pub async fn sysinfo(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    use crate::errno::EFAULT;
+    let info = a[0];
+    if info == 0 {
+        return -EFAULT;
+    }
+    let bytes = match mem::guest_slice_mut(caller, info, SYSINFO_SIZE) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    // Zero the whole struct, then set a few plausible fields:
+    //   uptime: 1 second since boot (so libs don't divide by zero)
+    //   totalram / freeram: 1 GiB each (sane defaults for a sandbox)
+    //   procs: 1 (ourselves)
+    for b in bytes.iter_mut() {
+        *b = 0;
+    }
+    bytes[SYSINFO_UPTIME_OFF..SYSINFO_UPTIME_OFF + 8]
+        .copy_from_slice(&1_i64.to_le_bytes());
+    bytes[SYSINFO_TOTALRAM_OFF..SYSINFO_TOTALRAM_OFF + 8]
+        .copy_from_slice(&(1u64 << 30).to_le_bytes());
+    bytes[SYSINFO_FREERAM_OFF..SYSINFO_FREERAM_OFF + 8]
+        .copy_from_slice(&(1u64 << 30).to_le_bytes());
+    bytes[SYSINFO_PROCS_OFF..SYSINFO_PROCS_OFF + 8]
+        .copy_from_slice(&1_i64.to_le_bytes());
+    0
+}
+
+/// `times(buf)` — stub returning all zeros in the tms struct. The plan
+/// lists this as a P2 stub; CPython and most guests don't read it.
+///
+/// Returns the wall-clock time in clock ticks (use 0 — we don't model
+/// `CLK_TCK`). `buf == NULL` → -EFAULT.
+pub async fn times(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    use crate::errno::EFAULT;
+    let buf = a[0];
+    if buf == 0 {
+        return -EFAULT;
+    }
+    let bytes = match mem::guest_slice_mut(caller, buf, TMS_SIZE) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    for b in bytes.iter_mut() {
+        *b = 0;
+    }
+    // Return 0 clock ticks. We don't model CLK_TCK in v1.
+    0
+}
+
 /// Re-export errno helper for unit tests below.
 
 #[cfg(test)]
@@ -247,5 +323,25 @@ mod tests {
         assert_eq!(NR_NANOSLEEP, 35);
         assert_eq!(NR_CLOCK_GETRES, 229);
         assert_eq!(NR_CLOCK_NANOSLEEP, 230);
+    }
+
+    #[test]
+    fn p2_closing_nr_constants_match_linux() {
+        // sysinfo(99) and times(100) — both P2 stubs per the plan.
+        assert_eq!(NR_SYSINFO, 99);
+        assert_eq!(NR_TIMES, 100);
+    }
+
+    #[test]
+    fn sysinfo_struct_size_covers_x86_64() {
+        // x86-64 native layout is 11×u64 + u32 + pad = 96 bytes. Our
+        // buffer is sized generously to cover both x86-64 and 32-bit.
+        assert!(SYSINFO_SIZE >= 96, "SYSINFO_SIZE={SYSINFO_SIZE} < 96");
+    }
+
+    #[test]
+    fn tms_struct_size_covers_x86_64() {
+        // x86-64 native: 4 × clock_t(u64) = 32 bytes.
+        assert!(TMS_SIZE >= 32, "TMS_SIZE={TMS_SIZE} < 32");
     }
 }

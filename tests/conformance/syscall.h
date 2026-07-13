@@ -161,6 +161,10 @@ int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
 // P2-C3 part 2: socketpair.
 #define NR_SOCKETPAIR 53
 
+// P2 closing: sysinfo + times stubs.
+#define NR_SYSINFO 99
+#define NR_TIMES 100
+
 // sendmsg / recvmsg flags.
 #define MSG_PEEK 0x2
 #define MSG_DONTWAIT 0x40

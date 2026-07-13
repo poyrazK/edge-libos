@@ -257,6 +257,10 @@ pub async fn dispatch(
             sys::time::clock_nanosleep(&mut caller, a).await
         }
 
+        // P2 closing: sysinfo + times stubs.
+        sys::time::NR_SYSINFO => sys::time::sysinfo(&mut caller, a).await,
+        sys::time::NR_TIMES => sys::time::times(&mut caller, a).await,
+
         // P2-C2: memory
         sys::memory::NR_MREMAP => sys::memory::mremap(&mut caller, a),
 
@@ -409,6 +413,8 @@ pub fn syscall_name(nr: u32) -> &'static str {
         sys::time::NR_CLOCK_GETTIME => "clock_gettime",
         sys::time::NR_GETTIMEOFDAY => "gettimeofday",
         sys::time::NR_NANOSLEEP => "nanosleep",
+        sys::time::NR_SYSINFO => "sysinfo",
+        sys::time::NR_TIMES => "times",
 
         sys::random::NR_GETRANDOM => "getrandom",
 

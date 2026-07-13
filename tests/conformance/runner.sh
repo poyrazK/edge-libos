@@ -142,6 +142,8 @@ expected_syscall() {
         socketpair)        echo "socketpair" ;;
         af_unix_abstract_returns_eopnotsupp) echo "bind" ;;
         af_unix_bind_connect) echo "connect" ;;
+        sysinfo)             echo "sysinfo" ;;
+        times)               echo "times" ;;
         *) echo "UNREGISTERED: $1" >&2; return 1 ;;
     esac
 }
