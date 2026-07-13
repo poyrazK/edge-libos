@@ -95,8 +95,11 @@ pub async fn socket(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         _ => return -EAFNOSUPPORT,
     };
 
-    let inner = SocketInner::new(kind, nonblock);
-    let fd = caller.data_mut().fds.insert(Resource::Socket(inner));
+    let inner = std::sync::Arc::new(parking_lot::Mutex::new(SocketInner::new(kind, nonblock)));
+    let fd = caller
+        .data_mut()
+        .fds
+        .insert(Resource::Socket(inner));
     fd as i64
 }
 
@@ -118,7 +121,9 @@ pub fn socket_for_test(
         _ => return Err(-EAFNOSUPPORT),
     };
     let _ = nonblock;
-    Ok(fds.insert(Resource::Socket(SocketInner::new(kind, false))))
+    Ok(fds.insert(Resource::Socket(std::sync::Arc::new(parking_lot::Mutex::new(
+        SocketInner::new(kind, false),
+    )))))
 }
 
 #[cfg(test)]
@@ -225,7 +230,7 @@ pub async fn bind(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let fds = &mut caller.data_mut().fds;
     match fds.get_mut(fd) {
         Ok(Resource::Socket(s)) => {
-            s.bound = Some(addr);
+            s.lock().bound = Some(addr);
             0
         }
         Ok(_) => -EBADF,
@@ -275,42 +280,73 @@ pub async fn accept4(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     // Phase 1: pull the (possibly-lazy) listener out of the resource.
     // We hold it as a local Option so we can `.await` outside the
     // `&mut Caller` borrow.
+    // P2-B5: take the listening TcpListener out under a short-lived lock;
+    // never hold the guard across `.await`. We materialize the listener
+    // (which involves a `.await`) outside any lock.
     let listener_opt: Option<tokio::net::TcpListener>;
     let kind;
     let parent_nonblock: bool;
-    {
+    let bound_addr: Option<std::net::SocketAddrV4> = {
         let fds = &mut caller.data_mut().fds;
         match fds.get_mut(fd) {
             Ok(Resource::Socket(s)) => {
-                if !s.is_listening() {
+                let mut gs = s.lock();
+                if !gs.is_listening() {
                     return -EINVAL;
                 }
-                if s.listener.is_none() {
-                    let addr = match &s.bound {
-                        Some(SockAddr::V4 { port, addr }) => std::net::SocketAddrV4::new(
+                kind = gs.kind;
+                parent_nonblock = gs.nonblock.load(std::sync::atomic::Ordering::Relaxed);
+                if gs.listener.is_some() {
+                    listener_opt = gs.listener.take();
+                    None
+                } else {
+                    listener_opt = None;
+                    match &gs.bound {
+                        Some(SockAddr::V4 { port, addr }) => Some(std::net::SocketAddrV4::new(
                             std::net::Ipv4Addr::from(*addr),
                             *port,
-                        ),
+                        )),
                         Some(SockAddr::V6 { .. }) => return -EOPNOTSUPP,
                         None => return -EINVAL,
-                    };
-                    let listener = match tokio::net::TcpListener::bind(addr).await {
-                        Ok(l) => l,
-                        Err(_) => return -crate::errno::EADDRINUSE,
-                    };
-                    s.listener = Some(listener);
-                    // Mark this socket as a listening acceptor — surfaces in
-                    // getsockopt(SO_ACCEPTCONN).
-                    s.is_acceptor = true;
+                    }
                 }
-                kind = s.kind;
-                parent_nonblock = s.nonblock.load(std::sync::atomic::Ordering::Relaxed);
-                listener_opt = s.listener.take();
             }
             Ok(_) => return -EBADF,
             Err(e) => return e,
         }
-    }
+    };
+
+    // If we still need to materialize, await the bind outside any lock.
+    let listener_opt = if let Some(addr) = bound_addr {
+        let listener = match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => l,
+            Err(_) => return -crate::errno::EADDRINUSE,
+        };
+        // Re-acquire the lock briefly to install the listener and the
+        // `is_acceptor` flag. Don't worry about races — if a concurrent
+        // accept4 caller already installed one, ours gets dropped below.
+        let fds = &mut caller.data_mut().fds;
+        if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
+            let mut gs = s.lock();
+            if gs.listener.is_none() {
+                gs.listener = Some(listener);
+                gs.is_acceptor = true;
+                // Re-take out under the same lock so the rest of accept4
+                // sees the listener; concurrent accept4 will get None
+                // and re-bind (rare; we accept the duplicate listener
+                // for P2 simplicity).
+            } else {
+                // Drop our listener; someone else installed one.
+                drop(listener);
+            }
+            gs.listener.take()
+        } else {
+            return -EBADF;
+        }
+    } else {
+        listener_opt
+    };
+    let listener_opt = listener_opt;
 
     let listener = match listener_opt {
         Some(l) => l,
@@ -351,8 +387,9 @@ pub async fn accept4(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     {
         let fds = &mut caller.data_mut().fds;
         if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
-            if s.listener.is_none() {
-                s.listener = Some(listener);
+            let mut gs = s.lock();
+            if gs.listener.is_none() {
+                gs.listener = Some(listener);
             }
             // If a concurrent caller already restored one, drop ours.
         }
@@ -362,7 +399,9 @@ pub async fn accept4(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let mut accepted = SocketInner::from_accepted(stream, kind, sock_nonblock || parent_nonblock);
     // Record the peer address for `getpeername`.
     accepted.peer_addr = Some(peer);
-    let new_fd = caller.data_mut().fds.insert(Resource::Socket(accepted));
+    let new_fd = caller.data_mut().fds.insert(Resource::Socket(std::sync::Arc::new(
+        parking_lot::Mutex::new(accepted),
+    )));
     new_fd as i64
 }
 
@@ -410,7 +449,7 @@ pub async fn connect(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         let fds = &caller.data().fds;
         match fds.get(fd) {
             Ok(Resource::Socket(s)) => {
-                if s.stream.is_some() {
+                if s.lock().stream.is_some() {
                     return -crate::errno::EISCONN;
                 }
             }
@@ -433,7 +472,7 @@ pub async fn connect(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
             // Record the error on the socket for getsockopt(SO_ERROR).
             // P1-6: getsockopt will surface this and clear it.
             if let Ok(Resource::Socket(s)) = caller.data().fds.get(fd) {
-                s.last_error
+                s.lock().last_error
                     .store(errno as i32, std::sync::atomic::Ordering::Relaxed);
             }
             return -errno;
@@ -443,9 +482,10 @@ pub async fn connect(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let fds = &mut caller.data_mut().fds;
     match fds.get_mut(fd) {
         Ok(Resource::Socket(s)) => {
-            s.stream = Some(stream);
+            let mut gs = s.lock();
+            gs.stream = Some(stream);
             // Record peer for getpeername — we know the target.
-            s.peer_addr = Some(target);
+            gs.peer_addr = Some(target);
             0
         }
         Ok(_) => -EBADF,
@@ -486,16 +526,19 @@ pub async fn sendto(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         Err(e) => return e,
     };
 
-    // Pull the stream out so we can `.await` outside the &mut caller borrow.
+    // Pull the stream out under a short-lived lock so we can `.await`
+    // outside the &mut caller borrow. Never hold the Mutex guard
+    // across `.await` (parking_lot::Mutex is sync).
     let mut stream = {
         let fds = &mut caller.data_mut().fds;
         match fds.get_mut(fd) {
             Ok(Resource::Socket(s)) => {
+                let mut gs = s.lock();
                 // P1-6: SHUT_WR was called — writes must fail with EPIPE.
-                if s.shutdown_flags & 0b10 != 0 {
+                if gs.shutdown_flags & 0b10 != 0 {
                     return -crate::errno::EPIPE;
                 }
-                match s.stream.take() {
+                match gs.stream.take() {
                     Some(st) => st,
                     None => return -crate::errno::ENOTCONN,
                 }
@@ -512,8 +555,9 @@ pub async fn sendto(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
             // Put the stream back before returning.
             let fds = &mut caller.data_mut().fds;
             if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
-                if s.stream.is_none() {
-                    s.stream = Some(stream);
+                let mut gs = s.lock();
+                if gs.stream.is_none() {
+                    gs.stream = Some(stream);
                 }
             }
             return -crate::errno::EIO;
@@ -524,8 +568,9 @@ pub async fn sendto(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     {
         let fds = &mut caller.data_mut().fds;
         if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
-            if s.stream.is_none() {
-                s.stream = Some(stream);
+            let mut gs = s.lock();
+            if gs.stream.is_none() {
+                gs.stream = Some(stream);
             }
         }
     }
@@ -578,16 +623,18 @@ pub async fn recvfrom(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         }
     }
 
-    // Pull the stream out so we can `.await` outside the &mut caller borrow.
+    // Pull the stream out under a short-lived lock (P2-B5: never hold
+    // the Mutex guard across `.await`).
     let mut stream = {
         let fds = &mut caller.data_mut().fds;
         match fds.get_mut(fd) {
             Ok(Resource::Socket(s)) => {
+                let mut gs = s.lock();
                 // P1-6: SHUT_RD was called — reads return EOF immediately.
-                if s.shutdown_flags & 0b01 != 0 {
+                if gs.shutdown_flags & 0b01 != 0 {
                     return 0;
                 }
-                match s.stream.take() {
+                match gs.stream.take() {
                     Some(st) => st,
                     None => return -crate::errno::ENOTCONN,
                 }
@@ -605,8 +652,9 @@ pub async fn recvfrom(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         Err(_) => {
             let fds = &mut caller.data_mut().fds;
             if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
-                if s.stream.is_none() {
-                    s.stream = Some(stream);
+                let mut gs = s.lock();
+                if gs.stream.is_none() {
+                    gs.stream = Some(stream);
                 }
             }
             return -crate::errno::EIO;
@@ -617,8 +665,9 @@ pub async fn recvfrom(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     {
         let fds = &mut caller.data_mut().fds;
         if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
-            if s.stream.is_none() {
-                s.stream = Some(stream);
+            let mut gs = s.lock();
+            if gs.stream.is_none() {
+                gs.stream = Some(stream);
             }
         }
     }
@@ -697,10 +746,11 @@ pub async fn setsockopt(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                 // Record the intent on the socket so P1-7's listener
                 // materialization can read it. We don't keep the optval
                 // bytes yet — only which opt was set.
+                let mut gs = s.lock();
                 match (level, optname) {
-                    (SOL_SOCKET, SO_REUSEADDR) => s.so_reuseaddr = true,
-                    (SOL_SOCKET, SO_KEEPALIVE) => s.so_keepalive = true,
-                    (IPPROTO_TCP, TCP_NODELAY) => s.tcp_nodelay = true,
+                    (SOL_SOCKET, SO_REUSEADDR) => gs.so_reuseaddr = true,
+                    (SOL_SOCKET, SO_KEEPALIVE) => gs.so_keepalive = true,
+                    (IPPROTO_TCP, TCP_NODELAY) => gs.tcp_nodelay = true,
                     _ => unreachable!(),
                 }
             }
@@ -774,24 +824,25 @@ pub async fn getsockopt(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
             (SOL_SOCKET, SO_DOMAIN) => 2, // AF_INET
             (SOL_SOCKET, SO_ERROR) => match fds_table.get(fd) {
                 Ok(Resource::Socket(s)) => s
+                    .lock()
                     .last_error
                     .swap(0, std::sync::atomic::Ordering::Relaxed),
                 _ => 0,
             }
             (SOL_SOCKET, SO_ACCEPTCONN) => match fds_table.get(fd) {
-                Ok(Resource::Socket(s)) => s.is_acceptor as i32,
+                Ok(Resource::Socket(s)) => s.lock().is_acceptor as i32,
                 _ => 0,
             },
             (SOL_SOCKET, SO_REUSEADDR) => match fds_table.get(fd) {
-                Ok(Resource::Socket(s)) => s.so_reuseaddr as i32,
+                Ok(Resource::Socket(s)) => s.lock().so_reuseaddr as i32,
                 _ => 0,
             },
             (SOL_SOCKET, SO_KEEPALIVE) => match fds_table.get(fd) {
-                Ok(Resource::Socket(s)) => s.so_keepalive as i32,
+                Ok(Resource::Socket(s)) => s.lock().so_keepalive as i32,
                 _ => 0,
             },
             (IPPROTO_TCP, TCP_NODELAY) => match fds_table.get(fd) {
-                Ok(Resource::Socket(s)) => s.tcp_nodelay as i32,
+                Ok(Resource::Socket(s)) => s.lock().tcp_nodelay as i32,
                 _ => 0,
             },
             _ => 0,
@@ -846,27 +897,30 @@ pub async fn getsockname(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let local_addr: std::net::SocketAddr = {
         let fds = &caller.data().fds;
         match fds.get(fd) {
-            Ok(Resource::Socket(s)) => match &s.bound {
-                Some(crate::fd::SockAddr::V4 { port, addr }) => {
-                    std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
-                        std::net::Ipv4Addr::from(*addr),
-                        *port,
-                    ))
+            Ok(Resource::Socket(s)) => {
+                let gs = s.lock();
+                match &gs.bound {
+                    Some(crate::fd::SockAddr::V4 { port, addr }) => {
+                        std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                            std::net::Ipv4Addr::from(*addr),
+                            *port,
+                        ))
+                    }
+                    Some(crate::fd::SockAddr::V6 { .. }) => {
+                        // IPv6 support is P2; report EINVAL for now.
+                        return -EINVAL;
+                    }
+                    None => match &gs.peer_addr {
+                        // No bind yet — fall back to the peer's family so
+                        // getpeername callers can still read the response.
+                        Some(p) => *p,
+                        None => std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                            std::net::Ipv4Addr::new(0, 0, 0, 0),
+                            0,
+                        )),
+                    },
                 }
-                Some(crate::fd::SockAddr::V6 { .. }) => {
-                    // IPv6 support is P2; report EINVAL for now.
-                    return -EINVAL;
-                }
-                None => match &s.peer_addr {
-                    // No bind yet — fall back to the peer's family so
-                    // getpeername callers can still read the response.
-                    Some(p) => *p,
-                    None => std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
-                        std::net::Ipv4Addr::new(0, 0, 0, 0),
-                        0,
-                    )),
-                },
-            },
+            }
             Ok(_) => return -EBADF,
             Err(e) => return e,
         }
@@ -923,7 +977,7 @@ pub async fn getpeername(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let peer: std::net::SocketAddr = {
         let fds = &caller.data().fds;
         match fds.get(fd) {
-            Ok(Resource::Socket(s)) => match s.peer_addr {
+            Ok(Resource::Socket(s)) => match s.lock().peer_addr {
                 Some(p) => p,
                 None => return -crate::errno::ENOTCONN,
             },
@@ -980,30 +1034,31 @@ pub async fn shutdown(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         _ => return -EINVAL,
     };
 
-    let fds = &mut caller.data_mut().fds;
-    match fds.get_mut(fd) {
-        Ok(Resource::Socket(s)) => {
-            s.shutdown_flags |= mask;
-            // For an accepted/connected stream with SHUT_WR, call
-            // AsyncWriteExt::shutdown on the underlying TcpStream so the
-            // peer sees EOF. We take the stream out to call .await on it
-            // (the borrow checker doesn't let us hold `&mut s` while
-            // mutably borrowing the inner stream), then put it back.
-            if (mask & 0b10) != 0 {
-                let taken = s.stream.take();
-                if let Some(mut stream) = taken {
-                    use tokio::io::AsyncWriteExt;
-                    let _ = stream.shutdown().await;
-                    // Don't restore — SHUT_WR makes future writes return
-                    // EPIPE; the stream is now half-closed.
-                    // Dropping `stream` here closes the write half.
+    // Take the stream out under a short-lived lock so we can `.await`
+    // outside any Mutex guard (P2-B5: never hold across `.await`).
+    let taken: Option<tokio::net::TcpStream> = {
+        let fds = &mut caller.data_mut().fds;
+        match fds.get_mut(fd) {
+            Ok(Resource::Socket(s)) => {
+                let mut gs = s.lock();
+                gs.shutdown_flags |= mask;
+                if (mask & 0b10) != 0 {
+                    gs.stream.take()
+                } else {
+                    None
                 }
             }
-            0
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
         }
-        Ok(_) => -EBADF,
-        Err(e) => e,
+    };
+    if let Some(mut stream) = taken {
+        use tokio::io::AsyncWriteExt;
+        let _ = stream.shutdown().await;
+        // Don't restore — SHUT_WR makes future writes return EPIPE;
+        // the stream is now half-closed. Dropping closes the write half.
     }
+    0
 }
 
 /// `listen(sockfd, backlog)` — mark the socket passive.
@@ -1025,10 +1080,11 @@ pub async fn listen(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let fds = &mut caller.data_mut().fds;
     match fds.get_mut(fd) {
         Ok(Resource::Socket(s)) => {
-            if s.bound.is_none() {
+            let mut gs = s.lock();
+            if gs.bound.is_none() {
                 return -(crate::errno::EDESTADDRREQ);
             }
-            s.listen_backlog = Some(backlog as i32);
+            gs.listen_backlog = Some(backlog as i32);
             0
         }
         Ok(_) => -EBADF,
@@ -1050,10 +1106,11 @@ mod p1_2_tests {
         // socket that was never bound.
         let ret = match fds.get_mut(fd).unwrap() {
             Resource::Socket(s) => {
-                if s.bound.is_none() {
+                let mut gs = s.lock();
+                if gs.bound.is_none() {
                     -crate::errno::EDESTADDRREQ
                 } else {
-                    s.listen_backlog = Some(5);
+                    gs.listen_backlog = Some(5);
                     0
                 }
             }
@@ -1068,21 +1125,22 @@ mod p1_2_tests {
         let fd = socket_for_test(&mut fds, AF_INET, SOCK_STREAM).unwrap();
         match fds.get_mut(fd).unwrap() {
             Resource::Socket(s) => {
-                s.bound = Some(SockAddr::V4 { port: 8080, addr: [127, 0, 0, 1] });
+                s.lock().bound = Some(SockAddr::V4 { port: 8080, addr: [127, 0, 0, 1] });
             }
             _ => unreachable!(),
         }
         // Re-borrow immutably to read back.
         match fds.get(fd).unwrap() {
             Resource::Socket(s) => {
-                match &s.bound {
+                let gs = s.lock();
+                match &gs.bound {
                     Some(SockAddr::V4 { port, addr }) => {
                         assert_eq!(*port, 8080);
                         assert_eq!(*addr, [127, 0, 0, 1]);
                     }
                     other => panic!("expected V4 bound, got {other:?}"),
                 }
-                assert!(!s.is_listening(), "not listening yet");
+                assert!(!gs.is_listening(), "not listening yet");
             }
             _ => unreachable!(),
         }
@@ -1094,11 +1152,12 @@ mod p1_2_tests {
         let fd = socket_for_test(&mut fds, AF_INET, SOCK_STREAM).unwrap();
         match fds.get_mut(fd).unwrap() {
             Resource::Socket(s) => {
-                assert!(!s.is_listening());
-                s.bound = Some(SockAddr::V4 { port: 0, addr: [0, 0, 0, 0] });
-                assert!(!s.is_listening(), "bind alone is not listening");
-                s.listen_backlog = Some(128);
-                assert!(s.is_listening(), "bind + listen -> listening");
+                let mut gs = s.lock();
+                assert!(!gs.is_listening());
+                gs.bound = Some(SockAddr::V4 { port: 0, addr: [0, 0, 0, 0] });
+                assert!(!gs.is_listening(), "bind alone is not listening");
+                gs.listen_backlog = Some(128);
+                assert!(gs.is_listening(), "bind + listen -> listening");
             }
             _ => unreachable!(),
         }

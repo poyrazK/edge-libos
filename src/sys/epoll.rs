@@ -115,10 +115,14 @@ pub async fn epoll_ctl(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     };
 
     // Phase 1b: pull the actual wake primitives from the target fd type.
+    // P2-B5: lock briefly to read the Arc<Notify> handles out.
     let (wake_read, wake_write) = {
         let fds = &caller.data().fds;
         match fds.get(fd) {
-            Ok(Resource::Socket(s)) => (s.notify_read.clone(), s.notify_write.clone()),
+            Ok(Resource::Socket(s)) => {
+                let gs = s.lock();
+                (gs.notify_read.clone(), gs.notify_write.clone())
+            }
             _ => {
                 let placeholder = Arc::new(tokio::sync::Notify::new());
                 (placeholder.clone(), placeholder)
@@ -389,8 +393,10 @@ fn compute_revents(fds: &crate::fd::FdTable, fd: u32, requested: u32) -> u32 {
     let mut r: u32 = 0;
     match res {
         Resource::Socket(s) => {
-            let has_stream = s.stream.is_some();
-            let is_listener = s.is_listening();
+            let gs = s.lock();
+            let has_stream = gs.stream.is_some();
+            let is_listener = gs.is_listening();
+            drop(gs);
             if (requested & EPOLLIN) != 0 {
                 if has_stream {
                     // Connected stream → readable. EPOLLIN fires.

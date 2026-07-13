@@ -473,7 +473,9 @@ pub async fn read(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
             Resource::File(fp) => {
                 // Read up to `len` bytes via std::io::Read at fp.pos.
                 // Seek first so position is correct.
-                let _ = fp.inner.seek(SeekFrom::Start(fp.pos));
+                let mut fp = fp.lock();
+                let pos = fp.pos;
+                let _ = fp.inner.seek(SeekFrom::Start(pos));
                 let mut got = Vec::with_capacity(len);
                 let mut chunk = [0u8; 4096];
                 loop {
@@ -568,13 +570,16 @@ pub async fn write(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                 }
                 bytes.len()
             }
-            Resource::File(fp) => match fp.inner.write(&bytes) {
-                Ok(n) => {
-                    fp.pos += n as u64;
-                    n
+            Resource::File(fp) => {
+                let mut fp = fp.lock();
+                match fp.inner.write(&bytes) {
+                    Ok(n) => {
+                        fp.pos += n as u64;
+                        n
+                    }
+                    Err(_) => return -crate::errno::EIO,
                 }
-                Err(_) => return -crate::errno::EIO,
-            },
+            }
             Resource::EventFd(e) => {
                 // P2-B1: add u64 at buf to the counter.
                 if let Err(e) = eventfd::require_u64_buf(a[2]) {
@@ -623,7 +628,9 @@ pub async fn openat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let is_dir = std::fs::metadata(&abs).map(|m| m.is_dir()).unwrap_or(false);
     let mut fp = FilePos::with_path(file, abs);
     fp.is_dir = is_dir;
-    let fd = caller.data_mut().fds.insert(Resource::File(fp));
+    let fd = caller.data_mut()
+        .fds
+        .insert(Resource::File(std::sync::Arc::new(parking_lot::Mutex::new(fp))));
     fd as i64
 }
 
@@ -656,6 +663,7 @@ pub async fn lseek(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     };
     match res {
         Resource::File(fp) => {
+            let mut fp = fp.lock();
             if fp.is_dir {
                 // P2-B2: dir stream. Only SEEK_SET(0) (rewind) is honored;
                 // other whence values return -ESPIPE per Linux semantics.
@@ -700,7 +708,7 @@ pub async fn fstat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let stat: Stat = {
         let fds = &caller.data().fds;
         match fds.get(fd) {
-            Ok(Resource::File(fp)) => match fp.inner.metadata() {
+            Ok(Resource::File(fp)) => match fp.lock().inner.metadata() {
                 Ok(meta) => Stat::from_metadata(&meta),
                 Err(_) => synth_char(),
             },
@@ -792,7 +800,7 @@ pub async fn statx(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
             Err(_) => return -EBADF,
         };
         match caller.data().fds.get(fd) {
-            Ok(Resource::File(fp)) => match fp.inner.metadata() {
+            Ok(Resource::File(fp)) => match fp.lock().inner.metadata() {
                 Ok(meta) => crate::vfs::Stat::from_metadata(&meta),
                 Err(_) => return -EACCES,
             },
@@ -862,7 +870,7 @@ pub async fn getdents64(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let is_dir_fd: bool = {
         let fds = &caller.data().fds;
         match fds.get(fd) {
-            Ok(Resource::File(fp)) => fp.is_dir,
+            Ok(Resource::File(fp)) => fp.lock().is_dir,
             Ok(_) => return -crate::errno::ENOTDIR,
             Err(e) => return e,
         }
@@ -876,7 +884,7 @@ pub async fn getdents64(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let path: PathBuf = {
         let fds = &caller.data().fds;
         match fds.get(fd) {
-            Ok(Resource::File(fp)) => match fp.path.clone() {
+            Ok(Resource::File(fp)) => match fp.lock().path.clone() {
                 Some(p) => p,
                 None => return -EBADF,
             },
@@ -895,7 +903,7 @@ pub async fn getdents64(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let needs_fill = {
         let fds = &caller.data().fds;
         match fds.get(fd) {
-            Ok(Resource::File(fp)) => fp.dir_cache.is_none(),
+            Ok(Resource::File(fp)) => fp.lock().dir_cache.is_none(),
             _ => false,
         }
     };
@@ -906,17 +914,17 @@ pub async fn getdents64(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         };
         let fds = &mut caller.data_mut().fds;
         if let Ok(Resource::File(fp)) = fds.get_mut(fd) {
-            fp.dir_cache = Some(cached);
+            fp.lock().dir_cache = Some(cached);
         }
     }
 
     // Slice the cached dirent64 buffer at fp.pos.
     let (slice, new_pos): (Vec<u8>, u64) = {
         let fds = &mut caller.data_mut().fds;
-        let fp = match fds.get_mut(fd) {
+        let mut fp = match fds.get_mut(fd) {
             Ok(Resource::File(fp)) => fp,
             _ => return -crate::errno::EBADF,
-        };
+        }.lock();
         let cache = fp.dir_cache.as_ref().expect("dir_cache just populated");
         let start = fp.pos as usize;
         if start >= cache.len() {
@@ -1171,7 +1179,7 @@ pub async fn fcntl(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                 }
                 Ok(Resource::File(_)) => O_RDWR as i64,
                 Ok(Resource::Socket(s)) => {
-                    let nb = s.nonblock.load(std::sync::atomic::Ordering::Relaxed);
+                    let nb = s.lock().nonblock.load(std::sync::atomic::Ordering::Relaxed);
                     let mut fl = O_RDWR;
                     if nb {
                         fl |= O_NONBLOCK;
@@ -1196,7 +1204,7 @@ pub async fn fcntl(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                     w.nonblock.store(want_nonblock, std::sync::atomic::Ordering::Relaxed);
                 }
                 Ok(Resource::Socket(s)) => {
-                    s.nonblock.store(want_nonblock, std::sync::atomic::Ordering::Relaxed);
+                    s.lock().nonblock.store(want_nonblock, std::sync::atomic::Ordering::Relaxed);
                 }
                 Ok(Resource::File(_)) => {
                     // Real files have no nonblock semantics on the host
@@ -1210,19 +1218,20 @@ pub async fn fcntl(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
             }
             0
         }
-        F_GETFD => 0,
+        F_GETFD => caller.data().fds.get_cloexec(fd) as i64,
         F_SETFD => {
-            let _ = arg;
+            let on = (arg as i32) & 1 != 0;
+            caller.data_mut().fds.set_cloexec(fd, on);
             0
         }
         F_DUPFD | F_DUPFD_CLOEXEC => {
+            let want_cloexec = cmd == F_DUPFD_CLOEXEC;
+            let min_fd = arg as u32;
             let cloned = {
                 let fds = &caller.data().fds;
                 match fds.get(fd) {
-                    Ok(Resource::File(fp)) => match fp.try_clone() {
-                        Ok(c) => Resource::File(c),
-                        Err(_) => return -EBADF,
-                    },
+                    // P2-B5: share state via Arc::clone (infallible).
+                    Ok(Resource::File(fp)) => Resource::File(std::sync::Arc::clone(fp)),
                     Ok(Resource::Stdin(r)) => Resource::Stdin(crate::fd::PipeRead {
                         buf: r.buf.clone(),
                         closed: r.closed.clone(),
@@ -1253,19 +1262,21 @@ pub async fn fcntl(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                         nonblock: w.nonblock.clone(),
                         notify: w.notify.clone(),
                     }),
-                    // P1-1: socket fds are not yet duplicable; P1-7's epoll
-                    // layer is the right place to model shared fds. For now
-                    // dup on a socket returns -EBADF (matches Linux: dup on
-                    // a socket without SO_ACCEPTCONN semantics is a no-op).
-                    Ok(Resource::Socket(_)) => return -EBADF,
-                    // P1-7: epoll and eventfd are not dup-able. Linux
+                    // P2-B5: dup-able via Arc<Mutex<SocketInner>> (commit 7).
+                    // `Arc::clone` is infallible; both fds share the same
+                    // underlying SocketInner — offset, bound, listener,
+                    // stream, peer_addr, shutdown_flags, is_acceptor.
+                    Ok(Resource::Socket(s)) => Resource::Socket(std::sync::Arc::clone(s)),
+                    // P2-B5: epoll/eventfd still not dup-able. (Linux
                     // allows `dup(epfd)` historically but it's effectively
-                    // a no-op; for P1 we just reject.
+                    // a no-op; we reject to keep semantics simple.)
                     Ok(Resource::Epoll(_)) | Ok(Resource::EventFd(_)) => return -EBADF,
                     Err(e) => return e,
                 }
             };
-            caller.data_mut().fds.insert(cloned) as i64
+            let new_fd = caller.data_mut().fds.insert_at_least(min_fd, cloned);
+            caller.data_mut().fds.set_cloexec(new_fd, want_cloexec);
+            new_fd as i64
         }
         _ => -EINVAL,
     }

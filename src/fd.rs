@@ -287,6 +287,13 @@ pub struct EventFdInner {
 }
 
 /// A `Resource` is what's behind a fd. Variants fill in as syscalls land.
+///
+/// P2-B5: `File` and `Socket` are wrapped in `Arc<Mutex<...>>` so dup'd
+/// fds share an open-file description. `Stdin`/`Stdout`/`Stderr`/
+/// `PipeRead`/`PipeWrite` were already sharing inner state via per-field
+/// `Arc<Mutex<VecDeque<u8>>>` etc. (see `make_pipe()` above); only the
+/// outer enum variant needs no change for those. `Epoll` and `EventFd`
+/// continue to reject `dup()` with -EBADF.
 pub enum Resource {
     /// stdin — typically a `PipeRead` preloaded by the driver.
     Stdin(PipeRead),
@@ -294,17 +301,19 @@ pub enum Resource {
     Stdout(PipeWrite),
     /// stderr — typically a `PipeWrite` preloaded by the driver.
     Stderr(PipeWrite),
-    /// Opened file (Step 14).
-    File(crate::sys::file::FilePos),
+    /// Opened file (Step 14). P2-B5: shared via `Arc<Mutex<>>` so dup'd
+    /// fds share the open-file description (offset, path, dir cache).
+    File(SharedFilePos),
     /// Read end of a `pipe2` (Step 15).
     #[allow(dead_code)]
     PipeRead(PipeRead),
     /// Write end of a `pipe2` (Step 15).
     #[allow(dead_code)]
     PipeWrite(PipeWrite),
-    /// Socket fd created by `socket(2)` (P1-1).
+    /// Socket fd created by `socket(2)` (P1-1). P2-B5: shared via
+    /// `Arc<Mutex<>>` so `dup()`-style fds share `bound`/`listener`/etc.
     #[allow(dead_code)]
-    Socket(SocketInner),
+    Socket(SharedSocket),
     /// Epoll instance created by `epoll_create1(2)` (P1-7).
     #[allow(dead_code)]
     Epoll(EpollInner),
@@ -313,9 +322,17 @@ pub enum Resource {
     EventFd(EventFdInner),
 }
 
+/// P2-B5: shared-state wrappers for dup-able resource variants. Both
+/// use `parking_lot::Mutex` (sync; **never hold across `.await`**).
+pub type SharedFilePos = std::sync::Arc<parking_lot::Mutex<crate::sys::file::FilePos>>;
+pub type SharedSocket = std::sync::Arc<parking_lot::Mutex<SocketInner>>;
+
 pub struct FdTable {
     table: HashMap<u32, Resource>,
     next_fd: u32,
+    /// P2-B5: set of fds whose FD_CLOEXEC bit is set. `F_DUPFD_CLOEXEC`,
+    /// `dup3` with `O_CLOEXEC`, and `F_SETFD(1)` insert; `close()` removes.
+    cloexec: std::collections::HashSet<u32>,
 }
 
 impl FdTable {
@@ -324,6 +341,7 @@ impl FdTable {
         Self {
             table: HashMap::new(),
             next_fd: 3,
+            cloexec: std::collections::HashSet::new(),
         }
     }
 
@@ -345,6 +363,7 @@ impl FdTable {
         Self {
             table,
             next_fd: 3,
+            cloexec: std::collections::HashSet::new(),
         }
     }
 
@@ -354,6 +373,48 @@ impl FdTable {
         self.next_fd += 1;
         self.table.insert(fd, r);
         fd
+    }
+
+    /// P2-B5: insert at a specific fd. Returns `Err(-EBADF)` if the
+    /// fd is already bound. Caller is responsible for pre-closing.
+    pub fn insert_at(&mut self, fd: u32, r: Resource) -> Result<u32, i64> {
+        if self.table.contains_key(&fd) {
+            return Err(-(crate::errno::EBADF));
+        }
+        if fd >= self.next_fd {
+            self.next_fd = fd + 1;
+        }
+        self.table.insert(fd, r);
+        Ok(fd)
+    }
+
+    /// P2-B5: insert at the lowest free fd ≥ `min`. Bumps `next_fd` if
+    /// the chosen fd exceeds it. Used by `fcntl(F_DUPFD, min_fd)` so
+    /// the returned fd honors the minimum-fd argument.
+    pub fn insert_at_least(&mut self, min: u32, r: Resource) -> u32 {
+        let mut fd = min.max(self.next_fd);
+        while self.table.contains_key(&fd) {
+            fd = fd.saturating_add(1);
+        }
+        if fd >= self.next_fd {
+            self.next_fd = fd + 1;
+        }
+        self.table.insert(fd, r);
+        fd
+    }
+
+    /// P2-B5: set the FD_CLOEXEC bit for `fd`.
+    pub fn set_cloexec(&mut self, fd: u32, on: bool) {
+        if on {
+            self.cloexec.insert(fd);
+        } else {
+            self.cloexec.remove(&fd);
+        }
+    }
+
+    /// P2-B5: returns true if `fd`'s FD_CLOEXEC bit is set.
+    pub fn get_cloexec(&self, fd: u32) -> bool {
+        self.cloexec.contains(&fd)
     }
 
     /// Borrow the resource behind `fd`. Returns `Err(-EBADF)` for unknown.
@@ -366,9 +427,11 @@ impl FdTable {
         self.table.get_mut(&fd).ok_or(-(crate::errno::EBADF))
     }
 
-    /// Close `fd`, returning `Err(-EBADF)` if it doesn't exist.
+    /// Close `fd`, returning `Err(-EBADF)` if it doesn't exist. P2-B5:
+    /// also removes the fd from `cloexec` so the set stays consistent.
     pub fn close(&mut self, fd: u32) -> Result<(), i64> {
         if self.table.remove(&fd).is_some() {
+            self.cloexec.remove(&fd);
             Ok(())
         } else {
             Err(-(crate::errno::EBADF))

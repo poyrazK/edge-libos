@@ -369,9 +369,10 @@ fn bind_listen_loopback_succeeds() -> Result<()> {
         // Verify the kernel state was actually updated.
         match store.data().fds.get(fd as u32) {
             Ok(Resource::Socket(s)) => {
-                assert!(s.bound.is_some(), "bind should have recorded the address");
-                assert_eq!(s.listen_backlog, Some(5), "listen should have recorded the backlog");
-                assert!(s.is_listening(), "bind+listen -> is_listening");
+                let gs = s.lock();
+                assert!(gs.bound.is_some(), "bind should have recorded the address");
+                assert_eq!(gs.listen_backlog, Some(5), "listen should have recorded the backlog");
+                assert!(gs.is_listening(), "bind+listen -> is_listening");
             }
             Err(e) => panic!("fd {fd} was missing after bind+listen: {e}"),
             Ok(other) => panic!("fd {fd} was not a Socket resource: found {} variant",
@@ -666,7 +667,7 @@ fn accept4_after_host_connect_returns_valid_fd() -> Result<()> {
                 let _ = connect_task.await;
                 match store.data().fds.get(new_fd as u32) {
                     Ok(Resource::Socket(s)) => {
-                        assert!(s.stream.is_some(),
+                        assert!(s.lock().stream.is_some(),
                             "accepted fd must have stream=Some");
                     }
                     Ok(_) => panic!("fd {new_fd} was not a Socket resource"),
