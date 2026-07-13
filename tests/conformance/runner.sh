@@ -16,7 +16,7 @@
 # Usage:
 #   bash tests/conformance/runner.sh
 
-set -o pipefail
+set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 ZIG=${ZIG:-zig}

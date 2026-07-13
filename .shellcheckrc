@@ -1,0 +1,19 @@
+# .shellcheckrc — repo-wide shellcheck configuration.
+#
+# Loaded automatically by shellcheck when invoked from the repo root.
+# https://github.com/koalaman/shellcheck/blob/master/shellcheckrc
+#
+# Rationale per directive:
+#
+#   SC2317 — "Command appears to be unreachable". preflight.sh and
+#            scripts/reproduce_dod.sh use `set -uo pipefail` WITHOUT `-e`
+#            deliberately so each step's exit is captured by run_step()
+#            / `if ... ; then ... else ...`. shellcheck can't see this
+#            and flags every "unreachable" error branch.
+#
+#   SC2154 — "var is referenced but not assigned". preflight.sh and
+#            scripts/reproduce_dod.sh read ${SKIP_*_SETUP} / ${SKIP_BUILD}
+#            etc. which are environment-variable inputs (defaulted to "0"
+#            further down). shellcheck can't trace env-var assignment.
+
+disable=SC2317,SC2154
