@@ -39,6 +39,8 @@ pub struct Kernel {
     /// Set by exit() / exit_group() syscalls. The host driver inspects this
     /// after each call returns and surfaces the code in its own exit code.
     pub exit_code: Option<i32>,
+    /// P2-C2: prctl(PR_SET_NAME) writes here; PR_GET_NAME reads from here.
+    pub comm: [u8; 16],
 }
 
 impl Kernel {
@@ -91,6 +93,7 @@ impl Kernel {
             signals: SignalState::new(),
             started_at: now,
             exit_code: None,
+            comm: [0; 16],
         }
     }
 

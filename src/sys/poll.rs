@@ -29,6 +29,9 @@ use crate::mem;
 
 // Linux x86-64 syscall NR.
 pub const NR_POLL: u32 = 7;
+// P2-C3 part 1: ppoll, select.
+pub const NR_PPOLL: u32 = 271;
+pub const NR_SELECT: u32 = 23;
 
 // poll(2) event flags (matches <poll.h> on Linux).
 pub const POLLIN: i16 = 0x0001;
@@ -285,6 +288,237 @@ fn ready_socket(
     r
 }
 
+/// `ppoll(fds, nfds, tsp, sigmask, sigsetsize)` — like `poll`, but
+/// `tsp` is a `struct timespec` (16 bytes: i64 sec, i64 nsec) instead of
+/// a millisecond count. `tsp == NULL` waits indefinitely. `sigmask` is
+/// ignored (no signal integration in v1).
+pub async fn ppoll(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let fds_ptr = a[0];
+    let nfds_raw = a[1];
+    let tsp = a[2];
+    let _sigmask = a[3];
+    let _sigsetsize = a[4];
+    let nfds = match usize::try_from(nfds_raw) {
+        Ok(n) if n >= 0 => n,
+        _ => return -EINVAL,
+    };
+    if nfds == 0 {
+        return 0;
+    }
+
+    // Convert tsp → ms. Negative tsp → EINVAL.
+    let timeout_ms: i64 = if tsp == 0 {
+        -1 // wait forever (mirrored in poll's deadline)
+    } else {
+        let bytes = match mem::guest_slice(caller, tsp, 16) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        let sec = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let nsec = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+            return -EINVAL;
+        }
+        let total_ms = (sec as i64).saturating_mul(1000) + (nsec as i64) / 1_000_000;
+        total_ms
+    };
+
+    // Reuse the regular poll handler.
+    poll(caller, [fds_ptr, nfds_raw, timeout_ms, 0, 0, 0]).await
+}
+
+/// `select(nfds, readfds, writefds, exceptfds, timeout)` — translates
+/// the three fd_set bitmasks into a pollfd array, calls `poll`, then
+/// writes the revents back into the bitmasks. `exceptfds` is ignored.
+/// `timeout` is a `struct timeval` (16 bytes: i64 sec, i64 usec);
+/// `timeout == NULL` waits forever; `timeval{0,0}` is non-blocking.
+pub async fn select(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let nfds_raw = a[0];
+    let readfds = a[1];
+    let writefds = a[2];
+    let _exceptfds = a[3];
+    let timeout_ptr = a[4];
+    let nfds = match i32::try_from(nfds_raw) {
+        Ok(n) if n >= 0 => n,
+        _ => return -EINVAL,
+    };
+    if nfds == 0 {
+        return 0;
+    }
+
+    // Build a list of (fd, in_read, in_write) by scanning the two bitmasks
+    // under a single shared borrow. Doing this in one shot (rather than
+    // calling `read_isset` per-fd) avoids interleaving `&mut caller`
+    // borrows with later `guest_slice_mut` calls.
+    let mut fds: Vec<(i32, bool, bool)> = Vec::new();
+    if readfds != 0 || writefds != 0 {
+        let set_bytes_total = (FD_SET_LONGS * 8) as i64;
+        let read_mask = if readfds != 0 {
+            mem::guest_slice(caller, readfds, set_bytes_total).ok()
+        } else {
+            None
+        };
+        let write_mask = if writefds != 0 {
+            mem::guest_slice(caller, writefds, set_bytes_total).ok()
+        } else {
+            None
+        };
+        for fd in 0..nfds {
+            let word = (fd as usize) >> 6;
+            let bit = (fd as usize) & 63;
+            if word >= FD_SET_LONGS {
+                continue;
+            }
+            let in_read = match read_mask {
+                Some(b) => {
+                    let v = u64::from_le_bytes(
+                        b[word * 8..word * 8 + 8].try_into().unwrap(),
+                    );
+                    (v >> bit) & 1 != 0
+                }
+                None => false,
+            };
+            let in_write = match write_mask {
+                Some(b) => {
+                    let v = u64::from_le_bytes(
+                        b[word * 8..word * 8 + 8].try_into().unwrap(),
+                    );
+                    (v >> bit) & 1 != 0
+                }
+                None => false,
+            };
+            if in_read || in_write {
+                fds.push((fd, in_read, in_write));
+            }
+        }
+    }
+    if fds.is_empty() {
+        return 0;
+    }
+
+    // Build the (fd, events) tuples for the pollfd scratch.
+    let poll_entries: Vec<(i32, i16)> = fds
+        .iter()
+        .map(|&(fd, in_r, in_w)| {
+            let mut events: i16 = 0;
+            if in_r {
+                events |= POLLIN;
+            }
+            if in_w {
+                events |= POLLOUT;
+            }
+            (fd, events)
+        })
+        .collect();
+
+    // Write the pollfd array to a temp region in guest memory.
+    // Use the marker region (offset 4096 + small) for simplicity.
+    let tmp_base: i64 = 8192;
+    let total_bytes = (poll_entries.len() * POLLFD_SIZE) as i64;
+    {
+        let bytes = match mem::guest_slice_mut(caller, tmp_base, total_bytes) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        for (i, (fd, ev)) in poll_entries.iter().enumerate() {
+            let off = i * POLLFD_SIZE;
+            bytes[off..off + 4].copy_from_slice(&fd.to_le_bytes());
+            bytes[off + 4..off + 6].copy_from_slice(&ev.to_le_bytes());
+            bytes[off + 6..off + 8].copy_from_slice(&0_i16.to_le_bytes());
+        }
+    }
+
+    let timeout_ms: i64 = if timeout_ptr == 0 {
+        -1
+    } else {
+        let t = match mem::guest_slice(caller, timeout_ptr, 16) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        let sec = i64::from_le_bytes(t[0..8].try_into().unwrap());
+        let usec = i64::from_le_bytes(t[8..16].try_into().unwrap());
+        if sec < 0 || usec < 0 {
+            return -EINVAL;
+        }
+        sec * 1000 + usec / 1000
+    };
+
+    let r = poll(
+        caller,
+        [tmp_base, poll_entries.len() as i64, timeout_ms, 0, 0, 0],
+    )
+    .await;
+
+    // Read back revents and set the appropriate bitmasks. Snapshot the
+    // revents into a local Vec first (shared borrow), then release the
+    // borrow before clearing/writing the guest bitmasks under mutable
+    // borrows.
+    if r >= 0 {
+        let revents_list: Vec<(i32, i16, i16)> = {
+            let bytes = match mem::guest_slice(caller, tmp_base, total_bytes) {
+                Ok(b) => b,
+                Err(e) => return e,
+            };
+            poll_entries
+                .iter()
+                .enumerate()
+                .map(|(i, (fd, ev))| {
+                    let off = i * POLLFD_SIZE;
+                    let revents =
+                        i16::from_le_bytes(bytes[off + 6..off + 8].try_into().unwrap());
+                    (*fd, *ev, revents)
+                })
+                .collect()
+        };
+        // Zero both bitmasks first; we'll re-set bits for fds with revents.
+        if readfds != 0 {
+            clear_fd_set(caller, readfds, nfds);
+        }
+        if writefds != 0 {
+            clear_fd_set(caller, writefds, nfds);
+        }
+        for (fd, ev, revents) in revents_list {
+            if revents == 0 {
+                continue;
+            }
+            if (revents & POLLIN) != 0 && (ev & POLLIN) != 0 && readfds != 0 {
+                set_fd_bit(caller, readfds, fd);
+            }
+            if (revents & POLLOUT) != 0 && (ev & POLLOUT) != 0 && writefds != 0 {
+                set_fd_bit(caller, writefds, fd);
+            }
+        }
+    }
+
+    r
+}
+
+/// FD_SETSIZE on wasm32-musl is 1024 by default; the bitmask is
+/// `nfds_bits` (16 bytes = 128 bits) u64 words. For our purposes the
+/// kernel only cares about bits < nfds.
+const FD_SET_LONGS: usize = 16; // 1024 / 64
+
+fn set_fd_bit(caller: &mut Caller<'_, Kernel>, set: i64, fd: i32) {
+    let word = (fd as usize) >> 6;
+    let bit = (fd as usize) & 63;
+    if word >= FD_SET_LONGS {
+        return;
+    }
+    if let Ok(bytes) = mem::guest_slice_mut(caller, set + (word * 8) as i64, 8) {
+        let mut v = u64::from_le_bytes(bytes.try_into().unwrap());
+        v |= 1u64 << bit;
+        bytes.copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+fn clear_fd_set(caller: &mut Caller<'_, Kernel>, set: i64, _nfds: i32) {
+    if let Ok(bytes) = mem::guest_slice_mut(caller, set, (FD_SET_LONGS * 8) as i64) {
+        for b in bytes.iter_mut() {
+            *b = 0;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +581,24 @@ mod tests {
         assert_eq!(POLLFD_SIZE, 8);
         // Sanity: i32 + 2*i16 == 8.
         assert_eq!(std::mem::size_of::<i32>() + 2 * std::mem::size_of::<i16>(), 8);
+    }
+
+    // P2-C3 part 1: NR / FD_SET constants.
+
+    #[test]
+    fn ppoll_nr_is_linux_271() {
+        assert_eq!(NR_PPOLL, 271);
+    }
+
+    #[test]
+    fn select_nr_is_linux_23() {
+        assert_eq!(NR_SELECT, 23);
+    }
+
+    #[test]
+    fn fd_set_longs_matches_fd_setsize() {
+        // 1024 bits / 64 bits-per-long = 16 longs.
+        assert_eq!(FD_SET_LONGS, 16);
+        assert_eq!(FD_SET_LONGS * 8, 128); // 128 bytes per fd_set
     }
 }

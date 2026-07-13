@@ -13,6 +13,20 @@ use crate::mem;
 pub const NR_RT_SIGACTION: u32 = 13;
 pub const NR_RT_SIGPROCMASK: u32 = 14;
 
+// P2-C2: sigaltstack, rt_sigreturn.
+pub const NR_SIGALTSTACK: u32 = 131;
+pub const NR_RT_SIGRETURN: u32 = 15;
+
+// sigaltstack(2) flags (linux/signal.h).
+pub const SS_ONSTACK: i32 = 1;
+pub const SS_DISABLE: i32 = 2;
+
+// `struct sigaltstack` on wasm32-musl: ss_sp(8) + ss_flags(4) + pad(4) + ss_size(8) = 24
+pub const SIGALTSTACK_SIZE: i64 = 24;
+const SS_SP_OFF: usize = 0;
+const SS_FLAGS_OFF: usize = 8;
+const SS_SIZE_OFF: usize = 16;
+
 /// `rt_sigaction`'s `how` argument values.
 const SIG_BLOCK: i64 = 0;
 const SIG_UNBLOCK: i64 = 1;
@@ -41,6 +55,9 @@ const SIG_RESTORER_REAL_OFF: usize = 24;
 pub struct SignalState {
     pub actions: HashMap<i32, SigAction>,
     pub mask: u64,
+    /// P2-C2: alternate signal stack (sigaltstack). Stored as the raw
+    /// bytes the guest wrote via sigaltstack(ss, old_ss).
+    pub alt_stack: Option<Vec<u8>>,
 }
 
 impl SignalState {
@@ -173,6 +190,65 @@ pub fn rt_sigprocmask(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     0
 }
 
+/// `sigaltstack(ss, old_ss)` — read/write the alternate signal stack
+/// record. We don't actually deliver signals in v1, but the syscall must
+/// succeed so musl's startup doesn't fall over. Layout: ss_sp(8),
+/// ss_flags(4)+pad(4), ss_size(8) = 24 bytes on wasm32-musl.
+pub fn sigaltstack(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let ss = a[0];
+    let old_ss = a[1];
+
+    // Snapshot current alt_stack before any mutable borrow.
+    let prev = caller.data().signals.alt_stack.clone();
+
+    if old_ss != 0 {
+        let bytes = match mem::guest_slice_mut(caller, old_ss, SIGALTSTACK_SIZE) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        if let Some(prev_bytes) = prev.as_ref() {
+            // Copy the raw 24-byte record.
+            for (i, &c) in prev_bytes.iter().enumerate() {
+                if i < SIGALTSTACK_SIZE as usize {
+                    bytes[i] = c;
+                }
+            }
+        } else {
+            // SS_DISABLE: clear the record.
+            for i in 0..SIGALTSTACK_SIZE as usize {
+                bytes[i] = 0;
+            }
+        }
+    }
+
+    if ss != 0 {
+        let bytes = match mem::guest_slice(caller, ss, SIGALTSTACK_SIZE) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        // Honor SS_DISABLE explicitly: clear alt_stack.
+        let flags = i32::from_le_bytes(
+            bytes[SS_FLAGS_OFF..SS_FLAGS_OFF + 4].try_into().unwrap(),
+        );
+        if flags & SS_DISABLE != 0 {
+            caller.data_mut().signals.alt_stack = None;
+        } else {
+            let mut record = vec![0u8; SIGALTSTACK_SIZE as usize];
+            record.copy_from_slice(bytes);
+            caller.data_mut().signals.alt_stack = Some(record);
+        }
+    }
+
+    0
+}
+
+/// `rt_sigreturn()` — return from a signal handler. We don't actually
+/// deliver signals in v1, so this is a no-op success. Returning 0 keeps
+/// musl's libc startup happy when probing the syscall surface.
+pub fn rt_sigreturn() -> i64 {
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,10 +257,17 @@ mod tests {
     fn nr_constants_match_linux_x86_64() {
         assert_eq!(NR_RT_SIGACTION, 13);
         assert_eq!(NR_RT_SIGPROCMASK, 14);
+        assert_eq!(NR_SIGALTSTACK, 131);
+        assert_eq!(NR_RT_SIGRETURN, 15);
     }
 
     #[test]
     fn sigaction_layout_fits_in_32_bytes() {
         assert_eq!(SIGACTION_SIZE, 32);
+    }
+
+    #[test]
+    fn sigaltstack_layout_fits_in_24_bytes() {
+        assert_eq!(SIGALTSTACK_SIZE, 24);
     }
 }

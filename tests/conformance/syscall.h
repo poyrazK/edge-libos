@@ -93,6 +93,113 @@ int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
 #define NR_EPOLL_WAIT 232
 #define NR_EVENTFD2 290
 
+// P2-C1 part 1: mkdir / mkdirat / rmdir / unlink / unlinkat.
+#define NR_MKDIR 83
+#define NR_RMDIR 84
+#define NR_UNLINK 87
+#define NR_MKDIRAT 258
+#define NR_UNLINKAT 263
+
+// P2-C1 part 2: rename / renameat / renameat2 / truncate / ftruncate.
+#define NR_RENAME 82
+#define NR_RENAMEAT 264
+#define NR_RENAMEAT2 316
+#define NR_TRUNCATE 76
+#define NR_FTRUNCATE 77
+
+// P2-C1 part 3: readlink / symlink / link / utimensat / chmod / faccessat /
+// chdir / chroot (+at variants).
+#define NR_READLINK 89
+#define NR_READLINKAT 267
+#define NR_SYMLINK 88
+#define NR_SYMLINKAT 266
+#define NR_LINK 86
+#define NR_LINKAT 265
+#define NR_UTIMENSAT 280
+#define NR_CHMOD 90
+#define NR_FCHMOD 91
+#define NR_FCHMODAT 268
+#define NR_FACCESSAT 269
+#define NR_FACCESSAT2 439
+#define NR_CHDIR 80
+#define NR_CHROOT 161
+
+// faccessat mode bits (linux/fcntl.h).
+#define F_OK 0
+#define R_OK 4
+#define W_OK 2
+#define X_OK 1
+
+// P2-C2: identity / process / signal / time / memory / ioctl.
+#define NR_GETPPID 110
+#define NR_UNAME 63
+#define NR_PRLIMIT64 302
+#define NR_GETRLIMIT 97
+#define NR_SETSID 112
+#define NR_GETSID 124
+#define NR_GETGROUPS 115
+#define NR_SCHED_YIELD 24
+#define NR_SCHED_GETAFFINITY 204
+#define NR_PRCTL 157
+#define NR_KILL 62
+#define NR_TGKILL 234
+#define NR_SIGALTSTACK 131
+#define NR_RT_SIGRETURN 15
+#define NR_CLOCK_GETRES 229
+#define NR_CLOCK_NANOSLEEP 230
+#define NR_MREMAP 25
+#define NR_IOCTL 16
+
+// P2-C3 part 1: socket msg / poll / epoll / eventfd completion.
+#define NR_SENDMSG 46
+#define NR_RECVMSG 47
+#define NR_SELECT 23
+#define NR_PPOLL 271
+#define NR_EPOLL_PWAIT 281
+#define NR_EVENTFD 284
+
+// P2-C3 part 2: socketpair.
+#define NR_SOCKETPAIR 53
+
+// sendmsg / recvmsg flags.
+#define MSG_PEEK 0x2
+#define MSG_DONTWAIT 0x40
+#define MSG_NOSIGNAL 0x4000
+#define MSG_TRUNC 0x20
+#define MSG_CTRUNC 0x8
+
+// poll(2) event flags.
+#define POLLIN 0x001
+#define POLLOUT 0x004
+#define POLLERR 0x008
+#define POLLHUP 0x010
+#define POLLNVAL 0x020
+
+// epoll(2) flags / events.
+#define EPOLLIN 0x001
+#define EPOLLOUT 0x004
+#define EPOLLERR 0x008
+#define EPOLLHUP 0x010
+#define EPOLL_CTL_ADD 1
+#define EPOLL_CTL_DEL 3
+
+// msghdr layout on wasm32-musl: 8 × 4 = 32 bytes total.
+//   msg_name(u32), msg_namelen(u32), msg_iov(u32), msg_iovlen(u32),
+//   msg_control(u32), msg_controllen(u32), msg_flags(u32), _pad(u32)
+#define MSGHDR_SIZE 32
+// iovec layout on wasm32-musl: 8 bytes total.
+//   iov_base(u32), iov_len(u32)
+#define IOVEC_SIZE 8
+
+// ioctl opcodes.
+#define FIONBIO 0x5421
+#define FIONREAD 0x541B
+#define TIOCGWINSZ 0x5413
+
+// sigaltstack flags.
+#define SS_ONSTACK 1
+#define SS_DISABLE 2
+
 // Standard *at() dirfd values. AT_FDCWD = -100 means "use cwd".
 #define AT_FDCWD (-100)
 

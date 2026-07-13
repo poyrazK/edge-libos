@@ -8,12 +8,13 @@
 //! eventually Socket/Epoll in P1).
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UnixDatagram, UnixListener, UnixStream};
 
 pub const AT_FDCWD: i64 = -100;
 pub const STDIN: u32 = 0;
@@ -130,21 +131,25 @@ pub enum SocketKind {
 /// at `bind()` time, then stored on the `SocketInner` for use by `listen()`
 /// (P1-2) and `accept4` (P1-4). For now we only model IPv4; IPv6 lands with
 /// the listener work in P1-4 since they share the lazy-build path.
+///
+/// P2-C3 part 2: `Unix` variant for AF_UNIX filesystem-path sockets.
+/// Abstract namespace (`sun_path[0] == 0`) → `-EOPNOTSUPP`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SockAddr {
     V4 { port: u16, addr: [u8; 4] },
     V6 { port: u16, addr: [u8; 16] },
+    Unix { path: PathBuf },
 }
 
 impl SockAddr {
     /// Build a `SocketAddrV4` from a `SockAddr::V4`. Returns `None` for V6
-    /// (handled separately when we add IPv6 listener support).
+    /// (handled separately when we add IPv6 listener support) and Unix.
     pub fn as_v4(&self) -> Option<std::net::SocketAddrV4> {
         match self {
             SockAddr::V4 { port, addr } => {
                 std::net::SocketAddrV4::new(std::net::Ipv4Addr::from(*addr), *port).into()
             }
-            SockAddr::V6 { .. } => None,
+            SockAddr::V6 { .. } | SockAddr::Unix { .. } => None,
         }
     }
 }
@@ -202,6 +207,30 @@ pub struct SocketInner {
     /// (peer accepted, buffer drained). epoll_wait subscribes to this
     /// for `EPOLLOUT` watchers.
     pub notify_write: Arc<tokio::sync::Notify>,
+    /// P2-C3: PEEK buffer for `recvmsg(MSG_PEEK)`. Bytes peeked from the
+    /// stream are stashed here; subsequent non-peek reads drain this
+    /// queue first. Lock briefly when accessing; never hold a Mutex
+    /// guard across `.await`.
+    pub peek_buf: parking_lot::Mutex<VecDeque<u8>>,
+    /// P2-C3 part 2: AF_UNIX host state. `Some(_)` only when
+    /// `family_unix == true`. Read/write briefly under the same lock as
+    /// the rest of `SocketInner` (it's a `Mutex<SocketInner>`).
+    pub unix: Option<UnixSockInner>,
+    /// P2-C3 part 2: this socket is an AF_UNIX socket. Recorded at
+    /// `socket(AF_UNIX, ...)` time so dispatchers can branch on family
+    /// without re-parsing `bound`.
+    pub family_unix: bool,
+    /// P2-C3 part 2: connected UnixStream (post-`accept4` or
+    /// post-`connect`). Mirrors `stream` for IPv4. Held outside
+    /// `unix` for direct access without the inner `Option`.
+    pub stream_unix: Option<UnixStream>,
+    /// P2-C3 part 2: peer address for an AF_UNIX accepted/connected
+    /// stream. Mirrors `peer_addr` for IPv4.
+    pub peer_addr_unix: Option<std::os::unix::net::SocketAddr>,
+    /// P2-C3 part 2: AF_UNIX datagram socket. Lazily bound on first
+    /// sendto/recvfrom (the bind step is explicit in CPython; we
+    /// support `bind(AF_UNIX, SOCK_DGRAM)` separately).
+    pub dgram_unix: Option<UnixDatagram>,
 }
 
 impl SocketInner {
@@ -222,7 +251,21 @@ impl SocketInner {
             is_acceptor: false,
             notify_read: Arc::new(tokio::sync::Notify::new()),
             notify_write: Arc::new(tokio::sync::Notify::new()),
+            peek_buf: parking_lot::Mutex::new(VecDeque::new()),
+            unix: None,
+            family_unix: false,
+            stream_unix: None,
+            peer_addr_unix: None,
+            dgram_unix: None,
         }
+    }
+
+    /// P2-C3 part 2: construct an AF_UNIX SocketInner.
+    pub fn new_unix(kind: SocketKind, nonblock: bool) -> Self {
+        let mut s = Self::new(kind, nonblock);
+        s.unix = Some(UnixSockInner::new());
+        s.family_unix = true;
+        s
     }
 
     /// True once `bind` + `listen` have both run. P1-4 `accept4` requires this.
@@ -239,12 +282,54 @@ impl SocketInner {
         s
     }
 
-    /// P1-6: family inferred from `bound` (or AF_INET if unknown).
+    /// P1-6: family inferred from `bound` (or AF_INET if unknown). For
+    /// AF_UNIX sockets the `family_unix` flag is authoritative regardless
+    /// of whether `bound` is set.
     pub fn family(&self) -> i32 {
+        if self.family_unix {
+            return 1; // AF_UNIX
+        }
         match self.bound {
             Some(SockAddr::V4 { .. }) => 2,    // AF_INET
             Some(SockAddr::V6 { .. }) => 10,   // AF_INET6
+            Some(SockAddr::Unix { .. }) => 1,  // AF_UNIX (defensive — family_unix catches first)
             None => 2,                          // default AF_INET for unbound
+        }
+    }
+}
+
+/// P2-C3 part 2: AF_UNIX socket state.
+///
+/// A single struct carries all the AF_UNIX host-resource variants an
+/// `AF_UNIX` fd might need over its lifetime:
+/// * `listener` — set on `bind` + `listen` (SOCK_STREAM only).
+/// * `stream`   — set on `connect` (SOCK_STREAM) or after `accept4`.
+/// * `dgram`    — set on `socket(AF_UNIX, SOCK_DGRAM)` (lazy on first
+///   `sendto` / `recvfrom`).
+///
+/// `path` is the filesystem path this socket is bound to (if any).
+/// Used for `getsockname` write-back and for the close-time `unlink`.
+/// Lock-discipline: same as everywhere else — never hold a
+/// `parking_lot::Mutex` guard across `.await`.
+#[allow(dead_code)]
+pub struct UnixSockInner {
+    pub path: Option<PathBuf>,
+    pub listener: Option<UnixListener>,
+    pub stream: Option<UnixStream>,
+    pub dgram: Option<UnixDatagram>,
+    /// Peer address — for AF_UNIX this is a `std::os::unix::net::SocketAddr`
+    /// (path-based). Used by `getpeername` write-back.
+    pub peer_addr: Option<std::os::unix::net::SocketAddr>,
+}
+
+impl UnixSockInner {
+    pub fn new() -> Self {
+        Self {
+            path: None,
+            listener: None,
+            stream: None,
+            dgram: None,
+            peer_addr: None,
         }
     }
 }

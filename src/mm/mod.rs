@@ -141,6 +141,40 @@ impl LinearAllocator {
         -EINVAL
     }
 
+    /// P2-C2 `mremap` identity: extend `(old, old_len)` to `new_len` bytes
+    /// in the same arena. Returns the new (or unchanged) base address on
+    /// success; `-ENOMEM` if the arena cannot fit the larger size.
+    ///
+    /// Strategy: if the existing range lives in an arena and the arena
+    /// has free space at the end (or in the free list adjacent to it),
+    /// just bump `used`. Otherwise return `-ENOMEM`.
+    pub fn grow_in_place(
+        &mut self,
+        old: u32,
+        old_len: usize,
+        new_len: usize,
+    ) -> Result<u32, i64> {
+        if new_len <= old_len {
+            return Ok(old);
+        }
+        let extra = new_len - old_len;
+        for arena in self.arenas.iter_mut() {
+            let rel = match old.checked_sub(arena.base) {
+                Some(v) => v as usize,
+                None => continue,
+            };
+            // The existing allocation must be at the top of the arena
+            // (rel + old_len == arena.used) for us to safely grow it.
+            if rel + old_len == arena.used
+                && arena.used + extra <= ARENA_SIZE
+            {
+                arena.used += extra;
+                return Ok(old);
+            }
+        }
+        Err(-ENOMEM)
+    }
+
     pub fn mprotect(&self, _addr: u32, _len: usize, _prot: i32) -> i64 {
         0
     }

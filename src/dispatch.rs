@@ -158,6 +158,34 @@ pub async fn dispatch(
         sys::file::NR_GETCWD => sys::file::getcwd(&mut caller, a).await,
         sys::file::NR_READV => sys::file::readv(&mut caller, a).await,
         sys::file::NR_WRITEV => sys::file::writev(&mut caller, a).await,
+        // P2-C1 part 1: mkdir / mkdirat / rmdir / unlink / unlinkat.
+        sys::file::NR_MKDIR => sys::file::mkdir(&mut caller, a).await,
+        sys::file::NR_MKDIRAT => sys::file::mkdirat(&mut caller, a).await,
+        sys::file::NR_RMDIR => sys::file::rmdir(&mut caller, a).await,
+        sys::file::NR_UNLINK => sys::file::unlink(&mut caller, a).await,
+        sys::file::NR_UNLINKAT => sys::file::unlinkat(&mut caller, a).await,
+        // P2-C1 part 2: rename / renameat / renameat2 / truncate / ftruncate.
+        sys::file::NR_RENAME => sys::file::rename(&mut caller, a).await,
+        sys::file::NR_RENAMEAT => sys::file::renameat(&mut caller, a).await,
+        sys::file::NR_RENAMEAT2 => sys::file::renameat2(&mut caller, a).await,
+        sys::file::NR_TRUNCATE => sys::file::truncate(&mut caller, a).await,
+        sys::file::NR_FTRUNCATE => sys::file::ftruncate(&mut caller, a).await,
+        // P2-C1 part 3: readlink / symlink / link / utimensat / chmod /
+        // faccessat / chdir / chroot (+at variants).
+        sys::file::NR_READLINK => sys::file::readlink(&mut caller, a).await,
+        sys::file::NR_READLINKAT => sys::file::readlinkat(&mut caller, a).await,
+        sys::file::NR_SYMLINK => sys::file::symlink(&mut caller, a).await,
+        sys::file::NR_SYMLINKAT => sys::file::symlinkat(&mut caller, a).await,
+        sys::file::NR_LINK => sys::file::link(&mut caller, a).await,
+        sys::file::NR_LINKAT => sys::file::linkat(&mut caller, a).await,
+        sys::file::NR_UTIMENSAT => sys::file::utimensat(&mut caller, a).await,
+        sys::file::NR_CHMOD => sys::file::chmod(&mut caller, a).await,
+        sys::file::NR_FCHMOD => sys::file::fchmod(&mut caller, a).await,
+        sys::file::NR_FCHMODAT => sys::file::fchmodat(&mut caller, a).await,
+        sys::file::NR_FACCESSAT => sys::file::faccessat(&mut caller, a).await,
+        sys::file::NR_FACCESSAT2 => sys::file::faccessat2(&mut caller, a).await,
+        sys::file::NR_CHDIR => sys::file::chdir(&mut caller, a).await,
+        sys::file::NR_CHROOT => sys::file::chroot(&mut caller, a).await,
 
         // Sockets (P1-1: socket only; bind/listen/accept/connect/recv/send
         // land in later sub-steps).
@@ -169,26 +197,71 @@ pub async fn dispatch(
         sys::socket::NR_CONNECT => sys::socket::connect(&mut caller, a).await,
         sys::socket::NR_SENDTO => sys::socket::sendto(&mut caller, a).await,
         sys::socket::NR_RECVFROM => sys::socket::recvfrom(&mut caller, a).await,
+        // P2-C3 part 1: sendmsg / recvmsg.
+        sys::socket::NR_SENDMSG => sys::socket::sendmsg(&mut caller, a).await,
+        sys::socket::NR_RECVMSG => sys::socket::recvmsg(&mut caller, a).await,
         sys::socket::NR_SETSOCKOPT => sys::socket::setsockopt(&mut caller, a).await,
         sys::socket::NR_GETSOCKOPT => sys::socket::getsockopt(&mut caller, a).await,
         sys::socket::NR_GETSOCKNAME => sys::socket::getsockname(&mut caller, a).await,
         sys::socket::NR_GETPEERNAME => sys::socket::getpeername(&mut caller, a).await,
         sys::socket::NR_SHUTDOWN => sys::socket::shutdown(&mut caller, a).await,
+        // P2-C3 part 2: socketpair (AF_UNIX pair).
+        sys::socket::NR_SOCKETPAIR => sys::socket::socketpair(&mut caller, a).await,
 
         // poll(2) — P1-6 synchronous readiness scan.
         sys::poll::NR_POLL => sys::poll::poll(&mut caller, a).await,
+        // P2-C3 part 1: ppoll, select.
+        sys::poll::NR_PPOLL => sys::poll::ppoll(&mut caller, a).await,
+        sys::poll::NR_SELECT => sys::poll::select(&mut caller, a).await,
 
         // P1-7: the async pivot — epoll + eventfd.
         sys::epoll::NR_EPOLL_CREATE1 => sys::epoll::epoll_create1(&mut caller, a).await,
         sys::epoll::NR_EPOLL_CTL => sys::epoll::epoll_ctl(&mut caller, a).await,
         sys::epoll::NR_EPOLL_WAIT => sys::epoll::epoll_wait(&mut caller, a).await,
+        // P2-C3 part 1: epoll_pwait, legacy eventfd.
+        sys::epoll::NR_EPOLL_PWAIT => sys::epoll::epoll_pwait(&mut caller, a).await,
         sys::eventfd::NR_EVENTFD2 => sys::eventfd::eventfd2(&mut caller, a).await,
+        sys::eventfd::NR_EVENTFD => sys::eventfd::eventfd(&mut caller, a).await,
 
         // Identity (stubs)
         sys::identity::NR_GETUID => sys::identity::getuid(),
         sys::identity::NR_GETEUID => sys::identity::geteuid(),
         sys::identity::NR_GETGID => sys::identity::getgid(),
         sys::identity::NR_GETEGID => sys::identity::getegid(),
+
+        // P2-C2: identity (extended)
+        sys::identity::NR_GETPPID => sys::identity::getppid(),
+        sys::identity::NR_UNAME => sys::identity::uname(&mut caller, a).await,
+        sys::identity::NR_PRLIMIT64 => sys::identity::prlimit64(&mut caller, a).await,
+        sys::identity::NR_GETRLIMIT => sys::identity::getrlimit(&mut caller, a).await,
+        sys::identity::NR_SETSID => sys::identity::setsid(),
+        sys::identity::NR_GETSID => sys::identity::getsid(a),
+        sys::identity::NR_GETGROUPS => sys::identity::getgroups(&mut caller, a).await,
+
+        // P2-C2: process
+        sys::process::NR_SCHED_YIELD => sys::process::sched_yield().await,
+        sys::process::NR_SCHED_GETAFFINITY => {
+            sys::process::sched_getaffinity(&mut caller, a).await
+        }
+        sys::process::NR_PRCTL => sys::process::prctl(&mut caller, a).await,
+        sys::process::NR_KILL => sys::process::kill(&mut caller, a).await,
+        sys::process::NR_TGKILL => sys::process::tgkill(&mut caller, a).await,
+
+        // P2-C2: signal
+        sys::signal::NR_SIGALTSTACK => sys::signal::sigaltstack(&mut caller, a),
+        sys::signal::NR_RT_SIGRETURN => sys::signal::rt_sigreturn(),
+
+        // P2-C2: time
+        sys::time::NR_CLOCK_GETRES => sys::time::clock_getres(&mut caller, a).await,
+        sys::time::NR_CLOCK_NANOSLEEP => {
+            sys::time::clock_nanosleep(&mut caller, a).await
+        }
+
+        // P2-C2: memory
+        sys::memory::NR_MREMAP => sys::memory::mremap(&mut caller, a),
+
+        // P2-C2: ioctl
+        sys::ioctl::NR_IOCTL => sys::ioctl::ioctl(&mut caller, a).await,
 
         // Time
         sys::time::NR_CLOCK_GETTIME => sys::time::clock_gettime(&mut caller, a).await,
@@ -250,6 +323,31 @@ pub fn syscall_name(nr: u32) -> &'static str {
         sys::file::NR_GETCWD => "getcwd",
         sys::file::NR_READV => "readv",
         sys::file::NR_WRITEV => "writev",
+        sys::file::NR_MKDIR => "mkdir",
+        sys::file::NR_MKDIRAT => "mkdirat",
+        sys::file::NR_RMDIR => "rmdir",
+        sys::file::NR_UNLINK => "unlink",
+        sys::file::NR_UNLINKAT => "unlinkat",
+        sys::file::NR_RENAME => "rename",
+        sys::file::NR_RENAMEAT => "renameat",
+        sys::file::NR_RENAMEAT2 => "renameat2",
+        sys::file::NR_TRUNCATE => "truncate",
+        sys::file::NR_FTRUNCATE => "ftruncate",
+        // P2-C1 part 3
+        sys::file::NR_READLINK => "readlink",
+        sys::file::NR_READLINKAT => "readlinkat",
+        sys::file::NR_SYMLINK => "symlink",
+        sys::file::NR_SYMLINKAT => "symlinkat",
+        sys::file::NR_LINK => "link",
+        sys::file::NR_LINKAT => "linkat",
+        sys::file::NR_UTIMENSAT => "utimensat",
+        sys::file::NR_CHMOD => "chmod",
+        sys::file::NR_FCHMOD => "fchmod",
+        sys::file::NR_FCHMODAT => "fchmodat",
+        sys::file::NR_FACCESSAT => "faccessat",
+        sys::file::NR_FACCESSAT2 => "faccessat2",
+        sys::file::NR_CHDIR => "chdir",
+        sys::file::NR_CHROOT => "chroot",
 
         sys::socket::NR_SOCKET => "socket",
         sys::socket::NR_BIND => "bind",
@@ -259,23 +357,54 @@ pub fn syscall_name(nr: u32) -> &'static str {
         sys::socket::NR_CONNECT => "connect",
         sys::socket::NR_SENDTO => "sendto",
         sys::socket::NR_RECVFROM => "recvfrom",
+        sys::socket::NR_SENDMSG => "sendmsg",
+        sys::socket::NR_RECVMSG => "recvmsg",
         sys::socket::NR_SETSOCKOPT => "setsockopt",
         sys::socket::NR_GETSOCKOPT => "getsockopt",
         sys::socket::NR_GETSOCKNAME => "getsockname",
         sys::socket::NR_GETPEERNAME => "getpeername",
         sys::socket::NR_SHUTDOWN => "shutdown",
+        sys::socket::NR_SOCKETPAIR => "socketpair",
 
         sys::poll::NR_POLL => "poll",
+        sys::poll::NR_PPOLL => "ppoll",
+        sys::poll::NR_SELECT => "select",
 
         sys::epoll::NR_EPOLL_CREATE1 => "epoll_create1",
         sys::epoll::NR_EPOLL_CTL => "epoll_ctl",
         sys::epoll::NR_EPOLL_WAIT => "epoll_wait",
+        sys::epoll::NR_EPOLL_PWAIT => "epoll_pwait",
         sys::eventfd::NR_EVENTFD2 => "eventfd2",
+        sys::eventfd::NR_EVENTFD => "eventfd",
 
         sys::identity::NR_GETUID => "getuid",
         sys::identity::NR_GETEUID => "geteuid",
         sys::identity::NR_GETGID => "getgid",
         sys::identity::NR_GETEGID => "getegid",
+        // P2-C2 identity
+        sys::identity::NR_GETPPID => "getppid",
+        sys::identity::NR_UNAME => "uname",
+        sys::identity::NR_PRLIMIT64 => "prlimit64",
+        sys::identity::NR_GETRLIMIT => "getrlimit",
+        sys::identity::NR_SETSID => "setsid",
+        sys::identity::NR_GETSID => "getsid",
+        sys::identity::NR_GETGROUPS => "getgroups",
+        // P2-C2 process
+        sys::process::NR_SCHED_YIELD => "sched_yield",
+        sys::process::NR_SCHED_GETAFFINITY => "sched_getaffinity",
+        sys::process::NR_PRCTL => "prctl",
+        sys::process::NR_KILL => "kill",
+        sys::process::NR_TGKILL => "tgkill",
+        // P2-C2 signal
+        sys::signal::NR_SIGALTSTACK => "sigaltstack",
+        sys::signal::NR_RT_SIGRETURN => "rt_sigreturn",
+        // P2-C2 time
+        sys::time::NR_CLOCK_GETRES => "clock_getres",
+        sys::time::NR_CLOCK_NANOSLEEP => "clock_nanosleep",
+        // P2-C2 memory
+        sys::memory::NR_MREMAP => "mremap",
+        // P2-C2 ioctl
+        sys::ioctl::NR_IOCTL => "ioctl",
 
         sys::time::NR_CLOCK_GETTIME => "clock_gettime",
         sys::time::NR_GETTIMEOFDAY => "gettimeofday",

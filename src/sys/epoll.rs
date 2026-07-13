@@ -42,6 +42,8 @@ use crate::mem;
 pub const NR_EPOLL_CREATE1: u32 = 291;
 pub const NR_EPOLL_CTL: u32 = 233;
 pub const NR_EPOLL_WAIT: u32 = 232;
+// P2-C3 part 1: epoll_pwait.
+pub const NR_EPOLL_PWAIT: u32 = 281;
 
 // epoll_ctl(2) operations.
 pub const EPOLL_CTL_ADD: i32 = 1;
@@ -479,8 +481,67 @@ fn pack_events(
     };
     for (i, (entry, revents)) in ready.iter().take(count).enumerate() {
         let off = i * EPOLL_EVENT_SIZE;
-        buf[off..off + 4].copy_from_slice(&revents.to_le_bytes());
+        // wasm32-musl `struct epoll_event` is 12 bytes: u32 events + u64 data.
+        // `data` is preserved through the round-trip from `EpollEntry::data`
+        // (set by the guest's `EPOLL_CTL_ADD`).
+        let ev_u32: u32 = revents & 0xFFFF_FFFF;
+        buf[off..off + 4].copy_from_slice(&ev_u32.to_le_bytes());
         buf[off + 4..off + 12].copy_from_slice(&entry.data.to_le_bytes());
     }
     count as i64
+}
+
+/// `epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize)` —
+/// like `epoll_wait` but takes a `struct timespec` timeout. `sigmask` is
+/// ignored (no signal integration in v1).
+pub async fn epoll_pwait(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let epfd = match u32::try_from(a[0]) {
+        Ok(f) => f,
+        Err(_) => return -EBADF,
+    };
+    let events_ptr = a[1];
+    let maxevents = match usize::try_from(a[2]) {
+        Ok(n) => n,
+        Err(_) => return -EINVAL,
+    };
+    let tsp = a[3];
+    let _sigmask = a[4];
+    let _sigsetsize = a[5];
+    if maxevents == 0 {
+        return -EINVAL;
+    }
+
+    let timeout_ms: i64 = if tsp == 0 {
+        -1 // wait forever
+    } else {
+        let bytes = match mem::guest_slice(caller, tsp, 16) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        let sec = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let nsec = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+            return -EINVAL;
+        }
+        (sec as i64).saturating_mul(1000) + (nsec as i64) / 1_000_000
+    };
+
+    epoll_wait(caller, [epfd as i64, events_ptr, maxevents as i64, timeout_ms, 0, 0]).await
+}
+
+#[cfg(test)]
+mod p2_c3_part1_tests {
+    //! P2-C3 part 1: epoll_pwait NR + EPOLL_EVENT_SIZE constant.
+    use super::*;
+
+    #[test]
+    fn epoll_pwait_nr_is_linux_281() {
+        assert_eq!(NR_EPOLL_PWAIT, 281);
+    }
+
+    #[test]
+    fn epoll_event_size_is_12_on_wasm32() {
+        // u32 events + u64 data = 12 bytes (matches wasm32-musl layout).
+        assert_eq!(EPOLL_EVENT_SIZE, 12);
+    }
 }
