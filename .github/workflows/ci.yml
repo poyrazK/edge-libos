@@ -143,12 +143,15 @@ jobs:
         # Loop survives future WAT additions; today there's exactly
         # one (tests/guests/serve_one_request.wat). wabt is already
         # installed by step 4.
+        # Uses `find -exec` (not `for x in $(find ...)`) because
+        # actionlint's embedded shellcheck flags SC2044 on the latter
+        # (paths with whitespace / newlines would be split).
         run: |
           set -euo pipefail
-          for wat in $(find tests guests -name '*.wat' -not -path '*/target/*' 2>/dev/null); do
-            echo "==> $wat"
-            wat2wasm "$wat" -o /tmp/check.wasm
-          done
+          while IFS= read -r -d '' wat; do
+              echo "==> $wat"
+              wat2wasm "$wat" -o /tmp/check.wasm
+          done < <(find tests guests -name '*.wat' -not -path '*/target/*' -print0 2>/dev/null || true)
 
   # ─── The ONLY job that runs cargo ──────────────────────────────────
   # Compiles once under the `ci` profile, runs the full Rust suite, and
