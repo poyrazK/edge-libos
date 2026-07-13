@@ -218,6 +218,40 @@ pub async fn dispatch(
         sys::identity::NR_GETGID => sys::identity::getgid(),
         sys::identity::NR_GETEGID => sys::identity::getegid(),
 
+        // P2-C2: identity (extended)
+        sys::identity::NR_GETPPID => sys::identity::getppid(),
+        sys::identity::NR_UNAME => sys::identity::uname(&mut caller, a).await,
+        sys::identity::NR_PRLIMIT64 => sys::identity::prlimit64(&mut caller, a).await,
+        sys::identity::NR_GETRLIMIT => sys::identity::getrlimit(&mut caller, a).await,
+        sys::identity::NR_SETSID => sys::identity::setsid(),
+        sys::identity::NR_GETSID => sys::identity::getsid(a),
+        sys::identity::NR_GETGROUPS => sys::identity::getgroups(&mut caller, a).await,
+
+        // P2-C2: process
+        sys::process::NR_SCHED_YIELD => sys::process::sched_yield().await,
+        sys::process::NR_SCHED_GETAFFINITY => {
+            sys::process::sched_getaffinity(&mut caller, a).await
+        }
+        sys::process::NR_PRCTL => sys::process::prctl(&mut caller, a).await,
+        sys::process::NR_KILL => sys::process::kill(&mut caller, a).await,
+        sys::process::NR_TGKILL => sys::process::tgkill(&mut caller, a).await,
+
+        // P2-C2: signal
+        sys::signal::NR_SIGALTSTACK => sys::signal::sigaltstack(&mut caller, a),
+        sys::signal::NR_RT_SIGRETURN => sys::signal::rt_sigreturn(),
+
+        // P2-C2: time
+        sys::time::NR_CLOCK_GETRES => sys::time::clock_getres(&mut caller, a).await,
+        sys::time::NR_CLOCK_NANOSLEEP => {
+            sys::time::clock_nanosleep(&mut caller, a).await
+        }
+
+        // P2-C2: memory
+        sys::memory::NR_MREMAP => sys::memory::mremap(&mut caller, a),
+
+        // P2-C2: ioctl
+        sys::ioctl::NR_IOCTL => sys::ioctl::ioctl(&mut caller, a).await,
+
         // Time
         sys::time::NR_CLOCK_GETTIME => sys::time::clock_gettime(&mut caller, a).await,
         sys::time::NR_GETTIMEOFDAY => sys::time::gettimeofday(&mut caller, a).await,
@@ -329,6 +363,30 @@ pub fn syscall_name(nr: u32) -> &'static str {
         sys::identity::NR_GETEUID => "geteuid",
         sys::identity::NR_GETGID => "getgid",
         sys::identity::NR_GETEGID => "getegid",
+        // P2-C2 identity
+        sys::identity::NR_GETPPID => "getppid",
+        sys::identity::NR_UNAME => "uname",
+        sys::identity::NR_PRLIMIT64 => "prlimit64",
+        sys::identity::NR_GETRLIMIT => "getrlimit",
+        sys::identity::NR_SETSID => "setsid",
+        sys::identity::NR_GETSID => "getsid",
+        sys::identity::NR_GETGROUPS => "getgroups",
+        // P2-C2 process
+        sys::process::NR_SCHED_YIELD => "sched_yield",
+        sys::process::NR_SCHED_GETAFFINITY => "sched_getaffinity",
+        sys::process::NR_PRCTL => "prctl",
+        sys::process::NR_KILL => "kill",
+        sys::process::NR_TGKILL => "tgkill",
+        // P2-C2 signal
+        sys::signal::NR_SIGALTSTACK => "sigaltstack",
+        sys::signal::NR_RT_SIGRETURN => "rt_sigreturn",
+        // P2-C2 time
+        sys::time::NR_CLOCK_GETRES => "clock_getres",
+        sys::time::NR_CLOCK_NANOSLEEP => "clock_nanosleep",
+        // P2-C2 memory
+        sys::memory::NR_MREMAP => "mremap",
+        // P2-C2 ioctl
+        sys::ioctl::NR_IOCTL => "ioctl",
 
         sys::time::NR_CLOCK_GETTIME => "clock_gettime",
         sys::time::NR_GETTIMEOFDAY => "gettimeofday",

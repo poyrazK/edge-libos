@@ -11,6 +11,13 @@ pub const NR_MPROTECT: u32 = 10;
 pub const NR_MADVISE: u32 = 28;
 pub const NR_BRK: u32 = 12;
 
+// P2-C2: mremap.
+pub const NR_MREMAP: u32 = 25;
+
+// mremap(2) flags (linux/mman.h).
+pub const MREMAP_MAYMOVE: i32 = 1;
+pub const MREMAP_FIXED: i32 = 2;
+
 /// Helper: read current memory size in bytes via a shared borrow of `caller`.
 fn mem_size(caller: &Caller<'_, Kernel>) -> usize {
     // Already a shared borrow; Kernel::memory is &-only.
@@ -106,4 +113,49 @@ pub fn madvise() -> i64 {
 /// brk(0) returns the high-water mark.
 pub fn brk(caller: &mut Caller<'_, Kernel>, _a: [i64; 6]) -> i64 {
     caller.data().mm.brk() as i64
+}
+
+/// `mremap(old, old_len, new_len, flags, new_addr)` — minimum set:
+/// identity re-map (no move, no flag). If `(old, old_len)` lives in an
+/// arena and `new_len <= old_len`, returns `old` unchanged. If `new_len >
+/// old_len` and the arena has room, allocates a new region in the same
+/// arena and returns its base.
+///
+/// `MREMAP_MAYMOVE` or `MREMAP_FIXED` with an unknown `new_addr` returns
+/// `-ENOSYS` (deferred to a future PR).
+pub fn mremap(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    use crate::errno::ENOSYS;
+    let old = match u32::try_from(a[0]) {
+        Ok(v) => v,
+        Err(_) => return -crate::errno::EINVAL,
+    };
+    let old_len = match usize::try_from(a[1]) {
+        Ok(n) if n > 0 => n,
+        _ => return -crate::errno::EINVAL,
+    };
+    let new_len = match usize::try_from(a[2]) {
+        Ok(n) if n > 0 => n,
+        _ => return -crate::errno::EINVAL,
+    };
+    let flags = a[3] as i32;
+    let new_addr = a[4] as u32;
+
+    // Reject MAYMOVE/FIXED on unknown ranges.
+    if flags & (MREMAP_MAYMOVE | MREMAP_FIXED) != 0 {
+        return -ENOSYS;
+    }
+    if new_addr != 0 {
+        return -ENOSYS;
+    }
+
+    // Identity re-map: shrink returns old; grow tries to allocate more in
+    // the same arena. Falls through to ENOMEM if it can't.
+    if new_len <= old_len {
+        return old as i64;
+    }
+    let mm = &mut caller.data_mut().mm;
+    match mm.grow_in_place(old, old_len, new_len) {
+        Ok(addr) => addr as i64,
+        Err(e) => e,
+    }
 }

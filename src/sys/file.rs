@@ -1502,6 +1502,30 @@ pub async fn writev(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     total_written
 }
 
+/// P2-C2: flip the nonblock flag on a resource. Used by both
+/// `fcntl(F_SETFL, O_NONBLOCK)` and `ioctl(FIONBIO, 1)`.
+///
+/// Resources without a nonblock concept (File, Epoll, EventFd) are
+/// accepted silently. Sockets/Pipes/Stdino update their `nonblock`
+/// AtomicBool.
+pub fn set_nonblock(r: &mut Resource, on: bool) {
+    use std::sync::atomic::Ordering;
+    match r {
+        Resource::Stdin(x) | Resource::PipeRead(x) => {
+            x.nonblock.store(on, Ordering::Relaxed);
+        }
+        Resource::Stdout(x) | Resource::Stderr(x) | Resource::PipeWrite(x) => {
+            x.nonblock.store(on, Ordering::Relaxed);
+        }
+        Resource::Socket(s) => {
+            s.lock().nonblock.store(on, Ordering::Relaxed);
+        }
+        Resource::File(_) | Resource::Epoll(_) | Resource::EventFd(_) => {
+            // No-op.
+        }
+    }
+}
+
 /// `fcntl(fd, cmd, arg)`. Limited subset (F_GETFL/F_SETFL/F_GETFD/F_SETFD/F_DUPFD).
 pub async fn fcntl(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let fd = match u32::try_from(a[0]) {
@@ -1554,23 +1578,9 @@ pub async fn fcntl(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
             let want_nonblock = (arg as i32) & O_NONBLOCK != 0;
             let fds = &mut caller.data_mut().fds;
             match fds.get_mut(fd) {
-                Ok(Resource::Stdin(r)) | Ok(Resource::PipeRead(r)) => {
-                    r.nonblock.store(want_nonblock, std::sync::atomic::Ordering::Relaxed);
+                Ok(r) => {
+                    set_nonblock(r, want_nonblock);
                 }
-                Ok(Resource::Stdout(w)) | Ok(Resource::Stderr(w)) | Ok(Resource::PipeWrite(w)) => {
-                    w.nonblock.store(want_nonblock, std::sync::atomic::Ordering::Relaxed);
-                }
-                Ok(Resource::Socket(s)) => {
-                    s.lock().nonblock.store(want_nonblock, std::sync::atomic::Ordering::Relaxed);
-                }
-                Ok(Resource::File(_)) => {
-                    // Real files have no nonblock semantics on the host
-                    // (they're blocking I/O on the std::fs::File). Accept
-                    // the call and return 0.
-                }
-                // P1-7: epoll/eventfd ignore F_SETFL; F_GETFL above already
-                // returns O_RDWR for them.
-                Ok(Resource::Epoll(_)) | Ok(Resource::EventFd(_)) => {}
                 Err(e) => return e,
             }
             0

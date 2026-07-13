@@ -130,6 +130,35 @@ int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
 #define W_OK 2
 #define X_OK 1
 
+// P2-C2: identity / process / signal / time / memory / ioctl.
+#define NR_GETPPID 110
+#define NR_UNAME 63
+#define NR_PRLIMIT64 302
+#define NR_GETRLIMIT 97
+#define NR_SETSID 112
+#define NR_GETSID 124
+#define NR_GETGROUPS 115
+#define NR_SCHED_YIELD 24
+#define NR_SCHED_GETAFFINITY 204
+#define NR_PRCTL 157
+#define NR_KILL 62
+#define NR_TGKILL 234
+#define NR_SIGALTSTACK 131
+#define NR_RT_SIGRETURN 15
+#define NR_CLOCK_GETRES 229
+#define NR_CLOCK_NANOSLEEP 230
+#define NR_MREMAP 25
+#define NR_IOCTL 16
+
+// ioctl opcodes.
+#define FIONBIO 0x5421
+#define FIONREAD 0x541B
+#define TIOCGWINSZ 0x5413
+
+// sigaltstack flags.
+#define SS_ONSTACK 1
+#define SS_DISABLE 2
+
 // Standard *at() dirfd values. AT_FDCWD = -100 means "use cwd".
 #define AT_FDCWD (-100)
 
