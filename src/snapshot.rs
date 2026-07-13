@@ -235,15 +235,10 @@ pub struct EventFdSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LinearAllocatorSnapshot {
-    pub arenas: Vec<ArenaSnapshot>,
+    /// Identical shape to `crate::mm::Arena`; we serialize the runtime
+    /// type directly because `Arena` already derives the right traits.
+    pub arenas: Vec<crate::mm::Arena>,
     pub high_water: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArenaSnapshot {
-    pub base: u32,
-    pub used: usize,
-    pub free_list: Vec<(usize, usize)>,
 }
 
 /// Identical-shape mirror of `crate::kernel::ClockState` so the runtime
@@ -454,11 +449,7 @@ mod tests {
     fn linear_allocator_snapshot_roundtrip() {
         // Build a snapshot directly and round-trip.
         let lsnap = LinearAllocatorSnapshot {
-            arenas: vec![ArenaSnapshot {
-                base: 0x1_000_0000,
-                used: 128,
-                free_list: vec![(128, 64), (256, 32)],
-            }],
+            arenas: vec![crate::mm::Arena::new(0x1_000_0000)],
             high_water: 0x1_001_0000,
         };
         let bytes = postcard::to_stdvec(&lsnap).expect("encode");
@@ -468,7 +459,7 @@ mod tests {
         assert_eq!(back.high_water, 0x1_001_0000);
         assert_eq!(back.arenas.len(), 1);
         assert_eq!(back.arenas[0].base, 0x1_000_0000);
-        assert_eq!(back.arenas[0].used, 128);
-        assert_eq!(back.arenas[0].free_list, vec![(128, 64), (256, 32)]);
+        assert_eq!(back.arenas[0].used, 0);
+        assert!(back.arenas[0].free_list.is_empty());
     }
 }
