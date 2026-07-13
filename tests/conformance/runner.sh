@@ -82,6 +82,7 @@ expected_syscall() {
         dup)               echo "dup" ;;
         dup2)              echo "dup2" ;;
         dup3)              echo "dup3" ;;
+        f_dupfd_min)       echo "fcntl" ;;
         lstat)             echo "lstat" ;;
         getcwd)            echo "getcwd" ;;
         readv)             echo "readv" ;;
