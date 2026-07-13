@@ -68,6 +68,27 @@ pub const F_SETFD: i32 = 2;
 pub const F_DUPFD: i32 = 0;
 pub const F_DUPFD_CLOEXEC: i32 = 1024 + 6;
 
+// statx(2) flags (linux/fcntl.h). AT_* apply to *at() family and statx;
+// STATX_* select which timestamps/fields the caller wants filled.
+pub const AT_EMPTY_PATH: i32 = 0x1000;
+pub const AT_NO_AUTOMOUNT: i32 = 0x800;
+pub const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+
+pub const STATX_TYPE: u32 = 0x1;
+pub const STATX_MODE: u32 = 0x2;
+pub const STATX_NLINK: u32 = 0x4;
+pub const STATX_UID: u32 = 0x8;
+pub const STATX_GID: u32 = 0x10;
+pub const STATX_ATIME: u32 = 0x20;
+pub const STATX_MTIME: u32 = 0x40;
+pub const STATX_CTIME: u32 = 0x80;
+pub const STATX_INO: u32 = 0x100;
+pub const STATX_BLOCKS: u32 = 0x400;
+pub const STATX_BTIME: u32 = 0x800;
+
+/// Linux `struct statx` is 256 bytes on x86-64 (linux/stat.h).
+pub const STATX_SIZE: usize = 256;
+
 /// A seekable file or directory fd. Wraps `std::fs::File` + its current
 /// position + the absolute path we opened it from (so `getdents64` can
 /// be answered without re-resolving).
@@ -116,6 +137,292 @@ impl FilePos {
             is_dir: self.is_dir,
             dir_cache: self.dir_cache.clone(),
         })
+    }
+}
+
+/// Linux `struct statx` (x86-64 / wasm32-musl layout, 256 bytes).
+///
+/// Layout per `include/uapi/linux/stat.h`. Field offsets are EXACT —
+/// the kernel writes little-endian at each offset, then exposes the
+/// buffer at `buf_ptr` for musl/glibc to decode. Any drift here will
+/// silently corrupt stat results in guests.
+///
+/// P2-B4 commit 3: encoder + projection from the 120-byte `Stat`.
+#[derive(Debug, Clone, Copy)]
+pub struct Statx {
+    pub stx_mask: u32,
+    pub stx_blksize: u32,
+    pub stx_attributes: u64,
+    pub stx_nlink: u64,
+    pub stx_uid: u32,
+    pub stx_gid: u32,
+    pub stx_mode: u16,
+    pub stx_ino: u64,
+    pub stx_size: u64,
+    pub stx_blocks: u64,
+    pub stx_attributes_mask: u64,
+    pub stx_atime_sec: i64,
+    pub stx_atime_nsec: i64,
+    pub stx_btime_sec: i64,
+    pub stx_btime_nsec: i64,
+    pub stx_ctime_sec: i64,
+    pub stx_ctime_nsec: i64,
+    pub stx_mtime_sec: i64,
+    pub stx_mtime_nsec: i64,
+    pub stx_rdev_major: u32,
+    pub stx_rdev_minor: u32,
+    pub stx_dev_major: u64,
+    pub stx_dev_minor: u64,
+    pub stx_mnt_id: u64,
+    pub stx_dio_mem_align: u32,
+    pub stx_dio_offset_align: u32,
+}
+
+impl Statx {
+    pub const SIZE: usize = STATX_SIZE;
+
+    /// Project a `Stat` (vfs.rs) into a `Statx`. Btime is always 0 (the
+    /// host `std::fs::Metadata` does not expose btime on Linux for most
+    /// filesystems), so `STATX_BTIME` is excluded from `stx_mask`.
+    pub fn from_stat(s: &crate::vfs::Stat) -> Self {
+        Self {
+            stx_mask: Statx::filled_mask(),
+            stx_blksize: s.st_blksize as u32,
+            stx_attributes: 0,
+            stx_nlink: s.st_nlink,
+            stx_uid: s.st_uid,
+            stx_gid: s.st_gid,
+            stx_mode: (s.st_mode & 0xffff) as u16,
+            stx_ino: s.st_ino,
+            stx_size: s.st_size as u64,
+            stx_blocks: s.st_blocks as u64,
+            stx_attributes_mask: 0,
+            stx_atime_sec: s.st_atime,
+            stx_atime_nsec: clamp_nsec(s.st_atime_nsec),
+            stx_btime_sec: 0,
+            stx_btime_nsec: 0,
+            stx_ctime_sec: s.st_ctime,
+            stx_ctime_nsec: clamp_nsec(s.st_ctime_nsec),
+            stx_mtime_sec: s.st_mtime,
+            stx_mtime_nsec: clamp_nsec(s.st_mtime_nsec),
+            stx_rdev_major: 0,
+            stx_rdev_minor: 0,
+            stx_dev_major: 0,
+            stx_dev_minor: 0,
+            stx_mnt_id: 0,
+            stx_dio_mem_align: 0,
+            stx_dio_offset_align: 0,
+        }
+    }
+
+    /// The mask of bits we actually fill. BTIME is excluded (always 0).
+    pub fn filled_mask() -> u32 {
+        STATX_TYPE
+            | STATX_MODE
+            | STATX_NLINK
+            | STATX_UID
+            | STATX_GID
+            | STATX_ATIME
+            | STATX_MTIME
+            | STATX_CTIME
+            | STATX_INO
+            | STATX_BLOCKS
+    }
+
+    /// Encode to a 256-byte little-endian buffer at exact offsets.
+    pub fn encode(self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        let mut o = 0usize;
+        buf[o..o + 4].copy_from_slice(&self.stx_mask.to_le_bytes());
+        o += 4;
+        buf[o..o + 4].copy_from_slice(&self.stx_blksize.to_le_bytes());
+        o += 4;
+        buf[o..o + 8].copy_from_slice(&self.stx_attributes.to_le_bytes());
+        o += 8;
+        buf[o..o + 8].copy_from_slice(&self.stx_nlink.to_le_bytes());
+        o += 8;
+        buf[o..o + 4].copy_from_slice(&self.stx_uid.to_le_bytes());
+        o += 4;
+        buf[o..o + 4].copy_from_slice(&self.stx_gid.to_le_bytes());
+        o += 4;
+        // offset 32 = stx_mode (u16)
+        buf[o..o + 2].copy_from_slice(&self.stx_mode.to_le_bytes());
+        o += 2;
+        // 6 bytes pad to offset 40
+        o += 6;
+        buf[o..o + 8].copy_from_slice(&self.stx_ino.to_le_bytes());
+        o += 8;
+        buf[o..o + 8].copy_from_slice(&self.stx_size.to_le_bytes());
+        o += 8;
+        buf[o..o + 8].copy_from_slice(&self.stx_blocks.to_le_bytes());
+        o += 8;
+        // offset 64 = stx_attributes_mask (u64)
+        buf[o..o + 8].copy_from_slice(&self.stx_attributes_mask.to_le_bytes());
+        o += 8;
+        // offset 72 = stx_atime
+        buf[o..o + 8].copy_from_slice(&self.stx_atime_sec.to_le_bytes());
+        o += 8;
+        buf[o..o + 8].copy_from_slice(&self.stx_atime_nsec.to_le_bytes());
+        o += 8;
+        // offset 88 = stx_btime (zero)
+        buf[o..o + 8].copy_from_slice(&self.stx_btime_sec.to_le_bytes());
+        o += 8;
+        buf[o..o + 8].copy_from_slice(&self.stx_btime_nsec.to_le_bytes());
+        o += 8;
+        // offset 104 = stx_ctime
+        buf[o..o + 8].copy_from_slice(&self.stx_ctime_sec.to_le_bytes());
+        o += 8;
+        buf[o..o + 8].copy_from_slice(&self.stx_ctime_nsec.to_le_bytes());
+        o += 8;
+        // offset 120 = stx_mtime
+        buf[o..o + 8].copy_from_slice(&self.stx_mtime_sec.to_le_bytes());
+        o += 8;
+        buf[o..o + 8].copy_from_slice(&self.stx_mtime_nsec.to_le_bytes());
+        o += 8;
+        // offset 136 = stx_rdev_major/minor
+        buf[o..o + 4].copy_from_slice(&self.stx_rdev_major.to_le_bytes());
+        o += 4;
+        buf[o..o + 4].copy_from_slice(&self.stx_rdev_minor.to_le_bytes());
+        o += 4;
+        // offset 144 = stx_dev_major/minor
+        buf[o..o + 8].copy_from_slice(&self.stx_dev_major.to_le_bytes());
+        o += 8;
+        buf[o..o + 8].copy_from_slice(&self.stx_dev_minor.to_le_bytes());
+        o += 8;
+        // offset 160 = stx_mnt_id
+        buf[o..o + 8].copy_from_slice(&self.stx_mnt_id.to_le_bytes());
+        o += 8;
+        // offset 168 = stx_dio_mem_align / stx_dio_offset_align
+        buf[o..o + 4].copy_from_slice(&self.stx_dio_mem_align.to_le_bytes());
+        o += 4;
+        buf[o..o + 4].copy_from_slice(&self.stx_dio_offset_align.to_le_bytes());
+        o += 4;
+        // Trailing pad to 256 = stx_reserved3[12] + stx_reserved4[24] + 8 byte end pad.
+        // Already zero; nothing to write.
+        debug_assert_eq!(o + (Self::SIZE - o), Self::SIZE);
+        buf
+    }
+}
+
+/// Clamp a nsec field into the legal 0..=999_999_999 range. Some host
+/// filesystems (e.g. tmpfs on Linux) can hand back negative or oversized
+/// values; musl would treat those as a malformed statx.
+fn clamp_nsec(n: i64) -> i64 {
+    if n < 0 {
+        0
+    } else if n > 999_999_999 {
+        999_999_999
+    } else {
+        n
+    }
+}
+
+#[cfg(test)]
+mod statx_offset_tests {
+    use super::*;
+
+    /// Build a known Statx and verify each field lands at its expected
+    /// byte offset in the 256-byte buffer. Anchored against
+    /// linux/stat.h so a layout drift fails compilation loudly.
+    #[test]
+    fn offsets_match_linux_stat_h() {
+        let s = Statx {
+            stx_mask: 0xdead_beef,
+            stx_blksize: 0x1111_2222,
+            stx_attributes: 0x3333_4444_5555_6666,
+            stx_nlink: 7,
+            stx_uid: 1000,
+            stx_gid: 1000,
+            stx_mode: 0o100644,
+            stx_ino: 0xabcd_1234_5678_9abc,
+            stx_size: 0x0102_0304_0506_0708,
+            stx_blocks: 0x090a_0b0c,
+            stx_attributes_mask: 0xdead_beef_dead_beef,
+            stx_atime_sec: 1_700_000_000,
+            stx_atime_nsec: 123_456_789,
+            stx_btime_sec: 0,
+            stx_btime_nsec: 0,
+            stx_ctime_sec: 1_700_000_001,
+            stx_ctime_nsec: 234_567_890,
+            stx_mtime_sec: 1_700_000_002,
+            stx_mtime_nsec: 345_678_901,
+            stx_rdev_major: 0,
+            stx_rdev_minor: 0,
+            stx_dev_major: 0,
+            stx_dev_minor: 0,
+            stx_mnt_id: 0,
+            stx_dio_mem_align: 0,
+            stx_dio_offset_align: 0,
+        };
+        let buf = s.encode();
+
+        assert_eq!(buf.len(), 256);
+        // stx_mask @ 0
+        assert_eq!(&buf[0..4], &s.stx_mask.to_le_bytes());
+        // stx_blksize @ 4
+        assert_eq!(&buf[4..8], &s.stx_blksize.to_le_bytes());
+        // stx_attributes @ 8
+        assert_eq!(&buf[8..16], &s.stx_attributes.to_le_bytes());
+        // stx_nlink @ 16
+        assert_eq!(&buf[16..24], &s.stx_nlink.to_le_bytes());
+        // stx_uid @ 24
+        assert_eq!(&buf[24..28], &s.stx_uid.to_le_bytes());
+        // stx_gid @ 28
+        assert_eq!(&buf[28..32], &s.stx_gid.to_le_bytes());
+        // stx_mode @ 32 (u16) — verify only 2 bytes used
+        assert_eq!(&buf[32..34], &s.stx_mode.to_le_bytes());
+        // 6-byte pad 34..40 must be zero
+        assert!(buf[34..40].iter().all(|b| *b == 0));
+        // stx_ino @ 40
+        assert_eq!(&buf[40..48], &s.stx_ino.to_le_bytes());
+        // stx_size @ 48
+        assert_eq!(&buf[48..56], &s.stx_size.to_le_bytes());
+        // stx_blocks @ 56
+        assert_eq!(&buf[56..64], &s.stx_blocks.to_le_bytes());
+        // stx_attributes_mask @ 64
+        assert_eq!(&buf[64..72], &s.stx_attributes_mask.to_le_bytes());
+        // stx_atime @ 72
+        assert_eq!(&buf[72..80], &s.stx_atime_sec.to_le_bytes());
+        assert_eq!(&buf[80..88], &s.stx_atime_nsec.to_le_bytes());
+        // stx_btime @ 88 (zeroed)
+        assert!(buf[88..104].iter().all(|b| *b == 0));
+        // stx_ctime @ 104
+        assert_eq!(&buf[104..112], &s.stx_ctime_sec.to_le_bytes());
+        assert_eq!(&buf[112..120], &s.stx_ctime_nsec.to_le_bytes());
+        // stx_mtime @ 120
+        assert_eq!(&buf[120..128], &s.stx_mtime_sec.to_le_bytes());
+        assert_eq!(&buf[128..136], &s.stx_mtime_nsec.to_le_bytes());
+        // stx_rdev_major/minor @ 136/140
+        assert_eq!(&buf[136..140], &s.stx_rdev_major.to_le_bytes());
+        assert_eq!(&buf[140..144], &s.stx_rdev_minor.to_le_bytes());
+        // stx_dev_major/minor @ 144/152
+        assert_eq!(&buf[144..152], &s.stx_dev_major.to_le_bytes());
+        assert_eq!(&buf[152..160], &s.stx_dev_minor.to_le_bytes());
+        // stx_mnt_id @ 160
+        assert_eq!(&buf[160..168], &s.stx_mnt_id.to_le_bytes());
+        // stx_dio_* @ 168/172
+        assert_eq!(&buf[168..172], &s.stx_dio_mem_align.to_le_bytes());
+        assert_eq!(&buf[172..176], &s.stx_dio_offset_align.to_le_bytes());
+        // reserved 176..256 — all zero
+        assert!(buf[176..256].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn clamp_nsec_helper() {
+        assert_eq!(clamp_nsec(-5), 0);
+        assert_eq!(clamp_nsec(0), 0);
+        assert_eq!(clamp_nsec(500_000_000), 500_000_000);
+        assert_eq!(clamp_nsec(1_000_000_000), 999_999_999);
+    }
+
+    #[test]
+    fn filled_mask_excludes_btime() {
+        let m = Statx::filled_mask();
+        assert_eq!(m & STATX_BTIME, 0, "BTIME must be excluded from filled_mask");
+        assert_ne!(m & STATX_TYPE, 0);
+        assert_ne!(m & STATX_MODE, 0);
+        assert_ne!(m & STATX_INO, 0);
+        assert_ne!(m & STATX_BLOCKS, 0);
     }
 }
 
