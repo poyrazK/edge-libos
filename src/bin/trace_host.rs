@@ -251,6 +251,12 @@ async fn dispatch_dispatch(
         sys::socket::NR_SENDTO => sys::socket::sendto(&mut caller, a).await,
         sys::socket::NR_RECVFROM => sys::socket::recvfrom(&mut caller, a).await,
         sys::socket::NR_SETSOCKOPT => sys::socket::setsockopt(&mut caller, a).await,
+        sys::socket::NR_GETSOCKOPT => sys::socket::getsockopt(&mut caller, a).await,
+        sys::socket::NR_GETSOCKNAME => sys::socket::getsockname(&mut caller, a).await,
+        sys::socket::NR_GETPEERNAME => sys::socket::getpeername(&mut caller, a).await,
+        sys::socket::NR_SHUTDOWN => sys::socket::shutdown(&mut caller, a).await,
+
+        sys::poll::NR_POLL => sys::poll::poll(&mut caller, a).await,
 
         sys::identity::NR_GETUID => sys::identity::getuid(),
         sys::identity::NR_GETEUID => sys::identity::geteuid(),

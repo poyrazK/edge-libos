@@ -21,6 +21,10 @@ pub const NR_SOCKET: u32 = 41;
 pub const NR_BIND: u32 = 49;
 pub const NR_LISTEN: u32 = 50;
 pub const NR_SETSOCKOPT: u32 = 54;
+pub const NR_GETSOCKOPT: u32 = 55;
+pub const NR_GETSOCKNAME: u32 = 51;
+pub const NR_GETPEERNAME: u32 = 52;
+pub const NR_SHUTDOWN: u32 = 48;
 pub const NR_ACCEPT: u32 = 43;
 pub const NR_ACCEPT4: u32 = 288;
 pub const NR_CONNECT: u32 = 42;
@@ -33,7 +37,16 @@ pub const SOL_SOCKET: i32 = 1;
 pub const IPPROTO_TCP: i32 = 6;
 pub const SO_REUSEADDR: i32 = 2;
 pub const SO_KEEPALIVE: i32 = 9;
+pub const SO_TYPE: i32 = 3;
+pub const SO_ERROR: i32 = 4;
+pub const SO_DOMAIN: i32 = 39; // Linux-specific; musl defines it
+pub const SO_ACCEPTCONN: i32 = 30;
 pub const TCP_NODELAY: i32 = 1;
+
+// shutdown(2) `how` values.
+pub const SHUT_RD: i32 = 0;
+pub const SHUT_WR: i32 = 1;
+pub const SHUT_RDWR: i32 = 2;
 
 // Address families.
 pub const AF_UNIX: i32 = 1;
@@ -286,6 +299,9 @@ pub async fn accept4(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                         Err(_) => return -crate::errno::EADDRINUSE,
                     };
                     s.listener = Some(listener);
+                    // Mark this socket as a listening acceptor — surfaces in
+                    // getsockopt(SO_ACCEPTCONN).
+                    s.is_acceptor = true;
                 }
                 kind = s.kind;
                 parent_nonblock = s.nonblock.load(std::sync::atomic::Ordering::Relaxed);
@@ -343,7 +359,9 @@ pub async fn accept4(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     }
 
     // Phase 5: insert the accepted stream as a fresh fd.
-    let accepted = SocketInner::from_accepted(stream, kind, sock_nonblock || parent_nonblock);
+    let mut accepted = SocketInner::from_accepted(stream, kind, sock_nonblock || parent_nonblock);
+    // Record the peer address for `getpeername`.
+    accepted.peer_addr = Some(peer);
     let new_fd = caller.data_mut().fds.insert(Resource::Socket(accepted));
     new_fd as i64
 }
@@ -406,12 +424,19 @@ pub async fn connect(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         Err(e) => {
             // Map a handful of common tokio errors to Linux errnos.
             use std::io::ErrorKind::*;
-            return -match e.kind() {
+            let errno = match e.kind() {
                 ConnectionRefused => crate::errno::ECONNREFUSED,
                 AddrInUse => crate::errno::EADDRINUSE,
                 TimedOut => crate::errno::ETIMEDOUT,
                 _ => crate::errno::EIO,
             };
+            // Record the error on the socket for getsockopt(SO_ERROR).
+            // P1-6: getsockopt will surface this and clear it.
+            if let Ok(Resource::Socket(s)) = caller.data().fds.get(fd) {
+                s.last_error
+                    .store(errno as i32, std::sync::atomic::Ordering::Relaxed);
+            }
+            return -errno;
         }
     };
 
@@ -419,6 +444,8 @@ pub async fn connect(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     match fds.get_mut(fd) {
         Ok(Resource::Socket(s)) => {
             s.stream = Some(stream);
+            // Record peer for getpeername — we know the target.
+            s.peer_addr = Some(target);
             0
         }
         Ok(_) => -EBADF,
@@ -463,10 +490,16 @@ pub async fn sendto(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let mut stream = {
         let fds = &mut caller.data_mut().fds;
         match fds.get_mut(fd) {
-            Ok(Resource::Socket(s)) => match s.stream.take() {
-                Some(st) => st,
-                None => return -crate::errno::ENOTCONN,
-            },
+            Ok(Resource::Socket(s)) => {
+                // P1-6: SHUT_WR was called — writes must fail with EPIPE.
+                if s.shutdown_flags & 0b10 != 0 {
+                    return -crate::errno::EPIPE;
+                }
+                match s.stream.take() {
+                    Some(st) => st,
+                    None => return -crate::errno::ENOTCONN,
+                }
+            }
             Ok(_) => return -EBADF,
             Err(e) => return e,
         }
@@ -549,10 +582,16 @@ pub async fn recvfrom(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let mut stream = {
         let fds = &mut caller.data_mut().fds;
         match fds.get_mut(fd) {
-            Ok(Resource::Socket(s)) => match s.stream.take() {
-                Some(st) => st,
-                None => return -crate::errno::ENOTCONN,
-            },
+            Ok(Resource::Socket(s)) => {
+                // P1-6: SHUT_RD was called — reads return EOF immediately.
+                if s.shutdown_flags & 0b01 != 0 {
+                    return 0;
+                }
+                match s.stream.take() {
+                    Some(st) => st,
+                    None => return -crate::errno::ENOTCONN,
+                }
+            }
             Ok(_) => return -EBADF,
             Err(e) => return e,
         }
@@ -663,6 +702,289 @@ pub async fn setsockopt(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                     (SOL_SOCKET, SO_KEEPALIVE) => s.so_keepalive = true,
                     (IPPROTO_TCP, TCP_NODELAY) => s.tcp_nodelay = true,
                     _ => unreachable!(),
+                }
+            }
+            0
+        }
+        Ok(_) => -EBADF,
+        Err(e) => e,
+    }
+}
+
+/// `getsockopt(fd, level, optname, optval, optlen_ptr)` — read a socket
+/// option into the guest's `optval` buffer. Honors:
+///   * `SO_TYPE`     → 1 (SOCK_STREAM) for stream sockets.
+///   * `SO_DOMAIN`   → AF_INET (2).
+///   * `SO_ERROR`    → reads `last_error` atomically and clears it.
+///   * `SO_ACCEPTCONN` → 1 if the socket has a listener materialized.
+///   * `SO_REUSEADDR` / `SO_KEEPALIVE` / `TCP_NODELAY` → 0/1 from the
+///     recorded state on `SocketInner`.
+///
+/// All other `(level, optname)` pairs are accepted and write 0 — same
+/// "unknown setsockopt opts → 0" contract as P1-3.
+///
+/// Errors: `-EBADF`, `-EFAULT` on bad optval/len pointers.
+/// `getsockopt(fd, level, optname, optval, optlen_ptr)` — read a socket
+/// option into the guest's `optval` buffer. Honors:
+///   * `SO_TYPE`       → 1 (SOCK_STREAM) for stream sockets.
+///   * `SO_DOMAIN`     → AF_INET (2).
+///   * `SO_ERROR`      → reads `last_error` atomically and clears it.
+///   * `SO_ACCEPTCONN` → 1 if the socket has a listener materialized.
+///   * `SO_REUSEADDR` / `SO_KEEPALIVE` / `TCP_NODELAY` → 0/1 from the
+///     recorded state on `SocketInner`.
+///
+/// All other `(level, optname)` pairs are accepted and write 0 — same
+/// "unknown setsockopt opts → 0" contract as P1-3.
+///
+/// Errors: `-EBADF`, `-EFAULT` on bad optval/len pointers.
+pub async fn getsockopt(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let fd = match u32::try_from(a[0]) {
+        Ok(f) => f,
+        Err(_) => return -EBADF,
+    };
+    let level = a[1] as i32;
+    let optname = a[2] as i32;
+    let optval_ptr = a[3];
+    let optlen_ptr = a[4];
+
+    if optval_ptr == 0 {
+        return -crate::errno::EFAULT;
+    }
+
+    // Phase 1: compute the value to write. We do this while holding only
+    // an immutable borrow on `caller` so the borrow checker is happy.
+    // SO_ERROR swaps atomically, so we mutate here — that's fine because
+    // it's `&self`-internal state on the SocketInner, not `caller`.
+    let value: i32 = {
+        let fds_table = &caller.data().fds;
+        match (level, optname) {
+            (SOL_SOCKET, SO_TYPE) => 1, // SOCK_STREAM (only stream modeled)
+            (SOL_SOCKET, SO_DOMAIN) => 2, // AF_INET
+            (SOL_SOCKET, SO_ERROR) => match fds_table.get(fd) {
+                Ok(Resource::Socket(s)) => s
+                    .last_error
+                    .swap(0, std::sync::atomic::Ordering::Relaxed),
+                _ => 0,
+            }
+            (SOL_SOCKET, SO_ACCEPTCONN) => match fds_table.get(fd) {
+                Ok(Resource::Socket(s)) => s.is_acceptor as i32,
+                _ => 0,
+            },
+            (SOL_SOCKET, SO_REUSEADDR) => match fds_table.get(fd) {
+                Ok(Resource::Socket(s)) => s.so_reuseaddr as i32,
+                _ => 0,
+            },
+            (SOL_SOCKET, SO_KEEPALIVE) => match fds_table.get(fd) {
+                Ok(Resource::Socket(s)) => s.so_keepalive as i32,
+                _ => 0,
+            },
+            (IPPROTO_TCP, TCP_NODELAY) => match fds_table.get(fd) {
+                Ok(Resource::Socket(s)) => s.tcp_nodelay as i32,
+                _ => 0,
+            },
+            _ => 0,
+        }
+    };
+
+    // Phase 2: write the value into the guest optval buffer.
+    {
+        let buf = match mem::guest_slice_mut(caller, optval_ptr, 4) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        buf[0..4].copy_from_slice(&(value as u32).to_le_bytes());
+    }
+
+    // Phase 3: write back the optlen (size we actually wrote) if asked.
+    if optlen_ptr != 0 {
+        if let Ok(buf) = mem::guest_slice_mut(caller, optlen_ptr, 4) {
+            buf[0..4].copy_from_slice(&(4u32).to_le_bytes());
+        }
+    }
+
+    0
+}
+/// `getsockname(fd, addr_ptr, addrlen_ptr)` — write back the locally-bound
+/// address (the `bound` field set by `bind()`). For accepted/connected
+/// sockets, falls back to `peer_addr` so callers see something useful.
+///
+/// Errors: `-EBADF`, `-EFAULT` on bad pointers.
+pub async fn getsockname(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let fd = match u32::try_from(a[0]) {
+        Ok(f) => f,
+        Err(_) => return -EBADF,
+    };
+    let addr_ptr = a[1];
+    let addrlen_ptr = a[2];
+
+    if addr_ptr == 0 {
+        return -crate::errno::EFAULT;
+    }
+    // Pre-validate pointers.
+    if let Err(e) = mem::guest_slice_mut(caller, addr_ptr, SOCKADDR_IN_SIZE as i64) {
+        return e;
+    }
+    if addrlen_ptr != 0 {
+        if let Err(e) = mem::guest_slice_mut(caller, addrlen_ptr, 4) {
+            return e;
+        }
+    }
+
+    // Snapshot the address we want to report.
+    let local_addr: std::net::SocketAddr = {
+        let fds = &caller.data().fds;
+        match fds.get(fd) {
+            Ok(Resource::Socket(s)) => match &s.bound {
+                Some(crate::fd::SockAddr::V4 { port, addr }) => {
+                    std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                        std::net::Ipv4Addr::from(*addr),
+                        *port,
+                    ))
+                }
+                Some(crate::fd::SockAddr::V6 { .. }) => {
+                    // IPv6 support is P2; report EINVAL for now.
+                    return -EINVAL;
+                }
+                None => match &s.peer_addr {
+                    // No bind yet — fall back to the peer's family so
+                    // getpeername callers can still read the response.
+                    Some(p) => *p,
+                    None => std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                        std::net::Ipv4Addr::new(0, 0, 0, 0),
+                        0,
+                    )),
+                },
+            },
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    };
+
+    if let Ok(buf) = mem::guest_slice_mut(caller, addr_ptr, SOCKADDR_IN_SIZE as i64) {
+        match local_addr {
+            std::net::SocketAddr::V4(v4) => {
+                let ip = v4.ip().octets();
+                let port = v4.port();
+                buf[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+                buf[2..4].copy_from_slice(&port.to_be_bytes());
+                buf[4..8].copy_from_slice(&ip);
+                for b in &mut buf[8..16] {
+                    *b = 0;
+                }
+            }
+            std::net::SocketAddr::V6(_) => return -EINVAL,
+        }
+    }
+    if addrlen_ptr != 0 {
+        if let Ok(buf) = mem::guest_slice_mut(caller, addrlen_ptr, 4) {
+            buf[0..4].copy_from_slice(&(16u32).to_le_bytes());
+        }
+    }
+    0
+}
+
+/// `getpeername(fd, addr_ptr, addrlen_ptr)` — write back the remote peer
+/// address (from `peer_addr`, set by `accept4` or `connect`).
+///
+/// Errors: `-EBADF`, `-ENOTCONN` if no peer is associated yet,
+/// `-EFAULT` on bad pointers.
+pub async fn getpeername(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let fd = match u32::try_from(a[0]) {
+        Ok(f) => f,
+        Err(_) => return -EBADF,
+    };
+    let addr_ptr = a[1];
+    let addrlen_ptr = a[2];
+
+    if addr_ptr == 0 {
+        return -crate::errno::EFAULT;
+    }
+    if let Err(e) = mem::guest_slice_mut(caller, addr_ptr, SOCKADDR_IN_SIZE as i64) {
+        return e;
+    }
+    if addrlen_ptr != 0 {
+        if let Err(e) = mem::guest_slice_mut(caller, addrlen_ptr, 4) {
+            return e;
+        }
+    }
+
+    let peer: std::net::SocketAddr = {
+        let fds = &caller.data().fds;
+        match fds.get(fd) {
+            Ok(Resource::Socket(s)) => match s.peer_addr {
+                Some(p) => p,
+                None => return -crate::errno::ENOTCONN,
+            },
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    };
+
+    if let Ok(buf) = mem::guest_slice_mut(caller, addr_ptr, SOCKADDR_IN_SIZE as i64) {
+        match peer {
+            std::net::SocketAddr::V4(v4) => {
+                let ip = v4.ip().octets();
+                let port = v4.port();
+                buf[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+                buf[2..4].copy_from_slice(&port.to_be_bytes());
+                buf[4..8].copy_from_slice(&ip);
+                for b in &mut buf[8..16] {
+                    *b = 0;
+                }
+            }
+            std::net::SocketAddr::V6(_) => return -EINVAL,
+        }
+    }
+    if addrlen_ptr != 0 {
+        if let Ok(buf) = mem::guest_slice_mut(caller, addrlen_ptr, 4) {
+            buf[0..4].copy_from_slice(&(16u32).to_le_bytes());
+        }
+    }
+    0
+}
+
+/// `shutdown(fd, how)` — half-close the connection. `how` is one of
+/// `SHUT_RD` (0), `SHUT_WR` (1), `SHUT_RDWR` (2).
+///
+/// Sets the corresponding bits on `SocketInner.shutdown_flags`. The actual
+/// effect on the underlying `TcpStream` is recorded so that subsequent
+/// `recvfrom`/`sendto` calls return EOF / -EPIPE / -EIO as appropriate.
+/// P1-6 doesn't actually splice the underlying stream — we just remember
+/// the intent; reads on a SHUT_RD socket return 0 (EOF), writes on
+/// SHUT_WR return -EPIPE.
+///
+/// Errors: `-EBADF`, `-EINVAL` for unknown `how`.
+pub async fn shutdown(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let fd = match u32::try_from(a[0]) {
+        Ok(f) => f,
+        Err(_) => return -EBADF,
+    };
+    let how = a[1] as i32;
+
+    let mask: u8 = match how {
+        SHUT_RD => 0b01,
+        SHUT_WR => 0b10,
+        SHUT_RDWR => 0b11,
+        _ => return -EINVAL,
+    };
+
+    let fds = &mut caller.data_mut().fds;
+    match fds.get_mut(fd) {
+        Ok(Resource::Socket(s)) => {
+            s.shutdown_flags |= mask;
+            // For an accepted/connected stream with SHUT_WR, call
+            // AsyncWriteExt::shutdown on the underlying TcpStream so the
+            // peer sees EOF. We take the stream out to call .await on it
+            // (the borrow checker doesn't let us hold `&mut s` while
+            // mutably borrowing the inner stream), then put it back.
+            if (mask & 0b10) != 0 {
+                let taken = s.stream.take();
+                if let Some(mut stream) = taken {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = stream.shutdown().await;
+                    // Don't restore — SHUT_WR makes future writes return
+                    // EPIPE; the stream is now half-closed.
+                    // Dropping `stream` here closes the write half.
                 }
             }
             0

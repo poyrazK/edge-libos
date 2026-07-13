@@ -69,9 +69,14 @@ int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
 #define NR_BIND 49
 #define NR_LISTEN 50
 #define NR_SETSOCKOPT 54
+#define NR_GETSOCKOPT 55
+#define NR_GETSOCKNAME 51
+#define NR_GETPEERNAME 52
+#define NR_SHUTDOWN 48
 #define NR_CONNECT 42
 #define NR_SENDTO 44
 #define NR_RECVFROM 45
+#define NR_POLL 7
 
 // Pass/fail markers. Placed at offset 4096 in linear memory. The runner
 // reads back the bytes at 4096 after the run.

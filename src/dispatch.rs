@@ -98,6 +98,13 @@ async fn dispatch(
         sys::socket::NR_SENDTO => sys::socket::sendto(&mut caller, a).await,
         sys::socket::NR_RECVFROM => sys::socket::recvfrom(&mut caller, a).await,
         sys::socket::NR_SETSOCKOPT => sys::socket::setsockopt(&mut caller, a).await,
+        sys::socket::NR_GETSOCKOPT => sys::socket::getsockopt(&mut caller, a).await,
+        sys::socket::NR_GETSOCKNAME => sys::socket::getsockname(&mut caller, a).await,
+        sys::socket::NR_GETPEERNAME => sys::socket::getpeername(&mut caller, a).await,
+        sys::socket::NR_SHUTDOWN => sys::socket::shutdown(&mut caller, a).await,
+
+        // poll(2) — P1-6 synchronous readiness scan.
+        sys::poll::NR_POLL => sys::poll::poll(&mut caller, a).await,
 
         // Identity (stubs)
         sys::identity::NR_GETUID => sys::identity::getuid(),
@@ -171,6 +178,12 @@ pub fn syscall_name(nr: u32) -> &'static str {
         sys::socket::NR_SENDTO => "sendto",
         sys::socket::NR_RECVFROM => "recvfrom",
         sys::socket::NR_SETSOCKOPT => "setsockopt",
+        sys::socket::NR_GETSOCKOPT => "getsockopt",
+        sys::socket::NR_GETSOCKNAME => "getsockname",
+        sys::socket::NR_GETPEERNAME => "getpeername",
+        sys::socket::NR_SHUTDOWN => "shutdown",
+
+        sys::poll::NR_POLL => "poll",
 
         sys::identity::NR_GETUID => "getuid",
         sys::identity::NR_GETEUID => "geteuid",

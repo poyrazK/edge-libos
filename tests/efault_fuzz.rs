@@ -350,6 +350,75 @@ fn fuzz_setsockopt_bad_optval_pointer() -> Result<()> {
     Ok(())
 }
 
+/// getsockopt(fd, level, optname, optval, optlen) — fd is fine but
+/// optval pointer is poisoned.
+#[test]
+fn fuzz_getsockopt_bad_optval_pointer() -> Result<()> {
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, CALLER_WAT)?;
+    for ptr in POISON_PTR {
+        let r = block_on(assert_efault_or_safe(
+            &engine, &linker, &module,
+            edge_libos::sys::socket::NR_GETSOCKOPT as i64,
+            [3 /*fd*/, 1 /*SOL_SOCKET*/, 4 /*SO_ERROR*/, *ptr, 4, 0],
+            "getsockopt",
+        ))?;
+        let _ = r;
+    }
+    Ok(())
+}
+
+/// getsockname(fd, addr, addrlen) — fd is fine but addr pointer is poisoned.
+#[test]
+fn fuzz_getsockname_bad_addr_pointer() -> Result<()> {
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, CALLER_WAT)?;
+    for ptr in POISON_PTR {
+        let r = block_on(assert_efault_or_safe(
+            &engine, &linker, &module,
+            edge_libos::sys::socket::NR_GETSOCKNAME as i64,
+            [3 /*fd*/, *ptr, 16, 0, 0, 0],
+            "getsockname",
+        ))?;
+        let _ = r;
+    }
+    Ok(())
+}
+
+/// getpeername(fd, addr, addrlen) — fd is fine but addr pointer is poisoned.
+#[test]
+fn fuzz_getpeername_bad_addr_pointer() -> Result<()> {
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, CALLER_WAT)?;
+    for ptr in POISON_PTR {
+        let r = block_on(assert_efault_or_safe(
+            &engine, &linker, &module,
+            edge_libos::sys::socket::NR_GETPEERNAME as i64,
+            [3 /*fd*/, *ptr, 16, 0, 0, 0],
+            "getpeername",
+        ))?;
+        let _ = r;
+    }
+    Ok(())
+}
+
+/// poll(fds, nfds, timeout) — fds pointer is poisoned.
+#[test]
+fn fuzz_poll_bad_fds_pointer() -> Result<()> {
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, CALLER_WAT)?;
+    for ptr in POISON_PTR {
+        let r = block_on(assert_efault_or_safe(
+            &engine, &linker, &module,
+            edge_libos::sys::poll::NR_POLL as i64,
+            [*ptr, 1, 0, 0, 0, 0],
+            "poll",
+        ))?;
+        let _ = r;
+    }
+    Ok(())
+}
+
 /// Brute-force overflow: pointer = i64::MAX/2, len = i64::MAX/2.
 #[test]
 fn fuzz_overflow_ptr_plus_len_every_pointer_syscall() -> Result<()> {
@@ -400,6 +469,14 @@ fn fuzz_overflow_ptr_plus_len_every_pointer_syscall() -> Result<()> {
          [3, huge, huge, 0, 0, 0]),
         (edge_libos::sys::socket::NR_SETSOCKOPT, "setsockopt",
          [3, 1, 2, huge, huge, 0]),
+        (edge_libos::sys::socket::NR_GETSOCKOPT, "getsockopt",
+         [3, 1, 4, huge, huge, 0]),
+        (edge_libos::sys::socket::NR_GETSOCKNAME, "getsockname",
+         [3, huge, huge, 0, 0, 0]),
+        (edge_libos::sys::socket::NR_GETPEERNAME, "getpeername",
+         [3, huge, huge, 0, 0, 0]),
+        (edge_libos::sys::poll::NR_POLL, "poll",
+         [huge, 1, 0, 0, 0, 0]),
     ];
     for (nr, name, args) in cases {
         let ret = block_on(assert_efault_or_safe(

@@ -790,6 +790,10 @@ async fn call_sendto_reuse(
     fd: i64,
     len: i64,
 ) -> Result<i64> {
+    // Re-attach this instance's memory so the kernel writes into OUR memory.
+    if let Some(mem) = instance.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
     let f = instance.get_typed_func::<(i64, i64), i64>(&mut *store, "go")?;
     Ok(f.call_async(&mut *store, (fd, len)).await?)
 }
@@ -819,6 +823,10 @@ async fn call_recvfrom_reuse(
     fd: i64,
     len: i64,
 ) -> Result<i64> {
+    // Re-attach this instance's memory so the kernel writes into OUR memory.
+    if let Some(mem) = instance.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
     let f = instance.get_typed_func::<(i64, i64), i64>(&mut *store, "go")?;
     Ok(f.call_async(&mut *store, (fd, len)).await?)
 }
@@ -1024,6 +1032,670 @@ fn sendto_then_recvfrom_roundtrips_over_loopback() -> Result<()> {
         // Clean up.
         let _ = call_close(&linker, &mut store, &close, accepted).await?;
         let _ = call_close(&linker, &mut store, &close, fd).await?;
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(())
+}
+// ---------------------------------------------------------------------------
+// P1-6: getsockopt(2) + getsockname(2) + getpeername(2) + shutdown(2) + poll(2)
+// ---------------------------------------------------------------------------
+
+/// `getsockopt(fd, level, optname, optval_ptr, optlen_ptr)` — reads a 4-byte
+/// i32 opt into the guest buffer.
+const GETSOCKOPT_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "go")
+        (param $fd i64) (param $level i64) (param $optname i64)
+        (result i64)
+        (call $syscall
+          (i64.const 55)             ;; NR_GETSOCKOPT
+          (local.get $fd)
+          (local.get $level)
+          (local.get $optname)
+          (i64.const 4096)           ;; optval ptr
+          (i64.const 4100)           ;; optlen ptr
+          (i64.const 0)))
+    )
+"#;
+
+/// `getsockname(fd, addr_ptr, addrlen_ptr)` — writes back 16-byte sockaddr.
+const GETSOCKNAME_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "go") (param $fd i64) (result i64)
+        (call $syscall
+          (i64.const 51)             ;; NR_GETSOCKNAME
+          (local.get $fd)
+          (i64.const 4096)
+          (i64.const 4112)           ;; addrlen ptr
+          (i64.const 0) (i64.const 0) (i64.const 0)))
+    )
+"#;
+
+/// `getpeername(fd, addr_ptr, addrlen_ptr)`.
+const GETPEERNAME_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "go") (param $fd i64) (result i64)
+        (call $syscall
+          (i64.const 52)             ;; NR_GETPEERNAME
+          (local.get $fd)
+          (i64.const 4096)
+          (i64.const 4112)
+          (i64.const 0) (i64.const 0) (i64.const 0)))
+    )
+"#;
+
+/// `shutdown(fd, how)` — how=0 (RD), 1 (WR), 2 (RDWR).
+const SHUTDOWN_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "go") (param $fd i64) (param $how i64) (result i64)
+        (call $syscall
+          (i64.const 48)             ;; NR_SHUTDOWN
+          (local.get $fd)
+          (local.get $how)
+          (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+    )
+"#;
+
+/// `poll(fds_ptr, nfds, timeout_ms)` — fds is an array of 8-byte pollfds.
+const POLL_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "go") (param $ptr i64) (param $nfds i64) (result i64)
+        (call $syscall
+          (i64.const 7)              ;; NR_POLL
+          (local.get $ptr)
+          (local.get $nfds)
+          (i64.const 0)
+          (i64.const 0) (i64.const 0) (i64.const 0)))
+    )
+"#;
+
+async fn call_getsockopt(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    module: &wasmtime::Module,
+    fd: i64,
+    level: i64,
+    optname: i64,
+) -> Result<i64> {
+    let inst = linker.instantiate_async(&mut *store, module).await?;
+    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = inst.get_typed_func::<(i64, i64, i64), i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, (fd, level, optname)).await?)
+}
+
+async fn call_getsockopt_reuse(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    instance: &wasmtime::Instance,
+    fd: i64,
+    level: i64,
+    optname: i64,
+) -> Result<i64> {
+    if let Some(mem) = instance.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = instance.get_typed_func::<(i64, i64, i64), i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, (fd, level, optname)).await?)
+}
+
+async fn call_getsockname(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    module: &wasmtime::Module,
+    fd: i64,
+) -> Result<i64> {
+    let inst = linker.instantiate_async(&mut *store, module).await?;
+    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = inst.get_typed_func::<i64, i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, fd).await?)
+}
+
+async fn call_getsockname_reuse(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    instance: &wasmtime::Instance,
+    fd: i64,
+) -> Result<i64> {
+    if let Some(mem) = instance.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = instance.get_typed_func::<i64, i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, fd).await?)
+}
+
+async fn call_getpeername(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    module: &wasmtime::Module,
+    fd: i64,
+) -> Result<i64> {
+    let inst = linker.instantiate_async(&mut *store, module).await?;
+    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = inst.get_typed_func::<i64, i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, fd).await?)
+}
+
+async fn call_getpeername_reuse(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    instance: &wasmtime::Instance,
+    fd: i64,
+) -> Result<i64> {
+    if let Some(mem) = instance.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = instance.get_typed_func::<i64, i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, fd).await?)
+}
+
+async fn call_shutdown(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    module: &wasmtime::Module,
+    fd: i64,
+    how: i64,
+) -> Result<i64> {
+    let inst = linker.instantiate_async(&mut *store, module).await?;
+    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = inst.get_typed_func::<(i64, i64), i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, (fd, how)).await?)
+}
+
+async fn call_poll(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    module: &wasmtime::Module,
+    ptr: i64,
+    nfds: i64,
+) -> Result<i64> {
+    let inst = linker.instantiate_async(&mut *store, module).await?;
+    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = inst.get_typed_func::<(i64, i64), i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, (ptr, nfds)).await?)
+}
+
+async fn call_poll_reuse(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    instance: &wasmtime::Instance,
+    ptr: i64,
+    nfds: i64,
+) -> Result<i64> {
+    if let Some(mem) = instance.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = instance.get_typed_func::<(i64, i64), i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, (ptr, nfds)).await?)
+}
+
+/// `getsockopt(SO_TYPE)` on a stream socket returns 1.
+/// `getsockopt(SO_DOMAIN)` returns 2 (AF_INET).
+#[test]
+fn getsockopt_so_type_and_domain() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let sock = common::compile_wat(&engine, SOCKET_WAT)?;
+    let gs = common::compile_wat(&engine, GETSOCKOPT_WAT)?;
+
+    block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let fd = call_socket(&linker, &mut store, &sock, 2, 1).await?;
+        // Reuse one instance so we can read back the optval bytes.
+        let inst = linker.instantiate_async(&mut store, &gs).await?;
+        if let Some(mem) = inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let rc = call_getsockopt_reuse(&linker, &mut store, &inst, fd, 1, 3).await?;
+        assert_eq!(rc, 0, "getsockopt rc");
+        let gs_mem = inst.get_memory(&mut store, "memory")
+            .ok_or_else(|| anyhow::anyhow!("no inst memory"))?;
+        let mut got = [0u8; 4];
+        gs_mem.read(&mut store, 4096, &mut got)?;
+        assert_eq!(i32::from_le_bytes(got), 1, "SO_TYPE should be 1 (SOCK_STREAM)");
+
+        let rc = call_getsockopt_reuse(&linker, &mut store, &inst, fd, 1, 39).await?;
+        assert_eq!(rc, 0);
+        gs_mem.read(&mut store, 4096, &mut got)?;
+        assert_eq!(i32::from_le_bytes(got), 2, "SO_DOMAIN should be 2 (AF_INET)");
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// `getsockopt(SO_ERROR)` on a fresh socket returns 0; after a failed
+/// `connect` to port 1, getsockopt(SO_ERROR) returns the recorded errno.
+#[test]
+fn getsockopt_so_error_records_connect_failure() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let sock = common::compile_wat(&engine, SOCKET_WAT)?;
+    let gs = common::compile_wat(&engine, GETSOCKOPT_WAT)?;
+    let conn = common::compile_wat(&engine, CONNECT_WAT)?;
+
+    // Patch CONNECT_WAT to use port 1 (almost certainly closed).
+    let conn_p1 = format!(r#"
+        (module
+          (import "kernel" "syscall"
+            (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+          (memory (export "memory") 1)
+          (data (i32.const 4096)
+            "\02\00"
+            "\00\01"
+            "\7f\00\00\01"
+            "\00\00\00\00\00\00\00\00")
+          (func (export "go") (param $fd i64) (result i64)
+            (call $syscall
+              (i64.const 42)
+              (local.get $fd)
+              (i64.const 4096)
+              (i64.const 16)
+              (i64.const 0) (i64.const 0) (i64.const 0))))
+    "#);
+    let conn_p1 = common::compile_wat(&engine, &conn_p1)?;
+
+    block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let fd = call_socket(&linker, &mut store, &sock, 2, 1).await?;
+        let gs_inst = linker.instantiate_async(&mut store, &gs).await?;
+        if let Some(mem) = gs_inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+
+        // SO_ERROR on a fresh socket = 0.
+        let rc = call_getsockopt_reuse(&linker, &mut store, &gs_inst, fd, 1, 4).await?;
+        assert_eq!(rc, 0);
+        let gs_mem = gs_inst.get_memory(&mut store, "memory")
+            .ok_or_else(|| anyhow::anyhow!("no gs_inst memory"))?;
+        let mut got = [0u8; 4];
+        gs_mem.read(&mut store, 4096, &mut got)?;
+        assert_eq!(i32::from_le_bytes(got), 0, "fresh socket SO_ERROR == 0");
+
+        // Connect to a closed port — should fail and record the error.
+        let _ = call_connect(&linker, &mut store, &conn_p1, fd).await?;
+        // Read SO_ERROR now.
+        let rc = call_getsockopt_reuse(&linker, &mut store, &gs_inst, fd, 1, 4).await?;
+        assert_eq!(rc, 0);
+        let gs_mem = gs_inst.get_memory(&mut store, "memory")
+            .ok_or_else(|| anyhow::anyhow!("no gs_inst memory"))?;
+        gs_mem.read(&mut store, 4096, &mut got)?;
+        let err = i32::from_le_bytes(got);
+        assert!(err != 0, "SO_ERROR after failed connect should be non-zero, got {err}");
+        // Most likely ECONNREFUSED=111, ETIMEDOUT=110, or EIO=5.
+        assert!(
+            err == 111 || err == 110 || err == 5,
+            "unexpected SO_ERROR value {err}"
+        );
+
+        // Re-read SO_ERROR — should be cleared to 0.
+        let rc = call_getsockopt_reuse(&linker, &mut store, &gs_inst, fd, 1, 4).await?;
+        assert_eq!(rc, 0);
+        gs_mem.read(&mut store, 4096, &mut got)?;
+        assert_eq!(i32::from_le_bytes(got), 0, "SO_ERROR should clear after read");
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// `getsockname(fd)` after `bind(127.0.0.1:8080)` writes back AF_INET,
+/// port 8080, addr 127.0.0.1.
+#[test]
+fn getsockname_after_bind_returns_loopback() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let sock = common::compile_wat(&engine, SOCKET_WAT)?;
+    let bind = common::compile_wat(&engine, BIND_WAT)?;
+    let gs = common::compile_wat(&engine, GETSOCKNAME_WAT)?;
+
+    block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let fd = call_socket(&linker, &mut store, &sock, 2, 1).await?;
+        let _ = call_bind(&linker, &mut store, &bind, fd).await?;
+
+        let inst = linker.instantiate_async(&mut store, &gs).await?;
+        if let Some(mem) = inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let rc = call_getsockname_reuse(&linker, &mut store, &inst, fd).await?;
+        assert_eq!(rc, 0, "getsockname rc");
+
+        let gs_mem = inst.get_memory(&mut store, "memory")
+            .ok_or_else(|| anyhow::anyhow!("no inst memory"))?;
+        let mut got = [0u8; 16];
+        gs_mem.read(&mut store, 4096, &mut got)?;
+        assert_eq!(u16::from_le_bytes([got[0], got[1]]), 2, "family == AF_INET");
+        assert_eq!(u16::from_be_bytes([got[2], got[3]]), 8080, "port == 8080");
+        assert_eq!(&got[4..8], &[127, 0, 0, 1], "addr == 127.0.0.1");
+
+        let mut addrlen = [0u8; 4];
+        gs_mem.read(&mut store, 4112, &mut addrlen)?;
+        assert_eq!(i32::from_le_bytes(addrlen), 16, "addrlen == 16");
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// `getpeername(fd)` without prior connect/accept returns -ENOTCONN.
+#[test]
+fn getpeername_on_unbound_socket_returns_enotconn() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let sock = common::compile_wat(&engine, SOCKET_WAT)?;
+    let gp = common::compile_wat(&engine, GETPEERNAME_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let fd = call_socket(&linker, &mut store, &sock, 2, 1).await?;
+        call_getpeername(&linker, &mut store, &gp, fd).await
+    })?;
+    assert_eq!(ret, -edge_libos::errno::ENOTCONN);
+    Ok(())
+}
+
+/// `shutdown(SHUT_RD)` then `recvfrom` returns 0 (EOF).
+#[test]
+fn shutdown_rd_then_recvfrom_returns_eof() -> Result<()> {
+    let _d = TmpDir::new();
+    let host_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let port = host_listener.local_addr()?.port();
+    drop(host_listener);
+
+    let (engine, linker) = common::engine_and_linker()?;
+    let sock = common::compile_wat(&engine, SOCKET_WAT)?;
+    let bind = common::compile_wat(&engine, BIND_WAT)?;
+    let listen = common::compile_wat(&engine, LISTEN_WAT)?;
+    let acc = common::compile_wat(&engine, ACCEPT4_WAT)?;
+    let sd = common::compile_wat(&engine, SHUTDOWN_WAT)?;
+    let recv = common::compile_wat(&engine, RECVFROM_WAT)?;
+    let close = common::compile_wat(&engine, CLOSE_WAT)?;
+
+    // Patch BIND_WAT for the dynamic port.
+    let port_be = port.to_be_bytes();
+    let bind_wat = format!(r#"
+        (module
+          (import "kernel" "syscall"
+            (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+          (memory (export "memory") 1)
+          (data (i32.const 4096)
+            "\02\00PATCH_PORT\7f\00\00\01"
+            "\00\00\00\00\00\00\00\00")
+          (func (export "go") (param $fd i64) (result i64)
+            (call $syscall
+              (i64.const 49)
+              (local.get $fd)
+              (i64.const 4096)
+              (i64.const 16)
+              (i64.const 0) (i64.const 0) (i64.const 0))))
+    "#);
+    let bind_wat = bind_wat.replace(
+        "PATCH_PORT",
+        &format!("\\{:02x}\\{:02x}", port_be[0], port_be[1]),
+    );
+    let bind_for_port = common::compile_wat(&engine, &bind_wat)?;
+
+    block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let fd = call_socket(&linker, &mut store, &sock, 2, 1).await?;
+        let _ = call_bind(&linker, &mut store, &bind_for_port, fd).await?;
+        let _ = call_listen(&linker, &mut store, &listen, fd, 1).await?;
+
+        // Host connect race against kernel accept4.
+        let connect_fut = async move {
+            for _ in 0..20 {
+                match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                    Ok(s) => return Ok(s),
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                }
+            }
+            Err(anyhow::anyhow!("host connect never succeeded"))
+        };
+        let accept_fut = call_accept4(&linker, &mut store, &acc, fd, 0);
+        let (host_res, accepted_res) = tokio::join!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), connect_fut),
+            tokio::time::timeout(std::time::Duration::from_secs(3), accept_fut),
+        );
+        let _host_stream = host_res
+            .map_err(|_| anyhow::anyhow!("host connect timed out"))?
+            .map_err(|e| anyhow::anyhow!("host connect failed: {e}"))?;
+        let accepted = accepted_res
+            .map_err(|_| anyhow::anyhow!("guest accept4 timed out"))??;
+        assert!(accepted >= 3, "accept4 returned {accepted}");
+
+        // shutdown(SHUT_RD) → 0.
+        let sd_ret = call_shutdown(&linker, &mut store, &sd, accepted, 0).await?;
+        assert_eq!(sd_ret, 0, "shutdown(SHUT_RD) should return 0");
+
+        // Now recvfrom should return 0 (EOF) without waiting for data.
+        let recv_inst = linker.instantiate_async(&mut store, &recv).await?;
+        if let Some(mem) = recv_inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let n = call_recvfrom_reuse(&linker, &mut store, &recv_inst, accepted, 16).await?;
+        assert_eq!(n, 0, "recvfrom after SHUT_RD should return 0 (EOF), got {n}");
+
+        let _ = call_close(&linker, &mut store, &close, accepted).await?;
+        let _ = call_close(&linker, &mut store, &close, fd).await?;
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// `shutdown(SHUT_WR)` then `sendto` returns -EPIPE.
+#[test]
+fn shutdown_wr_then_sendto_returns_epipe() -> Result<()> {
+    let _d = TmpDir::new();
+    let host_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let port = host_listener.local_addr()?.port();
+    drop(host_listener);
+
+    let (engine, linker) = common::engine_and_linker()?;
+    let sock = common::compile_wat(&engine, SOCKET_WAT)?;
+    let bind = common::compile_wat(&engine, BIND_WAT)?;
+    let listen = common::compile_wat(&engine, LISTEN_WAT)?;
+    let acc = common::compile_wat(&engine, ACCEPT4_WAT)?;
+    let sd = common::compile_wat(&engine, SHUTDOWN_WAT)?;
+    let sendto = common::compile_wat(&engine, SENDTO_WAT)?;
+    let close = common::compile_wat(&engine, CLOSE_WAT)?;
+
+    let port_be = port.to_be_bytes();
+    let bind_wat = format!(r#"
+        (module
+          (import "kernel" "syscall"
+            (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+          (memory (export "memory") 1)
+          (data (i32.const 4096)
+            "\02\00PATCH_PORT\7f\00\00\01"
+            "\00\00\00\00\00\00\00\00")
+          (func (export "go") (param $fd i64) (result i64)
+            (call $syscall
+              (i64.const 49)
+              (local.get $fd)
+              (i64.const 4096)
+              (i64.const 16)
+              (i64.const 0) (i64.const 0) (i64.const 0))))
+    "#);
+    let bind_wat = bind_wat.replace(
+        "PATCH_PORT",
+        &format!("\\{:02x}\\{:02x}", port_be[0], port_be[1]),
+    );
+    let bind_for_port = common::compile_wat(&engine, &bind_wat)?;
+
+    block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let fd = call_socket(&linker, &mut store, &sock, 2, 1).await?;
+        let _ = call_bind(&linker, &mut store, &bind_for_port, fd).await?;
+        let _ = call_listen(&linker, &mut store, &listen, fd, 1).await?;
+
+        let connect_fut = async move {
+            for _ in 0..20 {
+                match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                    Ok(s) => return Ok(s),
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                }
+            }
+            Err(anyhow::anyhow!("host connect never succeeded"))
+        };
+        let accept_fut = call_accept4(&linker, &mut store, &acc, fd, 0);
+        let (host_res, accepted_res) = tokio::join!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), connect_fut),
+            tokio::time::timeout(std::time::Duration::from_secs(3), accept_fut),
+        );
+        let _host_stream = host_res
+            .map_err(|_| anyhow::anyhow!("host connect timed out"))?
+            .map_err(|e| anyhow::anyhow!("host connect failed: {e}"))?;
+        let accepted = accepted_res
+            .map_err(|_| anyhow::anyhow!("guest accept4 timed out"))??;
+
+        let sd_ret = call_shutdown(&linker, &mut store, &sd, accepted, 1).await?;
+        assert_eq!(sd_ret, 0, "shutdown(SHUT_WR) should return 0");
+
+        // sendto → -EPIPE.
+        let send_inst = linker.instantiate_async(&mut store, &sendto).await?;
+        if let Some(mem) = send_inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let mem = store.data().memory.ok_or_else(|| anyhow::anyhow!("no memory"))?;
+        mem.write(&mut store, 4096, b"hello")?;
+        let n = call_sendto_reuse(&linker, &mut store, &send_inst, accepted, 5).await?;
+        assert_eq!(n, -edge_libos::errno::EPIPE, "sendto after SHUT_WR should return -EPIPE");
+
+        let _ = call_close(&linker, &mut store, &close, accepted).await?;
+        let _ = call_close(&linker, &mut store, &close, fd).await?;
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// `shutdown(99)` (bad `how`) returns -EINVAL.
+#[test]
+fn shutdown_invalid_how_returns_einval() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let sock = common::compile_wat(&engine, SOCKET_WAT)?;
+    let sd = common::compile_wat(&engine, SHUTDOWN_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let fd = call_socket(&linker, &mut store, &sock, 2, 1).await?;
+        call_shutdown(&linker, &mut store, &sd, fd, 99).await
+    })?;
+    assert_eq!(ret, -edge_libos::errno::EINVAL);
+    Ok(())
+}
+
+/// `poll` on an empty pollfd list (nfds=0) returns 0.
+#[test]
+fn poll_empty_returns_zero() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let poll = common::compile_wat(&engine, POLL_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        call_poll(&linker, &mut store, &poll, 4096, 0).await
+    })?;
+    assert_eq!(ret, 0, "poll with nfds=0 should return 0");
+    Ok(())
+}
+
+/// `poll` on a known-bad fd reports POLLNVAL in revents.
+#[test]
+fn poll_unknown_fd_marks_pollnval() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let poll = common::compile_wat(&engine, POLL_WAT)?;
+
+    block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let inst = linker.instantiate_async(&mut store, &poll).await?;
+        if let Some(mem) = inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        // Write a single pollfd at offset 4096: fd=9999, events=POLLIN, revents=0.
+        let mem = store.data().memory.ok_or_else(|| anyhow::anyhow!("no memory"))?;
+        let mut entry = [0u8; 8];
+        entry[0..4].copy_from_slice(&9999u32.to_le_bytes());
+        entry[4..6].copy_from_slice(&1u16.to_le_bytes()); // POLLIN
+        mem.write(&mut store, 4096, &entry)?;
+        let rc = call_poll_reuse(&linker, &mut store, &inst, 4096, 1).await?;
+        assert!(rc >= 1, "poll on unknown fd should report >=1 ready");
+        let poll_mem = inst.get_memory(&mut store, "memory")
+            .ok_or_else(|| anyhow::anyhow!("no inst memory"))?;
+        let mut got = [0u8; 8];
+        poll_mem.read(&mut store, 4096, &mut got)?;
+        let revents = u16::from_le_bytes([got[6], got[7]]);
+        assert_eq!(revents & 0x0020, 0x0020, "revents should include POLLNVAL");
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// `poll` on a ready pipe read end (with bytes in buffer) reports POLLIN.
+#[test]
+fn poll_ready_pipe_marks_pollin() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+
+    // Build a Kernel with a known pipe fds. We can't easily inject pipe2
+    // from WAT and observe the same fd through `linker`, so we manipulate
+    // `store.data().fds` directly. Insert a PipeRead preloaded with a byte.
+    let poll = common::compile_wat(&engine, POLL_WAT)?;
+
+    block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        use std::collections::VecDeque;
+        use std::sync::Arc;
+        use parking_lot::Mutex;
+        let buf = Arc::new(Mutex::new(VecDeque::from(vec![b'x'])));
+        let closed = Arc::new(Mutex::new(false));
+        let nonblock = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pr = edge_libos::fd::PipeRead {
+            buf: buf.clone(),
+            closed: closed.clone(),
+            nonblock: nonblock.clone(),
+        };
+        let pipe_fd = store.data_mut().fds.insert(Resource::PipeRead(pr));
+        let inst = linker.instantiate_async(&mut store, &poll).await?;
+        if let Some(mem) = inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+        let mem = store.data().memory.ok_or_else(|| anyhow::anyhow!("no memory"))?;
+        let mut entry = [0u8; 8];
+        entry[0..4].copy_from_slice(&(pipe_fd).to_le_bytes());
+        entry[4..6].copy_from_slice(&1u16.to_le_bytes()); // POLLIN
+        mem.write(&mut store, 4096, &entry)?;
+        let rc = call_poll_reuse(&linker, &mut store, &inst, 4096, 1).await?;
+        assert_eq!(rc, 1, "ready pipe should report 1 fd with revents");
+        let poll_mem = inst.get_memory(&mut store, "memory")
+            .ok_or_else(|| anyhow::anyhow!("no inst memory"))?;
+        let mut got = [0u8; 8];
+        poll_mem.read(&mut store, 4096, &mut got)?;
+        let revents = u16::from_le_bytes([got[6], got[7]]);
+        assert_eq!(revents & 0x0001, 0x0001, "revents should include POLLIN");
         Ok::<_, anyhow::Error>(())
     })?;
     Ok(())

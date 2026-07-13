@@ -62,6 +62,10 @@ expected_syscall() {
         bind)              echo "bind" ;;
         listen)            echo "listen" ;;
         setsockopt)        echo "setsockopt" ;;
+        getsockopt)        echo "getsockopt" ;;
+        getsockname)       echo "getsockname" ;;
+        shutdown)          echo "shutdown" ;;
+        poll)              echo "poll" ;;
         fcntl_nonblock)    echo "pipe2" ;;
         connect)           echo "connect" ;;
         open)              echo "open" ;;

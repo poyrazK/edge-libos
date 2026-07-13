@@ -8,7 +8,7 @@
 //! eventually Socket/Epoll in P1).
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -169,6 +169,19 @@ pub struct SocketInner {
     /// `accept4`, used by `recvfrom`/`sendto`/`close` (P1-5) and by
     /// `epoll_wait` (P1-7).
     pub stream: Option<TcpStream>,
+    /// P1-6: peer's `SocketAddr` as observed by the kernel. Set by
+    /// `accept4` (peer = host connect) and `connect` (peer = listener addr).
+    /// Read by `getpeername` to write back into the guest.
+    pub peer_addr: Option<std::net::SocketAddr>,
+    /// P1-6: last error from async connect, read by `getsockopt(SO_ERROR)`.
+    /// 0 means "no pending error". Linux clears the error after read.
+    pub last_error: AtomicI32,
+    /// P1-6: shutdown flags — bit 0 = SHUT_RD, bit 1 = SHUT_WR.
+    /// Once set, reads/writes on the underlying stream return EOF/EPIPE.
+    pub shutdown_flags: u8,
+    /// P1-6: is this socket a listener? Set on first `accept4` materialization.
+    /// Surfaced via `getsockopt(SO_ACCEPTCONN)`.
+    pub is_acceptor: bool,
 }
 
 impl SocketInner {
@@ -183,6 +196,10 @@ impl SocketInner {
             tcp_nodelay: false,
             listener: None,
             stream: None,
+            peer_addr: None,
+            last_error: AtomicI32::new(0),
+            shutdown_flags: 0,
+            is_acceptor: false,
         }
     }
 
@@ -198,6 +215,15 @@ impl SocketInner {
         let mut s = Self::new(kind, nonblock);
         s.stream = Some(stream);
         s
+    }
+
+    /// P1-6: family inferred from `bound` (or AF_INET if unknown).
+    pub fn family(&self) -> i32 {
+        match self.bound {
+            Some(SockAddr::V4 { .. }) => 2,    // AF_INET
+            Some(SockAddr::V6 { .. }) => 10,   // AF_INET6
+            None => 2,                          // default AF_INET for unbound
+        }
     }
 }
 
