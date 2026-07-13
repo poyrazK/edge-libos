@@ -89,6 +89,10 @@ expected_syscall() {
         rmdir)             echo "rmdir" ;;
         unlink)            echo "unlink" ;;
         unlinkat)          echo "unlinkat" ;;
+        rename)            echo "rename" ;;
+        renameat2_noreplace) echo "renameat2" ;;
+        ftruncate)         echo "ftruncate" ;;
+        truncate)          echo "truncate" ;;
         lstat)             echo "lstat" ;;
         getcwd)            echo "getcwd" ;;
         readv)             echo "readv" ;;

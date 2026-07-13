@@ -55,6 +55,18 @@ pub const NR_UNLINKAT: u32 = 263;
 // removes a non-directory). Matches `linux/fcntl.h`.
 pub const AT_REMOVEDIR: i32 = 0x200;
 
+// P2-C1 part 2: rename / renameat / renameat2 / ftruncate / truncate.
+pub const NR_RENAME: u32 = 82;
+pub const NR_RENAMEAT: u32 = 264;
+pub const NR_RENAMEAT2: u32 = 316;
+pub const NR_TRUNCATE: u32 = 76;
+pub const NR_FTRUNCATE: u32 = 77;
+
+// renameat2(2) flags (linux/fs.h).
+pub const RENAME_NOREPLACE: i32 = 0x1;
+pub const RENAME_EXCHANGE: i32 = 0x2;
+pub const RENAME_WHITEOUT: i32 = 0x4;
+
 /// Map a `std::io::Error` to a positive errno. Mirrors the helper in
 /// `vfs.rs` — kept local here so `sys/file.rs` doesn't depend on
 /// `vfs`'s private internals. Returns the errno as a positive i64.
@@ -1189,6 +1201,147 @@ pub async fn unlinkat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         std::fs::remove_file(&abs)
     };
     match result {
+        Ok(()) => 0,
+        Err(e) => -io_to_errno(e),
+    }
+}
+
+/// `rename(oldpath, newpath)` — atomically rename (move) a file or
+/// directory. Thin wrapper over `renameat(AT_FDCWD, old, AT_FDCWD, new, 0)`.
+pub async fn rename(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    renameat(caller, [-100, a[0], -100, a[1], 0, 0]).await
+}
+
+/// `renameat(olddirfd, oldpath, newdirfd, newpath, flags=0)` — rename
+/// with explicit dirfds. Honors:
+/// * `flags == 0`               → plain rename (std::fs::rename).
+/// * `RENAME_NOREPLACE (0x1)`   → -EEXIST if newpath already exists.
+/// * `RENAME_EXCHANGE (0x2)`    → atomic swap (POSIX rename supports it
+///                                on Linux; std::fs::rename maps to it).
+/// * `RENAME_WHITEOUT (0x4)`    → -EINVAL (not modeled; overlayfs only).
+/// * other bits                 → -EINVAL.
+pub async fn renameat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let olddirfd = a[0];
+    let old_ptr = a[1];
+    let newdirfd = a[2];
+    let new_ptr = a[3];
+    let flags = a[4] as i32;
+
+    let old = match mem::guest_str(caller, old_ptr, 4096) {
+        Ok(s) => s.to_string(),
+        Err(e) => return e,
+    };
+    let new = match mem::guest_str(caller, new_ptr, 4096) {
+        Ok(s) => s.to_string(),
+        Err(e) => return e,
+    };
+    if old.is_empty() || new.is_empty() {
+        return -crate::errno::ENOENT;
+    }
+
+    let old_abs = match crate::sys::path::resolve(caller, olddirfd, &old) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let new_abs = match crate::sys::path::resolve(caller, newdirfd, &new) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    // Reject unknown flag combinations up front. RENAME_WHITEOUT is the
+    // only recognized bit we don't model.
+    let known = RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT;
+    if flags & !known != 0 {
+        return -crate::errno::EINVAL;
+    }
+    if flags & RENAME_WHITEOUT != 0 {
+        return -crate::errno::EINVAL;
+    }
+
+    // RENAME_NOREPLACE: if newpath already exists, -EEXIST.
+    if flags & RENAME_NOREPLACE != 0 && std::fs::metadata(&new_abs).is_ok() {
+        return -crate::errno::EEXIST;
+    }
+
+    match std::fs::rename(&old_abs, &new_abs) {
+        Ok(()) => 0,
+        Err(e) => -io_to_errno(e),
+    }
+}
+
+/// `renameat2(olddirfd, oldpath, newdirfd, newpath, flags)` — same as
+/// `renameat` but with full flag support. Currently a thin shim.
+pub async fn renameat2(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    renameat(caller, a).await
+}
+
+/// `truncate(path, len)` — set the length of the file at `path`. If the
+/// file is shorter, it's extended (zero-filled); if longer, it's
+/// truncated. Creates the file if it doesn't exist (matches std::fs
+/// `OpenOptions::create`).
+pub async fn truncate(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let path_ptr = a[0];
+    let len_raw = a[1];
+
+    let path = match mem::guest_str(caller, path_ptr, 4096) {
+        Ok(s) => s.to_string(),
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return -crate::errno::ENOENT;
+    }
+    let len: u64 = match len_raw {
+        n if n < 0 => return -crate::errno::EINVAL,
+        n => n as u64,
+    };
+
+    let abs = match crate::sys::path::resolve(caller, -100, &path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&abs)
+        .and_then(|f| f.set_len(len))
+    {
+        Ok(()) => 0,
+        Err(e) => -io_to_errno(e),
+    }
+}
+
+/// `ftruncate(fd, len)` — set the length of the open file at `fd`.
+/// Per B5 lock discipline: we hold `Resource::File` (Arc<Mutex<FilePos>>),
+/// take a `try_clone` of the inner `std::fs::File` under a brief lock,
+/// drop the guard, then call the sync `set_len` on the clone (no .await).
+pub async fn ftruncate(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let fd = match u32::try_from(a[0]) {
+        Ok(f) => f,
+        Err(_) => return -crate::errno::EBADF,
+    };
+    let len_raw = a[1];
+    let len: u64 = match len_raw {
+        n if n < 0 => return -crate::errno::EINVAL,
+        n => n as u64,
+    };
+
+    let file_clone = {
+        let fds = &mut caller.data_mut().fds;
+        match fds.get_mut(fd) {
+            Ok(Resource::File(fp)) => {
+                let fp = fp.lock();
+                match fp.inner.try_clone() {
+                    Ok(f) => f,
+                    Err(e) => return -io_to_errno(e),
+                }
+            }
+            Ok(_) => return -crate::errno::EBADF,
+            Err(e) => return e,
+        }
+    };
+    // No await past this point — set_len is sync.
+    match file_clone.set_len(len) {
         Ok(()) => 0,
         Err(e) => -io_to_errno(e),
     }

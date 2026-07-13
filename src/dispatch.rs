@@ -164,6 +164,12 @@ pub async fn dispatch(
         sys::file::NR_RMDIR => sys::file::rmdir(&mut caller, a).await,
         sys::file::NR_UNLINK => sys::file::unlink(&mut caller, a).await,
         sys::file::NR_UNLINKAT => sys::file::unlinkat(&mut caller, a).await,
+        // P2-C1 part 2: rename / renameat / renameat2 / truncate / ftruncate.
+        sys::file::NR_RENAME => sys::file::rename(&mut caller, a).await,
+        sys::file::NR_RENAMEAT => sys::file::renameat(&mut caller, a).await,
+        sys::file::NR_RENAMEAT2 => sys::file::renameat2(&mut caller, a).await,
+        sys::file::NR_TRUNCATE => sys::file::truncate(&mut caller, a).await,
+        sys::file::NR_FTRUNCATE => sys::file::ftruncate(&mut caller, a).await,
 
         // Sockets (P1-1: socket only; bind/listen/accept/connect/recv/send
         // land in later sub-steps).
@@ -261,6 +267,11 @@ pub fn syscall_name(nr: u32) -> &'static str {
         sys::file::NR_RMDIR => "rmdir",
         sys::file::NR_UNLINK => "unlink",
         sys::file::NR_UNLINKAT => "unlinkat",
+        sys::file::NR_RENAME => "rename",
+        sys::file::NR_RENAMEAT => "renameat",
+        sys::file::NR_RENAMEAT2 => "renameat2",
+        sys::file::NR_TRUNCATE => "truncate",
+        sys::file::NR_FTRUNCATE => "ftruncate",
 
         sys::socket::NR_SOCKET => "socket",
         sys::socket::NR_BIND => "bind",

@@ -100,6 +100,13 @@ int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
 #define NR_MKDIRAT 258
 #define NR_UNLINKAT 263
 
+// P2-C1 part 2: rename / renameat / renameat2 / truncate / ftruncate.
+#define NR_RENAME 82
+#define NR_RENAMEAT 264
+#define NR_RENAMEAT2 316
+#define NR_TRUNCATE 76
+#define NR_FTRUNCATE 77
+
 // Standard *at() dirfd values. AT_FDCWD = -100 means "use cwd".
 #define AT_FDCWD (-100)
 
