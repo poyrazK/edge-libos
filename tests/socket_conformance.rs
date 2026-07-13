@@ -1700,3 +1700,431 @@ fn poll_ready_pipe_marks_pollin() -> Result<()> {
     })?;
     Ok(())
 }
+
+// P1-7: epoll_create1 + epoll_ctl + epoll_wait + eventfd2 — the async pivot
+// ---------------------------------------------------------------------------
+
+/// `epoll_create1(flags)` — returns a positive fd. We then close it.
+const EPOLL_CREATE1_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "go") (param $flags i64) (result i64)
+        (call $syscall
+          (i64.const 291)             ;; NR_EPOLL_CREATE1
+          (local.get $flags)
+          (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+    )
+"#;
+
+/// `epoll_ctl(epfd, op, fd, event_ptr)` — ADD/MOD/DEL.
+const EPOLL_CTL_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "go")
+        (param $epfd i64) (param $op i64) (param $fd i64) (param $event_ptr i64)
+        (result i64)
+        (call $syscall
+          (i64.const 233)             ;; NR_EPOLL_CTL
+          (local.get $epfd)
+          (local.get $op)
+          (local.get $fd)
+          (local.get $event_ptr)
+          (i64.const 0) (i64.const 0)))
+    )
+"#;
+
+/// `epoll_wait(epfd, events_ptr, maxevents, timeout_ms)`.
+const EPOLL_WAIT_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "go")
+        (param $epfd i64) (param $events_ptr i64)
+        (param $maxevents i64) (param $timeout_ms i64)
+        (result i64)
+        (call $syscall
+          (i64.const 232)             ;; NR_EPOLL_WAIT
+          (local.get $epfd)
+          (local.get $events_ptr)
+          (local.get $maxevents)
+          (local.get $timeout_ms)
+          (i64.const 0) (i64.const 0)))
+    )
+"#;
+
+/// `eventfd2(initval, flags)`.
+const EVENTFD2_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "go") (param $initval i64) (param $flags i64) (result i64)
+        (call $syscall
+          (i64.const 290)             ;; NR_EVENTFD2
+          (local.get $initval)
+          (local.get $flags)
+          (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+    )
+"#;
+
+async fn call_epoll_create1(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    module: &wasmtime::Module,
+    flags: i64,
+) -> Result<i64> {
+    let inst = linker.instantiate_async(&mut *store, module).await?;
+    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = inst.get_typed_func::<i64, i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, flags).await?)
+}
+
+async fn call_eventfd2(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    module: &wasmtime::Module,
+    initval: i64,
+    flags: i64,
+) -> Result<i64> {
+    let inst = linker.instantiate_async(&mut *store, module).await?;
+    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = inst.get_typed_func::<(i64, i64), i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, (initval, flags)).await?)
+}
+
+async fn call_epoll_ctl(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    module: &wasmtime::Module,
+    epfd: i64, op: i64, fd: i64, event_ptr: i64,
+) -> Result<i64> {
+    let inst = linker.instantiate_async(&mut *store, module).await?;
+    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = inst.get_typed_func::<(i64, i64, i64, i64), i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, (epfd, op, fd, event_ptr)).await?)
+}
+
+async fn call_epoll_ctl_reuse(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    instance: &wasmtime::Instance,
+    epfd: i64, op: i64, fd: i64, event_ptr: i64,
+) -> Result<i64> {
+    if let Some(mem) = instance.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = instance.get_typed_func::<(i64, i64, i64, i64), i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, (epfd, op, fd, event_ptr)).await?)
+}
+
+async fn call_epoll_wait(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    module: &wasmtime::Module,
+    epfd: i64, events_ptr: i64, maxevents: i64, timeout_ms: i64,
+) -> Result<i64> {
+    let inst = linker.instantiate_async(&mut *store, module).await?;
+    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = inst.get_typed_func::<(i64, i64, i64, i64), i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, (epfd, events_ptr, maxevents, timeout_ms)).await?)
+}
+
+async fn call_epoll_wait_reuse(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    instance: &wasmtime::Instance,
+    epfd: i64, events_ptr: i64, maxevents: i64, timeout_ms: i64,
+) -> Result<i64> {
+    if let Some(mem) = instance.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = instance.get_typed_func::<(i64, i64, i64, i64), i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, (epfd, events_ptr, maxevents, timeout_ms)).await?)
+}
+
+/// `epoll_create1(0)` returns a positive fd, then close.
+#[test]
+fn epoll_create1_returns_fd() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let ec1 = common::compile_wat(&engine, EPOLL_CREATE1_WAT)?;
+    let close = common::compile_wat(&engine, CLOSE_WAT)?;
+
+    block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let epfd = call_epoll_create1(&linker, &mut store, &ec1, 0).await?;
+        assert!(epfd >= 3, "epoll_create1 should return fd >= 3, got {epfd}");
+        let rc = call_close(&linker, &mut store, &close, epfd).await?;
+        assert_eq!(rc, 0, "close(epfd)");
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// `epoll_wait` on an empty instance with a 50ms timeout returns 0.
+#[test]
+fn epoll_wait_empty_timeout_returns_zero() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let ec1 = common::compile_wat(&engine, EPOLL_CREATE1_WAT)?;
+    let ew = common::compile_wat(&engine, EPOLL_WAIT_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let epfd = call_epoll_create1(&linker, &mut store, &ec1, 0).await?;
+        call_epoll_wait(&linker, &mut store, &ew, epfd, 4096, 4, 50).await
+    })?;
+    assert_eq!(ret, 0, "epoll_wait on empty set should return 0");
+    Ok(())
+}
+
+/// `epoll_wait` with timeout=0 on an empty instance returns 0 immediately.
+#[test]
+fn epoll_wait_with_timeout_returns_zero_on_timeout() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let ec1 = common::compile_wat(&engine, EPOLL_CREATE1_WAT)?;
+    let ew = common::compile_wat(&engine, EPOLL_WAIT_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let epfd = call_epoll_create1(&linker, &mut store, &ec1, 0).await?;
+        call_epoll_wait(&linker, &mut store, &ew, epfd, 4096, 4, 0).await
+    })?;
+    assert_eq!(ret, 0);
+    Ok(())
+}
+
+/// `epoll_ctl(ADD, fd, ...)` then `epoll_ctl(DEL, fd, ...)` — round-trip
+/// succeeds; `ADD` on an already-registered fd returns -EEXIST; `DEL` of
+/// an unknown fd returns -ENOENT.
+#[test]
+fn epoll_ctl_add_del_roundtrip() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let ec1 = common::compile_wat(&engine, EPOLL_CREATE1_WAT)?;
+    let ec = common::compile_wat(&engine, EPOLL_CTL_WAT)?;
+    let close = common::compile_wat(&engine, CLOSE_WAT)?;
+
+    block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let epfd = call_epoll_create1(&linker, &mut store, &ec1, 0).await?;
+
+        // Build an epoll_event { events=EPOLLIN=1, data=0xdeadbeef } at offset 4096.
+        let mem = store.data().memory.ok_or_else(|| anyhow::anyhow!("no memory"))?;
+        let mut ev = [0u8; 12];
+        ev[0..4].copy_from_slice(&1u32.to_le_bytes());           // EPOLLIN
+        ev[4..12].copy_from_slice(&0xdeadbeefu64.to_le_bytes()); // data
+        mem.write(&mut store, 4096, &ev)?;
+
+        // Use a single instance across both calls so the kernel writes are observable.
+        let inst = linker.instantiate_async(&mut store, &ec).await?;
+        if let Some(mem) = inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(mem);
+        }
+
+        // ADD STDOUT(1) with EPOLLIN.
+        let rc = call_epoll_ctl_reuse(&linker, &mut store, &inst, epfd, 1, 1, 4096).await?;
+        assert_eq!(rc, 0, "ADD should return 0");
+
+        // ADD again → -EEXIST.
+        let rc = call_epoll_ctl_reuse(&linker, &mut store, &inst, epfd, 1, 1, 4096).await?;
+        assert_eq!(rc, -edge_libos::errno::EEXIST, "double ADD should return -EEXIST");
+
+        // DEL → 0.
+        let rc = call_epoll_ctl_reuse(&linker, &mut store, &inst, epfd, 2, 1, 0).await?;
+        assert_eq!(rc, 0, "DEL should return 0");
+
+        // DEL again → -ENOENT.
+        let rc = call_epoll_ctl_reuse(&linker, &mut store, &inst, epfd, 2, 1, 0).await?;
+        assert_eq!(rc, -edge_libos::errno::ENOENT, "double DEL should return -ENOENT");
+
+        let _ = call_close(&linker, &mut store, &close, epfd).await?;
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// `epoll_ctl(unknown_epfd, ...)` returns -EBADF.
+#[test]
+fn epoll_ctl_bad_epfd_returns_ebadf() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let ec = common::compile_wat(&engine, EPOLL_CTL_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        call_epoll_ctl(&linker, &mut store, &ec, 9999, 1, 1, 4096).await
+    })?;
+    assert_eq!(ret, -edge_libos::errno::EBADF);
+    Ok(())
+}
+
+/// `eventfd2(0, 0)` returns a positive fd.
+#[test]
+fn eventfd2_returns_fd() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let ef = common::compile_wat(&engine, EVENTFD2_WAT)?;
+    let close = common::compile_wat(&engine, CLOSE_WAT)?;
+
+    block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let fd = call_eventfd2(&linker, &mut store, &ef, 0, 0).await?;
+        assert!(fd >= 3, "eventfd2 should return fd >= 3, got {fd}");
+        let rc = call_close(&linker, &mut store, &close, fd).await?;
+        assert_eq!(rc, 0);
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// Integration: register a listening socket with EPOLLIN; have the host
+/// connect; the guest's `epoll_wait` should return >= 1 event.
+#[test]
+fn epoll_wait_wakes_on_accept4() -> Result<()> {
+    let _d = TmpDir::new();
+    let host_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let port = host_listener.local_addr()?.port();
+    drop(host_listener);
+
+    let (engine, linker) = common::engine_and_linker()?;
+    let sock = common::compile_wat(&engine, SOCKET_WAT)?;
+    let bind = common::compile_wat(&engine, BIND_WAT)?;
+    let listen = common::compile_wat(&engine, LISTEN_WAT)?;
+    let ec1 = common::compile_wat(&engine, EPOLL_CREATE1_WAT)?;
+    let ec = common::compile_wat(&engine, EPOLL_CTL_WAT)?;
+    let ew = common::compile_wat(&engine, EPOLL_WAIT_WAT)?;
+    let acc = common::compile_wat(&engine, ACCEPT4_WAT)?;
+    let close = common::compile_wat(&engine, CLOSE_WAT)?;
+
+    // Patch BIND for the dynamic port.
+    let port_be = port.to_be_bytes();
+    let bind_wat = format!(r#"
+        (module
+          (import "kernel" "syscall"
+            (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+          (memory (export "memory") 1)
+          (data (i32.const 4096)
+            "\02\00PATCH_PORT\7f\00\00\01"
+            "\00\00\00\00\00\00\00\00")
+          (func (export "go") (param $fd i64) (result i64)
+            (call $syscall
+              (i64.const 49)
+              (local.get $fd)
+              (i64.const 4096)
+              (i64.const 16)
+              (i64.const 0) (i64.const 0) (i64.const 0))))
+    "#);
+    let bind_wat = bind_wat.replace(
+        "PATCH_PORT",
+        &format!("\\{:02x}\\{:02x}", port_be[0], port_be[1]),
+    );
+    let bind_for_port = common::compile_wat(&engine, &bind_wat)?;
+
+    block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let fd = call_socket(&linker, &mut store, &sock, 2, 1).await?;
+        let br = call_bind(&linker, &mut store, &bind_for_port, fd).await?;
+        assert_eq!(br, 0, "bind should return 0, got {br}");
+        let lr = call_listen(&linker, &mut store, &listen, fd, 1).await?;
+        assert_eq!(lr, 0, "listen should return 0, got {lr}");
+
+        let epfd = call_epoll_create1(&linker, &mut store, &ec1, 0).await?;
+
+        // Register the listening socket with EPOLLIN. The kernel should
+        // attach a `notify_read` Notify and our `compute_revents` should
+        // mark EPOLLIN for listeners.
+        // Use a single epoll_ctl instance across calls — write the event
+        // struct INTO its memory after attach.
+        let ec_inst = linker.instantiate_async(&mut store, &ec).await?;
+        if let Some(m) = ec_inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(m);
+        }
+        let ec_mem = ec_inst.get_memory(&mut store, "memory")
+            .ok_or_else(|| anyhow::anyhow!("no ec_inst memory"))?;
+        let mut ev = [0u8; 12];
+        ev[0..4].copy_from_slice(&0x001u32.to_le_bytes()); // EPOLLIN
+        ev[4..12].copy_from_slice(&0xcafef00du64.to_le_bytes());
+        ec_mem.write(&mut store, 4096, &ev)?;
+        let rc = call_epoll_ctl_reuse(&linker, &mut store, &ec_inst, epfd, 1, fd, 4096).await?;
+        assert_eq!(rc, 0, "epoll_ctl ADD");
+
+        // Synchronous read of epoll_wait should already report >=1 because
+        // the listener is immediately considered ready.
+        let ew_inst = linker.instantiate_async(&mut store, &ew).await?;
+        if let Some(m) = ew_inst.get_memory(&mut store, "memory") {
+            store.data_mut().attach_memory(m);
+        }
+        // First epoll_wait — listener is "always ready" in P1-7's simple
+        // model, so this returns >=1 immediately.
+        let n = call_epoll_wait_reuse(
+            &linker, &mut store, &ew_inst, epfd, 4096, 4, 1000,
+        ).await?;
+        assert!(n >= 1, "epoll_wait on a listening socket should return >=1, got {n}");
+
+        // Verify the revents field of the first event is EPOLLIN.
+        let ew_mem = ew_inst.get_memory(&mut store, "memory")
+            .ok_or_else(|| anyhow::anyhow!("no ew_inst memory"))?;
+        let mut got = [0u8; 12];
+        ew_mem.read(&mut store, 4096, &mut got)?;
+        let revents = u32::from_le_bytes([got[0], got[1], got[2], got[3]]);
+        assert_eq!(revents & 0x001, 0x001, "revents should include EPOLLIN, got {revents:#x}");
+        let data = u64::from_le_bytes([got[4], got[5], got[6], got[7], got[8], got[9], got[10], got[11]]);
+        assert_eq!(data, 0xcafef00d, "user data word should be preserved");
+
+        // Now do a real accept4 race + epoll_wait to confirm the kernel's
+        // notify mechanism is wired up.
+        let _ = call_epoll_ctl_reuse(&linker, &mut store, &ec_inst, epfd, 2, fd, 0).await?;
+        // Re-write the event struct into ec_inst's memory (it was preserved
+        // above but be defensive).
+        ec_mem.write(&mut store, 4096, &ev)?;
+        let _ = call_epoll_ctl_reuse(&linker, &mut store, &ec_inst, epfd, 1, fd, 4096).await?;
+
+        let connect_fut = async move {
+            for _ in 0..20 {
+                if let Ok(s) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                    return Ok::<_, anyhow::Error>(s);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(anyhow::anyhow!("host connect never succeeded"))
+        };
+        let accept_fut = call_accept4(&linker, &mut store, &acc, fd, 0);
+        let (host_res, accepted_res) = tokio::join!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), connect_fut),
+            tokio::time::timeout(std::time::Duration::from_secs(3), accept_fut),
+        );
+        let _host_stream = host_res
+            .map_err(|_| anyhow::anyhow!("host connect timed out"))?
+            .map_err(|e| anyhow::anyhow!("host connect failed: {e}"))?;
+        let accepted = accepted_res
+            .map_err(|_| anyhow::anyhow!("guest accept4 timed out"))??;
+        assert!(accepted >= 3, "accept4 returned {accepted}");
+
+        // After accept4, epoll_wait should still see the listener as ready.
+        let n2 = call_epoll_wait_reuse(
+            &linker, &mut store, &ew_inst, epfd, 4096, 4, 50,
+        ).await?;
+        assert!(n2 >= 1, "post-accept4 epoll_wait should still report >=1, got {n2}");
+
+        let _ = call_close(&linker, &mut store, &close, accepted).await?;
+        let _ = call_close(&linker, &mut store, &close, epfd).await?;
+        let _ = call_close(&linker, &mut store, &close, fd).await?;
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(())
+}

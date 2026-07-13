@@ -419,6 +419,89 @@ fn fuzz_poll_bad_fds_pointer() -> Result<()> {
     Ok(())
 }
 
+/// epoll_create1(flags) — no pointer args. A successful return is a
+/// valid fd (>=3); we accept that as a safe outcome too.
+#[test]
+fn fuzz_epoll_create1_no_pointer_args() -> Result<()> {
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, CALLER_WAT)?;
+    let ret = block_on(dispatch_argv(
+        &engine, &linker, &module,
+        edge_libos::sys::epoll::NR_EPOLL_CREATE1 as i64,
+        [0 /*flags*/, 0, 0, 0, 0, 0],
+    ))?;
+    // Either a valid fd (>=3) or one of the safe error sentinels.
+    assert!(
+        ret >= 3
+            || ret == -edge_libos::errno::EFAULT
+            || ret == -edge_libos::errno::EINVAL
+            || ret == -edge_libos::errno::ENOSYS
+            || ret == -edge_libos::errno::EBADF,
+        "epoll_create1 returned {ret}, expected fd or safe error"
+    );
+    Ok(())
+}
+
+/// epoll_ctl(epfd, op, fd, event_ptr) — event pointer is poisoned on
+/// ADD/MOD. With a bogus epfd, the call short-circuits to -EBADF before
+/// the deref; with a real epfd but bogus ptr, -EFAULT.
+#[test]
+fn fuzz_epoll_ctl_bad_event_pointer() -> Result<()> {
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, CALLER_WAT)?;
+    for ptr in POISON_PTR {
+        let r = block_on(assert_efault_or_safe(
+            &engine, &linker, &module,
+            edge_libos::sys::epoll::NR_EPOLL_CTL as i64,
+            [9999 /*epfd*/, 1 /*ADD*/, 1 /*fd*/, *ptr, 0, 0],
+            "epoll_ctl",
+        ))?;
+        let _ = r;
+    }
+    Ok(())
+}
+
+/// epoll_wait(epfd, events_ptr, maxevents, timeout) — events pointer is
+/// poisoned. With a bogus epfd, the call returns -EBADF; with a real
+/// epfd but bogus events_ptr, -EFAULT or -EINVAL.
+#[test]
+fn fuzz_epoll_wait_bad_events_pointer() -> Result<()> {
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, CALLER_WAT)?;
+    for ptr in POISON_PTR {
+        let r = block_on(assert_efault_or_safe(
+            &engine, &linker, &module,
+            edge_libos::sys::epoll::NR_EPOLL_WAIT as i64,
+            [9999 /*epfd*/, *ptr, 4, 0, 0, 0],
+            "epoll_wait",
+        ))?;
+        let _ = r;
+    }
+    Ok(())
+}
+
+/// eventfd2(initval, flags) — no pointer args. A successful return is a
+/// valid fd (>=3); accept that as a safe outcome too.
+#[test]
+fn fuzz_eventfd2_no_pointer_args() -> Result<()> {
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, CALLER_WAT)?;
+    let ret = block_on(dispatch_argv(
+        &engine, &linker, &module,
+        edge_libos::sys::eventfd::NR_EVENTFD2 as i64,
+        [0 /*initval*/, 0, 0, 0, 0, 0],
+    ))?;
+    assert!(
+        ret >= 3
+            || ret == -edge_libos::errno::EFAULT
+            || ret == -edge_libos::errno::EINVAL
+            || ret == -edge_libos::errno::ENOSYS
+            || ret == -edge_libos::errno::EBADF,
+        "eventfd2 returned {ret}, expected fd or safe error"
+    );
+    Ok(())
+}
+
 /// Brute-force overflow: pointer = i64::MAX/2, len = i64::MAX/2.
 #[test]
 fn fuzz_overflow_ptr_plus_len_every_pointer_syscall() -> Result<()> {
@@ -477,19 +560,43 @@ fn fuzz_overflow_ptr_plus_len_every_pointer_syscall() -> Result<()> {
          [3, huge, huge, 0, 0, 0]),
         (edge_libos::sys::poll::NR_POLL, "poll",
          [huge, 1, 0, 0, 0, 0]),
+        (edge_libos::sys::epoll::NR_EPOLL_CTL, "epoll_ctl",
+         [huge, 1, 1, huge, 0, 0]),
+        (edge_libos::sys::epoll::NR_EPOLL_WAIT, "epoll_wait",
+         [huge, huge, 4, 0, 0, 0]),
+        (edge_libos::sys::epoll::NR_EPOLL_CREATE1, "epoll_create1",
+         [0, 0, 0, 0, 0, 0]),
+        (edge_libos::sys::eventfd::NR_EVENTFD2, "eventfd2",
+         [0, 0, 0, 0, 0, 0]),
     ];
     for (nr, name, args) in cases {
+        // epoll_create1 + eventfd2 have no pointer args; they always
+        // return a valid fd. Skip the safe-set check for them and just
+        // verify the return is sensible.
+        if *nr == edge_libos::sys::epoll::NR_EPOLL_CREATE1
+            || *nr == edge_libos::sys::eventfd::NR_EVENTFD2
+        {
+            let ret = block_on(dispatch_argv(
+                &engine, &linker, &module,
+                *nr as i64,
+                *args,
+            ))?;
+            assert!(
+                ret >= 3
+                    || ret == -edge_libos::errno::EFAULT
+                    || ret == -edge_libos::errno::EINVAL
+                    || ret == -edge_libos::errno::EBADF
+                    || ret == -edge_libos::errno::ENOSYS,
+                "{name}: poisoned call returned {ret}, expected fd or safe error"
+            );
+            continue;
+        }
         let ret = block_on(assert_efault_or_safe(
             &engine, &linker, &module,
             *nr as i64,
             *args,
             name,
         ))?;
-        // Every entry in `cases` has its primary pointer poisoned with
-        // values that overflow any reasonable bounds check.
-        // -EFAULT or -EINVAL are both acceptable; -ENOSYS is acceptable
-        // for stubbed syscalls; -EBADF acceptable for paths that don't
-        // even get to the pointer dereference.
         let _ = ret;
     }
     Ok(())

@@ -667,6 +667,8 @@ pub async fn fcntl(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                     }
                     fl as i64
                 }
+                // P1-7: epoll/eventfd have no file-status flags to surface.
+                Ok(Resource::Epoll(_)) | Ok(Resource::EventFd(_)) => O_RDWR as i64,
                 Err(e) => e,
             }
         }
@@ -690,6 +692,9 @@ pub async fn fcntl(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                     // (they're blocking I/O on the std::fs::File). Accept
                     // the call and return 0.
                 }
+                // P1-7: epoll/eventfd ignore F_SETFL; F_GETFL above already
+                // returns O_RDWR for them.
+                Ok(Resource::Epoll(_)) | Ok(Resource::EventFd(_)) => {}
                 Err(e) => return e,
             }
             0
@@ -737,6 +742,10 @@ pub async fn fcntl(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                     // dup on a socket returns -EBADF (matches Linux: dup on
                     // a socket without SO_ACCEPTCONN semantics is a no-op).
                     Ok(Resource::Socket(_)) => return -EBADF,
+                    // P1-7: epoll and eventfd are not dup-able. Linux
+                    // allows `dup(epfd)` historically but it's effectively
+                    // a no-op; for P1 we just reject.
+                    Ok(Resource::Epoll(_)) | Ok(Resource::EventFd(_)) => return -EBADF,
                     Err(e) => return e,
                 }
             };

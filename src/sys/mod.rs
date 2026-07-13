@@ -8,6 +8,8 @@
 //! Returns the kernel-convention i64: `>= 0` success, `[-4095, -1]` = `-errno`.
 //! Pure-stubs (identity) take no caller and return `i64` directly.
 
+pub mod epoll;
+pub mod eventfd;
 pub mod file;
 pub mod identity;
 pub mod memory;

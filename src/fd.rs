@@ -182,6 +182,15 @@ pub struct SocketInner {
     /// P1-6: is this socket a listener? Set on first `accept4` materialization.
     /// Surfaced via `getsockopt(SO_ACCEPTCONN)`.
     pub is_acceptor: bool,
+    /// P1-7: Notify that fires when the socket's *read-side* readiness
+    /// changes (data arrives, peer connects, half-close from peer).
+    /// epoll_wait subscribes to this to wake when a watched fd becomes
+    /// readable.
+    pub notify_read: Arc<tokio::sync::Notify>,
+    /// P1-7: Notify that fires when the *write-side* readiness changes
+    /// (peer accepted, buffer drained). epoll_wait subscribes to this
+    /// for `EPOLLOUT` watchers.
+    pub notify_write: Arc<tokio::sync::Notify>,
 }
 
 impl SocketInner {
@@ -200,6 +209,8 @@ impl SocketInner {
             last_error: AtomicI32::new(0),
             shutdown_flags: 0,
             is_acceptor: false,
+            notify_read: Arc::new(tokio::sync::Notify::new()),
+            notify_write: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -227,6 +238,43 @@ impl SocketInner {
     }
 }
 
+/// P1-7: per-fd entry in an `Epoll` instance. Stores the requested events
+/// mask, the user-supplied data word, and a `Notify` the epoll_wait async
+/// future subscribes to.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct EpollEntry {
+    pub fd: u32,
+    pub events: u32,
+    pub data: u64,
+    /// Wake primitive shared with the watched fd's `Notify`. The
+    /// `epoll_wait` task awaits on this; the fd's writers call
+    /// `notify.notify_waiters()` to wake it.
+    pub wake: Arc<tokio::sync::Notify>,
+}
+
+/// P1-7: kernel-side state for an `epoll_create1` fd.
+#[allow(dead_code)]
+pub struct EpollInner {
+    /// Active registrations, keyed by the watched fd.
+    pub entries: parking_lot::Mutex<std::collections::HashMap<u32, EpollEntry>>,
+    /// Wake primitive used to cancel a pending `epoll_wait`. When
+    /// `epoll_ctl(DEL)` runs while a wait is in flight, it notifies here
+    /// so the wait re-scans and returns 0 events.
+    pub cancel: Arc<tokio::sync::Notify>,
+    /// `eventfd` auto-created and registered with EPOLLIN as a self-wake
+    /// primitive. P1-7's epoll_wait awaits on this plus the per-fd wakes.
+    pub self_event_fd: Option<u32>,
+}
+
+/// P1-7: kernel-side state for an `eventfd2` fd.
+#[allow(dead_code)]
+pub struct EventFdInner {
+    pub counter: parking_lot::Mutex<u64>,
+    pub notify: Arc<tokio::sync::Notify>,
+    pub nonblock: AtomicBool,
+}
+
 /// A `Resource` is what's behind a fd. Variants fill in as syscalls land.
 pub enum Resource {
     /// stdin — typically a `PipeRead` preloaded by the driver.
@@ -246,6 +294,12 @@ pub enum Resource {
     /// Socket fd created by `socket(2)` (P1-1).
     #[allow(dead_code)]
     Socket(SocketInner),
+    /// Epoll instance created by `epoll_create1(2)` (P1-7).
+    #[allow(dead_code)]
+    Epoll(EpollInner),
+    /// Event counter created by `eventfd2(2)` (P1-7).
+    #[allow(dead_code)]
+    EventFd(EventFdInner),
 }
 
 pub struct FdTable {

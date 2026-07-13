@@ -106,6 +106,12 @@ async fn dispatch(
         // poll(2) — P1-6 synchronous readiness scan.
         sys::poll::NR_POLL => sys::poll::poll(&mut caller, a).await,
 
+        // P1-7: the async pivot — epoll + eventfd.
+        sys::epoll::NR_EPOLL_CREATE1 => sys::epoll::epoll_create1(&mut caller, a).await,
+        sys::epoll::NR_EPOLL_CTL => sys::epoll::epoll_ctl(&mut caller, a).await,
+        sys::epoll::NR_EPOLL_WAIT => sys::epoll::epoll_wait(&mut caller, a).await,
+        sys::eventfd::NR_EVENTFD2 => sys::eventfd::eventfd2(&mut caller, a).await,
+
         // Identity (stubs)
         sys::identity::NR_GETUID => sys::identity::getuid(),
         sys::identity::NR_GETEUID => sys::identity::geteuid(),
@@ -184,6 +190,11 @@ pub fn syscall_name(nr: u32) -> &'static str {
         sys::socket::NR_SHUTDOWN => "shutdown",
 
         sys::poll::NR_POLL => "poll",
+
+        sys::epoll::NR_EPOLL_CREATE1 => "epoll_create1",
+        sys::epoll::NR_EPOLL_CTL => "epoll_ctl",
+        sys::epoll::NR_EPOLL_WAIT => "epoll_wait",
+        sys::eventfd::NR_EVENTFD2 => "eventfd2",
 
         sys::identity::NR_GETUID => "getuid",
         sys::identity::NR_GETEUID => "geteuid",

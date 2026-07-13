@@ -66,6 +66,10 @@ expected_syscall() {
         getsockname)       echo "getsockname" ;;
         shutdown)          echo "shutdown" ;;
         poll)              echo "poll" ;;
+        epoll_create1)     echo "epoll_create1" ;;
+        epoll_ctl)         echo "epoll_ctl" ;;
+        epoll_wait)        echo "epoll_wait" ;;
+        eventfd2)          echo "eventfd2" ;;
         fcntl_nonblock)    echo "pipe2" ;;
         connect)           echo "connect" ;;
         open)              echo "open" ;;

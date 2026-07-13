@@ -258,6 +258,11 @@ async fn dispatch_dispatch(
 
         sys::poll::NR_POLL => sys::poll::poll(&mut caller, a).await,
 
+        sys::epoll::NR_EPOLL_CREATE1 => sys::epoll::epoll_create1(&mut caller, a).await,
+        sys::epoll::NR_EPOLL_CTL => sys::epoll::epoll_ctl(&mut caller, a).await,
+        sys::epoll::NR_EPOLL_WAIT => sys::epoll::epoll_wait(&mut caller, a).await,
+        sys::eventfd::NR_EVENTFD2 => sys::eventfd::eventfd2(&mut caller, a).await,
+
         sys::identity::NR_GETUID => sys::identity::getuid(),
         sys::identity::NR_GETEUID => sys::identity::geteuid(),
         sys::identity::NR_GETGID => sys::identity::getgid(),

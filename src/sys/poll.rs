@@ -141,6 +141,9 @@ fn poll_one(fds: &FdTable, fd: i32, events: i16) -> i16 {
         Resource::PipeRead(p) => ready_pipe_read(events, !p.buf.lock().is_empty() || *p.closed.lock()),
         Resource::PipeWrite(_) => POLLOUT & events, // buf pipes are always writeable
         Resource::Socket(s) => ready_socket(events, s),
+        // P1-7: epoll/eventfd fds aren't useful as poll targets — report
+        // POLLNVAL so the caller knows to use epoll_wait instead.
+        Resource::Epoll(_) | Resource::EventFd(_) => POLLNVAL,
     }
 }
 

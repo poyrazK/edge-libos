@@ -77,6 +77,10 @@ int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
 #define NR_SENDTO 44
 #define NR_RECVFROM 45
 #define NR_POLL 7
+#define NR_EPOLL_CREATE1 291
+#define NR_EPOLL_CTL 233
+#define NR_EPOLL_WAIT 232
+#define NR_EVENTFD2 290
 
 // Pass/fail markers. Placed at offset 4096 in linear memory. The runner
 // reads back the bytes at 4096 after the run.
