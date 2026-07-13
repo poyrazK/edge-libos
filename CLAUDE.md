@@ -35,6 +35,21 @@ NEVER EVER merge , its users job
 
 ## Commands
 
+**Iterating locally? Do NOT use `--release`, and do NOT run the full suite each
+loop.** `--release` uses `panic="abort"`, so `build` then `test` recompiles the
+whole Wasmtime dep graph *twice*; agents work in separate worktrees, so every
+cold `--release` build is a fresh full Wasmtime compile. Instead:
+
+```bash
+cargo build --profile ci                          # shares ONE dep compile with test
+cargo nextest run --profile ci <substring>        # fast, parallel; scope to what changed
+cargo test  --profile ci <substring>              # if a test isn't nextest-compatible
+```
+
+Reserve `--release` and the **full** suite for pre-merge / CI only — CI already
+runs everything on every push. The commands below use `--release` for
+completeness; substitute `--profile ci` when iterating.
+
 ```bash
 # Build host kernel (two bins: edge-python driver, trace-host tracer)
 cargo build --release
