@@ -38,7 +38,7 @@ const SIG_SETMASK: i64 = 2;
 ///
 /// P2-D1: derives `Serialize`/`Deserialize` so `SignalState` can be
 /// captured in `KernelSnapshot` without a custom impl.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct SigAction {
     pub handler: u64,

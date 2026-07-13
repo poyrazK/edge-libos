@@ -19,6 +19,7 @@ pub mod mem;
 pub mod fd;
 pub mod vfs;
 pub mod mm;
+pub mod snapshot;
 pub mod sys;
 
 pub use kernel::Kernel;

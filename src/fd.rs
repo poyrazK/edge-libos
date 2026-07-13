@@ -130,6 +130,13 @@ pub enum SocketKind {
     Datagram,
 }
 
+impl Default for SocketKind {
+    fn default() -> Self {
+        // Default to Stream for SocketSnapshot's `Default` impl.
+        SocketKind::Stream
+    }
+}
+
 /// The bound address of a socket. Parsed from `sockaddr_in` / `sockaddr_in6`
 /// at `bind()` time, then stored on the `SocketInner` for use by `listen()`
 /// (P1-2) and `accept4` (P1-4). For now we only model IPv4; IPv6 lands with
