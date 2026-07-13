@@ -44,6 +44,16 @@ int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
 #define NR_GETDENTS64 217
 #define NR_PIPE2 293
 #define NR_FCNTL 72
+#define NR_DUP 32
+#define NR_DUP2 33
+#define NR_DUP3 292
+#define O_CLOEXEC 02000000
+#define F_DUPFD 0
+#define F_DUPFD_CLOEXEC (1024 + 6)
+#define F_GETFD 1
+#define F_SETFD 2
+#define F_GETFL 3
+#define F_SETFL 4
 #define NR_BRK 12
 #define NR_MMAP 9
 #define NR_MUNMAP 11

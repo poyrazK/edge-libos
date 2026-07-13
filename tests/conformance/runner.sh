@@ -79,6 +79,9 @@ expected_syscall() {
         open)              echo "open" ;;
         stat)              echo "stat" ;;
         statx)             echo "statx" ;;
+        dup)               echo "dup" ;;
+        dup2)              echo "dup2" ;;
+        dup3)              echo "dup3" ;;
         lstat)             echo "lstat" ;;
         getcwd)            echo "getcwd" ;;
         readv)             echo "readv" ;;

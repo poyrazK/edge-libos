@@ -39,6 +39,10 @@ pub const NR_FCNTL: u32 = 72;
 pub const NR_GETCWD: u32 = 79;
 pub const NR_READV: u32 = 19;
 pub const NR_WRITEV: u32 = 20;
+// P2-B5: dup(2) / dup2(2) / dup3(2).
+pub const NR_DUP: u32 = 32;
+pub const NR_DUP2: u32 = 33;
+pub const NR_DUP3: u32 = 292;
 
 // open() flags (linux/fcntl.h). Keep the bare minimum CPython needs.
 pub const O_ACCMODE: i32 = 0o3;
@@ -1218,7 +1222,17 @@ pub async fn fcntl(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
             }
             0
         }
-        F_GETFD => caller.data().fds.get_cloexec(fd) as i64,
+        F_GETFD => {
+            let on = caller.data().fds.get_cloexec(fd);
+            // Optional optval write-back. Linux writes the bit value as a
+            // 32-bit int. We omit the write if arg == 0 (matches glibc).
+            if arg != 0 {
+                if let Ok(buf) = mem::guest_slice_mut(caller, arg, 4) {
+                    buf[0..4].copy_from_slice(&(if on { 1i32 } else { 0i32 }).to_le_bytes());
+                }
+            }
+            on as i64
+        }
         F_SETFD => {
             let on = (arg as i32) & 1 != 0;
             caller.data_mut().fds.set_cloexec(fd, on);
@@ -1280,6 +1294,151 @@ pub async fn fcntl(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         }
         _ => -EINVAL,
     }
+}
+
+// -- P2-B5: dup(2) / dup2(2) / dup3(2) ---------------------------------------
+
+/// `dup(oldfd)` → new fd with no minimum-fd preference; shares the
+/// open-file description (offset, listener, stream, etc.) with `oldfd`.
+///
+/// `dup` doesn't accept a target fd; the kernel picks the lowest free.
+/// Returns the new fd as i64, or -errno on failure.
+pub async fn dup(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let oldfd = match u32::try_from(a[0]) {
+        Ok(f) => f,
+        Err(_) => return -crate::errno::EBADF,
+    };
+    internal_dup(caller, oldfd, None, false).await
+}
+
+/// `dup2(oldfd, newfd)` → exact fd `newfd`. If `oldfd == newfd` and
+/// the fd is valid, `dup2` returns `newfd` unchanged (matches Linux).
+/// Otherwise closes `newfd` if it was bound, then duplicates.
+pub async fn dup2(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let oldfd = match u32::try_from(a[0]) {
+        Ok(f) => f,
+        Err(_) => return -crate::errno::EBADF,
+    };
+    let newfd = match u32::try_from(a[1]) {
+        Ok(f) => f,
+        Err(_) => return -crate::errno::EBADF,
+    };
+    if oldfd == newfd {
+        // Linux: if oldfd is valid, dup2 succeeds and returns newfd
+        // unchanged. If oldfd is not a valid fd, returns -EBADF.
+        let fds = &caller.data().fds;
+        match fds.get(oldfd) {
+            Ok(_) => return newfd as i64,
+            Err(e) => return e,
+        }
+    }
+    internal_dup(caller, oldfd, Some(newfd), false).await
+}
+
+/// `dup3(oldfd, newfd, flags)` — like dup2 but accepts `O_CLOEXEC` and
+/// rejects `oldfd == newfd` (Linux behaviour).
+pub async fn dup3(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let oldfd = match u32::try_from(a[0]) {
+        Ok(f) => f,
+        Err(_) => return -crate::errno::EBADF,
+    };
+    let newfd = match u32::try_from(a[1]) {
+        Ok(f) => f,
+        Err(_) => return -crate::errno::EBADF,
+    };
+    let flags = a[2] as i32;
+    if flags & !O_CLOEXEC != 0 {
+        return -crate::errno::EINVAL;
+    }
+    if oldfd == newfd {
+        return -crate::errno::EINVAL;
+    }
+    internal_dup(caller, oldfd, Some(newfd), flags & O_CLOEXEC != 0).await
+}
+
+/// Shared implementation behind `dup`, `dup2`, `dup3`, and `F_DUPFD`.
+///
+/// `newfd_target`:
+///   * `None`         — pick the lowest free fd >= oldfd+1 (for `dup`,
+///     or `F_DUPFD` callers that always pass `Some(min)`).
+///   * `Some(n)`      — close `n` if bound, insert at `n` (for `dup2`,
+///     `dup3`, and `F_DUPFD`).
+///
+/// `want_cloexec` sets the FD_CLOEXEC bit on the resulting fd.
+async fn internal_dup(
+    caller: &mut Caller<'_, Kernel>,
+    oldfd: u32,
+    newfd_target: Option<u32>,
+    want_cloexec: bool,
+) -> i64 {
+    // Phase 1: clone-by-Arc (or per-field for pipes). We do this under a
+    // shared borrow so the cloned `Resource` is detached by the time we
+    // mutate the FdTable.
+    let cloned: Option<Resource> = {
+        let fds = &caller.data().fds;
+        match fds.get(oldfd) {
+            Err(e) => return e,
+            Ok(Resource::File(fp)) => Some(Resource::File(std::sync::Arc::clone(fp))),
+            Ok(Resource::Socket(s)) => Some(Resource::Socket(std::sync::Arc::clone(s))),
+            Ok(Resource::Stdin(r)) => Some(Resource::Stdin(crate::fd::PipeRead {
+                buf: r.buf.clone(),
+                closed: r.closed.clone(),
+                nonblock: r.nonblock.clone(),
+                notify: r.notify.clone(),
+            })),
+            Ok(Resource::Stdout(w)) => Some(Resource::Stdout(crate::fd::PipeWrite {
+                buf: w.buf.clone(),
+                closed: w.closed.clone(),
+                nonblock: w.nonblock.clone(),
+                notify: w.notify.clone(),
+            })),
+            Ok(Resource::Stderr(w)) => Some(Resource::Stderr(crate::fd::PipeWrite {
+                buf: w.buf.clone(),
+                closed: w.closed.clone(),
+                nonblock: w.nonblock.clone(),
+                notify: w.notify.clone(),
+            })),
+            Ok(Resource::PipeRead(r)) => Some(Resource::PipeRead(crate::fd::PipeRead {
+                buf: r.buf.clone(),
+                closed: r.closed.clone(),
+                nonblock: r.nonblock.clone(),
+                notify: r.notify.clone(),
+            })),
+            Ok(Resource::PipeWrite(w)) => Some(Resource::PipeWrite(crate::fd::PipeWrite {
+                buf: w.buf.clone(),
+                closed: w.closed.clone(),
+                nonblock: w.nonblock.clone(),
+                notify: w.notify.clone(),
+            })),
+            // P2-B5: dup(epfd) and dup(eventfd) are not modeled. Linux
+            // permits them historically but they aren't meaningful for
+            // our epoll implementation.
+            Ok(Resource::Epoll(_)) | Ok(Resource::EventFd(_)) => return -crate::errno::EBADF,
+        }
+    };
+    let cloned = match cloned {
+        Some(c) => c,
+        None => return -crate::errno::EFAULT,
+    };
+
+    // Phase 2: install the cloned resource. For dup2/dup3, close the
+    // target first if it was bound; for dup, take the lowest free fd.
+    let new_fd: u32 = match newfd_target {
+        Some(target) => {
+            // Close target if bound (drop its resource; ignore errors).
+            let _ = caller.data_mut().fds.close(target);
+            match caller.data_mut().fds.insert_at(target, cloned) {
+                Ok(fd) => fd,
+                Err(e) => return e,
+            }
+        }
+        None => caller.data_mut().fds.insert_at_least(oldfd + 1, cloned),
+    };
+    caller
+        .data_mut()
+        .fds
+        .set_cloexec(new_fd, want_cloexec);
+    new_fd as i64
 }
 
 // -- Helpers ----------------------------------------------------------------
