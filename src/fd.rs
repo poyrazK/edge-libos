@@ -329,7 +329,7 @@ impl SocketInner {
         use crate::snapshot::{SocketSnapshot, UnixSockSnapshot};
         let unix_inner = self.unix.as_ref().map(|u| UnixSockSnapshot {
             path: u.path.clone(),
-            peer_addr: None,
+            peer_addr_present: u.peer_addr.is_some(),
         });
         let peek_buf = self.peek_buf.lock().clone();
         SocketSnapshot {
@@ -340,7 +340,7 @@ impl SocketInner {
             so_reuseaddr: self.so_reuseaddr,
             so_keepalive: self.so_keepalive,
             tcp_nodelay: self.tcp_nodelay,
-            peer_addr: self.peer_addr,
+            peer_addr_present: self.peer_addr.is_some(),
             last_error: self.last_error.load(std::sync::atomic::Ordering::Relaxed),
             shutdown_flags: self.shutdown_flags,
             is_acceptor: self.is_acceptor,
@@ -648,6 +648,21 @@ impl FdTable {
     /// True if `fd` is currently bound.
     pub fn contains(&self, fd: u32) -> bool {
         self.table.contains_key(&fd)
+    }
+
+    /// P2-D1: iterate (fd, &Resource) without exposing the inner table.
+    pub fn iter_for_snapshot(&self) -> Vec<(u32, &Resource)> {
+        self.table.iter().map(|(fd, r)| (*fd, r)).collect()
+    }
+
+    /// P2-D1: cloexec set as a `Vec<u32>` (caller sorts).
+    pub fn iter_cloexec_for_snapshot(&self) -> Vec<u32> {
+        self.cloexec.iter().copied().collect()
+    }
+
+    /// P2-D1: expose `next_fd` for snapshot without making it pub.
+    pub fn next_fd_for_snapshot(&self) -> u32 {
+        self.next_fd
     }
 }
 

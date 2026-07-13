@@ -46,8 +46,8 @@
 //! Every snapshot starts with `format_version: u32 = SNAPSHOT_FORMAT_VERSION`.
 //! Future D-series changes bump the version and migrate on decode.
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -153,18 +153,83 @@ pub struct FdEntrySnapshot {
     pub kind: ResourceSnapshot,
 }
 
+/// P2-D1: per-variant kind tag is a string and the payload is a
+/// single struct field. We use an explicit field rather than an
+/// internally-tagged enum because `postcard` (1.x) does not support
+/// internally-tagged enums out of the box — only externally tagged
+/// (with variant index) or adjacent/enum-with-content. The single-
+/// field-with-tag form below serializes as `{ "kind": "stdin", "body":
+/// PipeSnapshot { ... } }`. Use `bincode`-style adjacent with explicit
+/// struct field; deserializes reliably across postcard versions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ResourceSnapshot {
-    Stdin(PipeSnapshot),
-    Stdout(PipeSnapshot),
-    Stderr(PipeSnapshot),
-    PipeRead(PipeSnapshot),
-    PipeWrite(PipeSnapshot),
-    File(FileSnapshot),
-    Socket(SocketSnapshot),
-    Epoll(EpollSnapshot),
-    EventFd(EventFdSnapshot),
+pub struct ResourceSnapshot {
+    pub kind: ResourceKind,
+    pub body: ResourceBody,
+}
+
+/// All `Resource` variants enumerated as a serde-friendly enum.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ResourceKind {
+    Stdin,
+    Stdout,
+    Stderr,
+    PipeRead,
+    PipeWrite,
+    File,
+    Socket,
+    Epoll,
+    EventFd,
+}
+
+/// The per-kind payload — flattened union.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResourceBody {
+    /// Pipe variants: serializes pipe state.
+    pub pipe: Option<PipeSnapshot>,
+    /// File variant: serializes file state.
+    pub file: Option<FileSnapshot>,
+    /// Socket variant: serializes socket state.
+    pub socket: Option<SocketSnapshot>,
+    /// Epoll variant: serializes epoll state.
+    pub epoll: Option<EpollSnapshot>,
+    /// EventFd variant: serializes eventfd state.
+    pub eventfd: Option<EventFdSnapshot>,
+}
+
+impl ResourceSnapshot {
+    /// Build from a runtime `Resource` kind and the relevant snapshot
+    /// form. Returns a typed value; the caller chooses the
+    /// corresponding discriminator.
+    pub fn from_pipe(kind: ResourceKind, pipe: PipeSnapshot) -> Self {
+        debug_assert!(matches!(kind, ResourceKind::Stdin | ResourceKind::Stdout | ResourceKind::Stderr | ResourceKind::PipeRead | ResourceKind::PipeWrite));
+        let mut body = ResourceBody::default();
+        body.pipe = Some(pipe);
+        Self { kind, body }
+    }
+
+    pub fn from_file(file: FileSnapshot) -> Self {
+        let mut body = ResourceBody::default();
+        body.file = Some(file);
+        Self { kind: ResourceKind::File, body }
+    }
+
+    pub fn from_socket(socket: SocketSnapshot) -> Self {
+        let mut body = ResourceBody::default();
+        body.socket = Some(socket);
+        Self { kind: ResourceKind::Socket, body }
+    }
+
+    pub fn from_epoll(epoll: EpollSnapshot) -> Self {
+        let mut body = ResourceBody::default();
+        body.epoll = Some(epoll);
+        Self { kind: ResourceKind::Epoll, body }
+    }
+
+    pub fn from_eventfd(eventfd: EventFdSnapshot) -> Self {
+        let mut body = ResourceBody::default();
+        body.eventfd = Some(eventfd);
+        Self { kind: ResourceKind::EventFd, body }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -193,7 +258,7 @@ pub struct SocketSnapshot {
     pub so_reuseaddr: bool,
     pub so_keepalive: bool,
     pub tcp_nodelay: bool,
-    pub peer_addr: Option<SocketAddr>,
+    pub peer_addr_present: bool,
     pub last_error: i32,
     pub shutdown_flags: u8,
     pub is_acceptor: bool,
@@ -206,11 +271,11 @@ pub struct SocketSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UnixSockSnapshot {
     pub path: Option<PathBuf>,
-    /// `std::os::unix::net::SocketAddr` is not `Serialize`/`Deserialize`
-    /// on stable Rust. Persist as a presence tag — the peer addr for
-    /// AF_UNIX is path-based and reconstructable from `path`.
-    #[serde(default, with = "unix_socket_addr_drop")]
-    pub peer_addr: Option<std::os::unix::net::SocketAddr>,
+    /// P2-D1: cannot persist `std::os::unix::net::SocketAddr` (no
+    /// `Serialize` on stable; `as_bytes`/`from_bytes` are unstable).
+    /// The peer addr for AF_UNIX is filesystem-path-based and
+    /// reconstructable from `path` on restore.
+    pub peer_addr_present: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -289,29 +354,6 @@ impl From<&SignalState> for SignalStateSnapshot {
     }
 }
 
-/// Adapter for `std::os::unix::net::SocketAddr`. The type isn't
-/// `Serialize`/`Deserialize` on stable Rust and `as_bytes`/`from_bytes`
-/// are unstable. We drop the unix peer addr on snapshot — peer info
-/// for an AF_UNIX socket is filesystem-path-based and reconstructable
-/// from `path` + `peer_path` on restore.
-pub mod unix_socket_addr_drop {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use std::os::unix::net::SocketAddr;
-
-    pub fn serialize<S: Serializer>(
-        _addr: &Option<SocketAddr>,
-        s: S,
-    ) -> Result<S::Ok, S::Error> {
-        // Persist as `()` so postcard has a fixed shape; on restore the
-        // peer addr is reconstructed from path state, not from this field.
-        ().serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(_d: D) -> Result<Option<SocketAddr>, D::Error> {
-        Ok(None)
-    }
-}
-
 impl From<&crate::kernel::ClockState> for ClockStateSnapshot {
     fn from(c: &crate::kernel::ClockState) -> Self {
         Self {
@@ -372,13 +414,74 @@ impl std::error::Error for SnapshotError {
     }
 }
 
-/// Placeholder — the orchestration that walks `Kernel` and assembles the
-/// snapshot lives in `snapshot_apply.rs`. D1.6 will fill this in.
-pub fn try_to_snapshot(kernel: &Kernel, _mem_bytes: &[u8]) -> Result<KernelSnapshot, SnapshotError> {
-    let _ = (kernel, _mem_bytes);
-    Err(SnapshotError::Postcard(
-        "try_to_snapshot: not yet implemented (D1.6)".into(),
-    ))
+/// Walk `Kernel` and assemble a `KernelSnapshot`.
+///
+/// Locks briefly per resource, drops the guard, copies out the snapshot
+/// form. Runtime handles (`Arc<Notify>`, `Memory`, raw fds) are dropped
+/// from the snapshot — they will be rebuilt in `apply_snapshot` (D1.7)
+/// and the linear-memory in `apply_snapshot` (D2).
+pub fn try_to_snapshot(
+    kernel: &Kernel,
+    _mem_bytes: &[u8],
+) -> Result<KernelSnapshot, SnapshotError> {
+    use crate::fd::Resource;
+    use crate::snapshot::{FdEntrySnapshot, ResourceSnapshot};
+
+    let mut entries: Vec<FdEntrySnapshot> = Vec::new();
+    // Snapshot the fd table in sorted order for deterministic postcard output.
+    let mut fds_sorted: Vec<(u32, &Resource)> = kernel.fds.iter_for_snapshot();
+    fds_sorted.sort_by_key(|(fd, _)| *fd);
+
+    for (fd, resource) in fds_sorted {
+        let kind = match resource {
+            Resource::Stdin(p) => ResourceSnapshot::from_pipe(ResourceKind::Stdin, p.snapshot()),
+            Resource::Stdout(p) => ResourceSnapshot::from_pipe(ResourceKind::Stdout, p.snapshot()),
+            Resource::Stderr(p) => ResourceSnapshot::from_pipe(ResourceKind::Stderr, p.snapshot()),
+            Resource::PipeRead(p) => ResourceSnapshot::from_pipe(ResourceKind::PipeRead, p.snapshot()),
+            Resource::PipeWrite(p) => ResourceSnapshot::from_pipe(ResourceKind::PipeWrite, p.snapshot()),
+            Resource::File(shared) => {
+                let guard = shared.lock();
+                ResourceSnapshot::from_file(crate::snapshot::FileSnapshot {
+                    path: guard.path.clone(),
+                    pos: guard.pos,
+                    is_dir: guard.is_dir,
+                    dir_cache: guard.dir_cache.clone(),
+                })
+            }
+            Resource::Socket(shared) => {
+                let guard = shared.lock();
+                ResourceSnapshot::from_socket(guard.snapshot())
+            }
+            Resource::Epoll(e) => ResourceSnapshot::from_epoll(e.snapshot()),
+            Resource::EventFd(e) => ResourceSnapshot::from_eventfd(e.snapshot()),
+        };
+        entries.push(FdEntrySnapshot { fd, kind });
+    }
+
+    let cloexec: Vec<u32> = {
+        let mut v: Vec<u32> = kernel.fds.iter_cloexec_for_snapshot();
+        v.sort();
+        v
+    };
+
+    Ok(KernelSnapshot {
+        format_version: SNAPSHOT_FORMAT_VERSION,
+        fds: crate::snapshot::FdSnapshot {
+            entries,
+            next_fd: kernel.fds.next_fd_for_snapshot(),
+            cloexec,
+        },
+        mm: kernel.mm.snapshot(),
+        vfs: crate::snapshot::VfsSnapshot::from(&kernel.vfs),
+        clock: crate::snapshot::ClockStateSnapshot::from(&kernel.clock),
+        brk: kernel.brk,
+        args: kernel.args.clone(),
+        env: kernel.env.clone(),
+        rng_seed: kernel.rng_seed,
+        signals: crate::snapshot::SignalStateSnapshot::from(&kernel.signals),
+        exit_code: kernel.exit_code,
+        comm: kernel.comm,
+    })
 }
 
 /// Placeholder — D1.7 will fill this in.
@@ -395,6 +498,8 @@ pub fn apply_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::SeedableRng;
+    use std::sync::Arc;
 
     #[test]
     fn format_version_constant_value() {
@@ -461,5 +566,87 @@ mod tests {
         assert_eq!(back.arenas[0].base, 0x1_000_0000);
         assert_eq!(back.arenas[0].used, 0);
         assert!(back.arenas[0].free_list.is_empty());
+    }
+
+    #[test]
+    fn sanity_snapshot_roundtrip() {
+        // Plan §Verification: build a real Kernel (with stdio + an
+        // EventFd), snap it, encode/decode via postcard, verify fields.
+        use crate::fd::{EventFdInner, Resource};
+        use std::sync::atomic::AtomicBool;
+
+        let kernel = Kernel::new_without_stdio(
+            vec!["edge-python".into(), "main.py".into()],
+            vec![("PATH".to_string(), "/usr/bin".to_string())],
+        );
+
+        // Force a specific RNG seed so we can compare.
+        // (Default uses OS entropy.)
+        let mut kernel = kernel;
+        kernel.rng_seed = [42u8; 32];
+        kernel.rng = rand::rngs::SmallRng::from_seed(kernel.rng_seed);
+        kernel.brk = 0x1000;
+        kernel.comm[0] = b'e';
+        kernel.comm[1] = b'd';
+        kernel.comm[2] = b'g';
+        kernel.comm[3] = b'e';
+
+        // Insert an EventFd at fd 3 (the first non-stdio slot).
+        let efd_fd = kernel.fds.insert(Resource::EventFd(EventFdInner {
+            counter: parking_lot::Mutex::new(7),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            nonblock: AtomicBool::new(false),
+        }));
+        assert_eq!(efd_fd, 3);
+
+        // Capture the snapshot.
+        let snap = try_to_snapshot(&kernel, &[]).expect("snapshot succeeds");
+
+        // Header.
+        assert_eq!(snap.format_version, SNAPSHOT_FORMAT_VERSION);
+        assert_eq!(snap.brk, 0x1000);
+        assert_eq!(snap.rng_seed, [42u8; 32]);
+        assert_eq!(snap.args, vec!["edge-python".to_string(), "main.py".to_string()]);
+        assert_eq!(snap.env, vec![("PATH".to_string(), "/usr/bin".to_string())]);
+        assert_eq!(snap.comm, kernel.comm);
+
+        // FDs: 0 (stdin), 1 (stdout), 2 (stderr), 3 (eventfd) all present.
+        assert_eq!(snap.fds.entries.len(), 4);
+        let fds: Vec<u32> = snap.fds.entries.iter().map(|e| e.fd).collect();
+        assert_eq!(fds, vec![0, 1, 2, 3]);
+
+        // Specifically the EventFd entry has counter=7.
+        let efd_entry = snap.fds.entries.iter().find(|e| e.fd == 3).unwrap();
+        assert_eq!(efd_entry.kind.kind, ResourceKind::EventFd);
+        let efd = efd_entry.kind.body.eventfd.as_ref().expect("eventfd body");
+        assert_eq!(efd.counter, 7);
+        assert!(!efd.nonblock);
+
+        // next_fd should be ≥ 4.
+        assert!(snap.fds.next_fd >= 4);
+
+        // Round-trip the entire snapshot via postcard.
+        let bytes = postcard::to_stdvec(&snap).expect("encode succeeds");
+        let back: KernelSnapshot =
+            postcard::from_bytes(&bytes).expect("decode succeeds");
+        assert_eq!(back.format_version, snap.format_version);
+        assert_eq!(back.brk, snap.brk);
+        assert_eq!(back.rng_seed, snap.rng_seed);
+        assert_eq!(back.args, snap.args);
+        assert_eq!(back.env, snap.env);
+        assert_eq!(back.fds.entries.len(), snap.fds.entries.len());
+        assert_eq!(back.mm.high_water, snap.mm.high_water);
+
+        // Round-trip the entire snapshot via postcard.
+        let bytes = postcard::to_stdvec(&snap).expect("encode succeeds");
+        let back: KernelSnapshot =
+            postcard::from_bytes(&bytes).expect("decode succeeds");
+        assert_eq!(back.format_version, snap.format_version);
+        assert_eq!(back.brk, snap.brk);
+        assert_eq!(back.rng_seed, snap.rng_seed);
+        assert_eq!(back.args, snap.args);
+        assert_eq!(back.env, snap.env);
+        assert_eq!(back.fds.entries.len(), snap.fds.entries.len());
+        assert_eq!(back.mm.high_water, snap.mm.high_water);
     }
 }
