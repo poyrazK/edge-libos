@@ -101,6 +101,8 @@ jobs:
         # Tarball name is `zig-x86_64-linux-<ver>.tar.xz` (NOT
         # `zig-linux-x86_64-<ver>.tar.xz` — that URL 404s). Verified via
         # https://ziglang.org/download/index.json on 2026-07-13.
+        # Use the absolute /opt/zig path for THIS step's verification, and
+        # also export PATH + persist GITHUB_PATH for subsequent steps.
         env:
           ZIG_VERSION: ${{ env.ZIG_VERSION }}
         run: |
@@ -112,9 +114,13 @@ jobs:
           sudo tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
           echo "/opt/zig" | sudo tee /etc/ld.so.conf.d/zig.conf >/dev/null
           sudo ldconfig
+          # Persist /opt/zig on PATH for subsequent steps in this job.
           echo "/opt/zig" | sudo tee -a "$GITHUB_PATH" >/dev/null
           rm -f /tmp/zig.tar.xz
-          zig version
+          # In this step's shell, /opt/zig is NOT on PATH yet — use the
+          # absolute path so `zig version` runs against the freshly installed
+          # binary.
+          /opt/zig/zig version
 
       - name: 6. Install wabt (wat2wasm)
         run: |
