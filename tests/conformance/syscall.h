@@ -165,6 +165,13 @@ int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
 #define NR_SYSINFO 99
 #define NR_TIMES 100
 
+// P3 reservation: clone / fork / wait4 / futex. All return -ENOSYS
+// until P3 lands; see docs/adr/0001, docs/adr/0002.
+#define NR_CLONE 56
+#define NR_FORK 57
+#define NR_WAIT4 61
+#define NR_FUTEX 202
+
 // sendmsg / recvmsg flags.
 #define MSG_PEEK 0x2
 #define MSG_DONTWAIT 0x40
