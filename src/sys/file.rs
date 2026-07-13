@@ -757,11 +757,79 @@ pub async fn newfstatat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 
 /// `statx(dirfd, pathname, flags, mask, buf)` — extended stat.
 ///
-/// P2-B4 stub: returns -ENOSYS until the encoder + handler land in
-/// commits 3 + 4 of the B4 series.
-pub async fn statx(caller: &mut Caller<'_, Kernel>, _a: [i64; 6]) -> i64 {
-    let _ = caller;
-    -crate::errno::ENOSYS
+/// P2-B4: returns a 256-byte `struct statx` at `buf`. Recognized flags
+/// are `AT_EMPTY_PATH`, `AT_NO_AUTOMOUNT`, `AT_SYMLINK_NOFOLLOW`; any
+/// other bits in `flags` return `-EINVAL` (matches Linux strict mode).
+/// `mask` is accepted but currently we always fill the same fixed set
+/// (BTIME excluded — the host std does not expose btime).
+pub async fn statx(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let dirfd = a[0];
+    let path_ptr = a[1];
+    let flags = a[2] as i32;
+    let _mask = a[3] as u32;
+    let buf_ptr = a[4];
+
+    const RECOGNIZED_FLAGS: i32 = AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_SYMLINK_NOFOLLOW;
+    if flags & !RECOGNIZED_FLAGS != 0 {
+        return -EINVAL;
+    }
+    if let Err(e) = mem::guest_slice_mut(caller, buf_ptr, STATX_SIZE as i64) {
+        return e;
+    }
+
+    let path = match mem::guest_str(caller, path_ptr, 4096) {
+        Ok(s) => s.to_string(),
+        Err(e) => return e,
+    };
+
+    // Build a `Stat` either by stat'ing the fd (AT_EMPTY_PATH + empty
+    // path) or by resolving the path through the VFS. Reuse
+    // `Stat::from_metadata(&meta)` (vfs.rs) and project via
+    // `Statx::from_stat`.
+    let stat = if flags & AT_EMPTY_PATH != 0 && path.is_empty() {
+        let fd = match u32::try_from(dirfd) {
+            Ok(f) => f,
+            Err(_) => return -EBADF,
+        };
+        match caller.data().fds.get(fd) {
+            Ok(Resource::File(fp)) => match fp.inner.metadata() {
+                Ok(meta) => crate::vfs::Stat::from_metadata(&meta),
+                Err(_) => return -EACCES,
+            },
+            Ok(_) => synth_char(),
+            Err(e) => return e,
+        }
+    } else {
+        if path.is_empty() {
+            return -ENOENT;
+        }
+        let (root, cwd) = {
+            let kern = caller.data();
+            (kern.vfs.root.clone(), kern.vfs.cwd.clone())
+        };
+        let vfs = crate::vfs::Vfs { root, cwd };
+        let abs = match vfs.resolve_path(dirfd, &path) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        // AT_SYMLINK_NOFOLLOW is accepted; we don't differentiate here
+        // because the host std always follows symlinks. If we ever need
+        // lstat semantics, swap to std::fs::symlink_metadata.
+        let _ = flags;
+        match vfs.stat(&abs) {
+            Ok(s) => s,
+            Err(e) => return e,
+        }
+    };
+
+    let statx = Statx::from_stat(&stat);
+    let bytes = statx.encode();
+    let slice = match mem::guest_slice_mut(caller, buf_ptr, STATX_SIZE as i64) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    slice.copy_from_slice(&bytes);
+    0
 }
 
 /// `getdents64(fd, buf, len)`.
