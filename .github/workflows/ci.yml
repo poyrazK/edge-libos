@@ -191,7 +191,16 @@ jobs:
           cargo install --locked cargo-deny
           cargo deny check
 
-      - name: 11. Upload binaries (7-day retention)
+      - name: 11. cargo-machete (unused dependency detection)
+        # Walks the dep graph; cheap but needs cargo-machete installed.
+        # The `wasi-delegate` feature stub (Cargo.toml:39-43) is off
+        # by default and won't be flagged.
+        run: |
+          set -euo pipefail
+          cargo install --locked cargo-machete
+          cargo machete
+
+      - name: 12. Upload binaries (7-day retention)
         uses: actions/upload-artifact@v4
         with:
           name: release-binaries
