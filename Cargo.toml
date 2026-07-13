@@ -50,3 +50,24 @@ panic = "abort"
 
 [profile.dev]
 opt-level = 1
+
+# CI-only profile. Production builds still use `release` (opt3 + thin LTO +
+# codegen-units=1 + panic=abort). CI does NOT need those: it only needs
+# binaries that run correctly and a test suite that passes. The expensive
+# release knobs cost ~2-3x compile time, and `panic=abort` forces
+# `cargo test` to recompile the whole dependency graph a second time under
+# `panic=unwind`. This profile removes all of that:
+#   - lto=false, codegen-units=256   → fast, parallel codegen
+#   - panic="unwind"                 → `cargo build` and `cargo test` share
+#                                       ONE dependency compile (no abort/unwind
+#                                       split)
+#   - opt-level=1                    → wasmtime still runs guests fast enough
+#                                       for the smoke tests, but compiles quickly
+# Used via `cargo {build,test} --profile ci` in .github/workflows/ci.yml.
+[profile.ci]
+inherits = "release"
+opt-level = 1
+lto = false
+codegen-units = 256
+panic = "unwind"
+debug = false

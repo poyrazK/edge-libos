@@ -195,13 +195,24 @@ fi
 # Total test count (kept in sync with tests/count_tests.sh). Printed on
 # every run, success or failure, so the operator sees the same number the
 # HANDOFF and README claim.
-list_output=$(cd "$ROOT" && cargo test --release -- --list 2>&1 || true)
-rust_unit=$(printf '%s\n' "$list_output" | grep ': test$' | sed 's/^[[:space:]]*//' | grep -c '::' || true)
-rust_integ=$(printf '%s\n' "$list_output" | grep ': test$' | sed 's/^[[:space:]]*//' | grep -cv '::' || true)
-rust_total=$((rust_unit + rust_integ))
-c_total=$(ls "$ROOT"/tests/conformance/*.c 2>/dev/null | wc -l | tr -d ' ')
-grand=$((rust_total + c_total))
-echo "Test totals: Rust=$rust_total (unit=$rust_unit, integ=$rust_integ), C=$c_total, Grand=$grand"
+#
+# `cargo test --list` compiles the ENTIRE dependency graph just to enumerate
+# tests. In CI this runner is invoked from the `c-conformance` job, which has
+# no cargo cache — so this cosmetic count would trigger a full cold release
+# build of wasmtime. Set SKIP_TEST_COUNT=1 there to skip it; the C count still
+# prints. `tests/count_tests.sh` remains the source of truth off the hot path.
+if [[ "${SKIP_TEST_COUNT:-0}" == "1" ]]; then
+    c_total=$(ls "$ROOT"/tests/conformance/*.c 2>/dev/null | wc -l | tr -d ' ')
+    echo "Test totals: C=$c_total (Rust count skipped: SKIP_TEST_COUNT=1)"
+else
+    list_output=$(cd "$ROOT" && cargo test --release -- --list 2>&1 || true)
+    rust_unit=$(printf '%s\n' "$list_output" | grep ': test$' | sed 's/^[[:space:]]*//' | grep -c '::' || true)
+    rust_integ=$(printf '%s\n' "$list_output" | grep ': test$' | sed 's/^[[:space:]]*//' | grep -cv '::' || true)
+    rust_total=$((rust_unit + rust_integ))
+    c_total=$(ls "$ROOT"/tests/conformance/*.c 2>/dev/null | wc -l | tr -d ' ')
+    grand=$((rust_total + c_total))
+    echo "Test totals: Rust=$rust_total (unit=$rust_unit, integ=$rust_integ), C=$c_total, Grand=$grand"
+fi
 
 if [[ $FAIL -gt 0 ]]; then
     echo "Failed: ${FAIL_NAMES[*]}"
