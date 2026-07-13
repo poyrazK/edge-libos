@@ -150,6 +150,44 @@ int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
 #define NR_MREMAP 25
 #define NR_IOCTL 16
 
+// P2-C3 part 1: socket msg / poll / epoll / eventfd completion.
+#define NR_SENDMSG 46
+#define NR_RECVMSG 47
+#define NR_SELECT 23
+#define NR_PPOLL 271
+#define NR_EPOLL_PWAIT 281
+#define NR_EVENTFD 284
+
+// sendmsg / recvmsg flags.
+#define MSG_PEEK 0x2
+#define MSG_DONTWAIT 0x40
+#define MSG_NOSIGNAL 0x4000
+#define MSG_TRUNC 0x20
+#define MSG_CTRUNC 0x8
+
+// poll(2) event flags.
+#define POLLIN 0x001
+#define POLLOUT 0x004
+#define POLLERR 0x008
+#define POLLHUP 0x010
+#define POLLNVAL 0x020
+
+// epoll(2) flags / events.
+#define EPOLLIN 0x001
+#define EPOLLOUT 0x004
+#define EPOLLERR 0x008
+#define EPOLLHUP 0x010
+#define EPOLL_CTL_ADD 1
+#define EPOLL_CTL_DEL 3
+
+// msghdr layout on wasm32-musl: 8 × 4 = 32 bytes total.
+//   msg_name(u32), msg_namelen(u32), msg_iov(u32), msg_iovlen(u32),
+//   msg_control(u32), msg_controllen(u32), msg_flags(u32), _pad(u32)
+#define MSGHDR_SIZE 32
+// iovec layout on wasm32-musl: 8 bytes total.
+//   iov_base(u32), iov_len(u32)
+#define IOVEC_SIZE 8
+
 // ioctl opcodes.
 #define FIONBIO 0x5421
 #define FIONREAD 0x541B

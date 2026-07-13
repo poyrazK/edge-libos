@@ -30,6 +30,28 @@ pub const NR_ACCEPT4: u32 = 288;
 pub const NR_CONNECT: u32 = 42;
 pub const NR_SENDTO: u32 = 44;
 pub const NR_RECVFROM: u32 = 45;
+// P2-C3 part 1: sendmsg / recvmsg.
+pub const NR_SENDMSG: u32 = 46;
+pub const NR_RECVMSG: u32 = 47;
+
+// sendmsg/recvmsg flag bits (linux/socket.h).
+pub const MSG_PEEK: i32 = 0x2;
+pub const MSG_DONTWAIT: i32 = 0x40;
+pub const MSG_NOSIGNAL: i32 = 0x4000;
+pub const MSG_TRUNC: i32 = 0x20;
+pub const MSG_CTRUNC: i32 = 0x8;
+
+// `struct msghdr` on wasm32-musl: 8 × 4 = 32 bytes
+// (msg_name, msg_namelen, msg_iov, msg_iovlen, msg_control,
+//  msg_controllen, msg_flags, pad).
+pub const MSGHDR_SIZE: i64 = 32;
+const MSG_NAME_OFF: usize = 0;
+const MSG_NAMELEN_OFF: usize = 4;
+const MSG_IOV_OFF: usize = 8;
+const MSG_IOVLEN_OFF: usize = 12;
+const MSG_CONTROL_OFF: usize = 16;
+const MSG_CONTROLLEN_OFF: usize = 20;
+const MSG_FLAGS_OFF: usize = 24;
 
 // setsockopt level + optname constants we honor (per plan §P1-3).
 // All other levels / optnames → 0 (accepted but unmodeled).
@@ -1184,5 +1206,407 @@ mod p1_2_tests {
         let v4 = addr.as_v4().expect("V4 -> Some");
         assert_eq!(*v4.ip(), std::net::Ipv4Addr::new(192, 168, 1, 1));
         assert_eq!(v4.port(), 8080);
+    }
+}
+
+// ─── P2-C3 part 1: sendmsg, recvmsg.
+
+/// Read a `struct msghdr` from guest memory and gather the iovec payload
+/// into a single contiguous `Vec<u8>`. Returns the gathered bytes, the
+/// total length the caller asked for, and the flags from the msghdr.
+fn read_msghdr_iov(
+    caller: &mut Caller<'_, Kernel>,
+    msghdr_ptr: i64,
+) -> Result<(Vec<u8>, i32, bool, i64), i64> {
+    let mhdr = match mem::guest_slice(caller, msghdr_ptr, MSGHDR_SIZE) {
+        Ok(b) => b,
+        Err(e) => return Err(e),
+    };
+    let iov_ptr = u32::from_le_bytes(mhdr[MSG_IOV_OFF..MSG_IOV_OFF + 4].try_into().unwrap()) as i64;
+    let iov_count = u32::from_le_bytes(
+        mhdr[MSG_IOVLEN_OFF..MSG_IOVLEN_OFF + 4].try_into().unwrap(),
+    ) as i64;
+    let flags = i32::from_le_bytes(
+        mhdr[MSG_FLAGS_OFF..MSG_FLAGS_OFF + 4].try_into().unwrap(),
+    );
+
+    if iov_count <= 0 || iov_ptr == 0 {
+        // Empty iovec list (or NULL iov_ptr with zero count): no payload
+        // to send/recv. Matches Linux semantics where msghdr with no
+        // iovecs is valid.
+        return Ok((Vec::new(), flags, true, 0));
+    }
+    let iov_count_us = iov_count as usize;
+    let total_iov_bytes = (iov_count as i64).checked_mul(8).unwrap_or(i64::MAX);
+    let iov_bytes = match mem::guest_slice(caller, iov_ptr, total_iov_bytes) {
+        Ok(b) => b,
+        Err(e) => return Err(e),
+    };
+    let mut payload = Vec::new();
+    let mut total_len: usize = 0;
+    for i in 0..iov_count_us {
+        let base = i * 8;
+        let iov_base = u32::from_le_bytes(iov_bytes[base..base + 4].try_into().unwrap()) as i64;
+        let iov_len = u32::from_le_bytes(iov_bytes[base + 4..base + 8].try_into().unwrap()) as i64;
+        total_len = total_len.saturating_add(iov_len.max(0) as usize);
+        if iov_base != 0 && iov_len > 0 {
+            let data = match mem::guest_slice(caller, iov_base, iov_len) {
+                Ok(d) => d,
+                Err(e) => return Err(e),
+            };
+            payload.extend_from_slice(data);
+        }
+    }
+    Ok((payload, flags, true, total_len as i64))
+}
+
+/// `sendmsg(fd, msghdr, flags)` — gather the iovec payload from the
+/// msghdr and write to the socket. Honors:
+/// * `MSG_DONTWAIT` — flip nonblock for the duration.
+/// * `MSG_NOSIGNAL` — accepted, discarded (we don't deliver SIGPIPE).
+/// * `MSG_PEEK` — invalid for send; ignored.
+/// Other flags accepted silently. Returns the number of bytes written.
+pub async fn sendmsg(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let fd = match u32::try_from(a[0]) {
+        Ok(f) => f,
+        Err(_) => return -EBADF,
+    };
+    let msghdr_ptr = a[1];
+    let flags_in = a[2] as i32;
+
+    // Validate the fd up front so a bogus fd returns EBADF rather than
+    // getting masked by the empty-msghdr fast-path.
+    {
+        let fds = &mut caller.data_mut().fds;
+        match fds.get_mut(fd) {
+            Ok(Resource::Socket(_)) => {}
+            Ok(_) => return -EBADF,
+            Err(_) => return -EBADF,
+        }
+    }
+
+    let (payload, _msg_flags, ok, _total) = match read_msghdr_iov(caller, msghdr_ptr) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if !ok {
+        return -EINVAL;
+    }
+    if payload.is_empty() {
+        return 0;
+    }
+
+    // Honor MSG_DONTWAIT: flip nonblock for the duration of this call.
+    let was_nonblock = if flags_in & MSG_DONTWAIT != 0 {
+        let fds = &mut caller.data_mut().fds;
+        match fds.get_mut(fd) {
+            Ok(Resource::Socket(s)) => {
+                let prev = s.lock().nonblock.load(std::sync::atomic::Ordering::Relaxed);
+                s.lock().nonblock.store(true, std::sync::atomic::Ordering::Relaxed);
+                Some(prev)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // Take the stream out under a short lock; never hold the guard
+    // across .await.
+    let mut stream = {
+        let fds = &mut caller.data_mut().fds;
+        match fds.get_mut(fd) {
+            Ok(Resource::Socket(s)) => {
+                let mut gs = s.lock();
+                if gs.shutdown_flags & 0b10 != 0 {
+                    return -crate::errno::EPIPE;
+                }
+                match gs.stream.take() {
+                    Some(st) => st,
+                    None => return -crate::errno::ENOTCONN,
+                }
+            }
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    };
+
+    use tokio::io::AsyncWriteExt;
+    let res = stream.write(&payload).await;
+
+    // Restore stream and (optionally) nonblock.
+    {
+        let fds = &mut caller.data_mut().fds;
+        if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
+            let mut gs = s.lock();
+            if gs.stream.is_none() {
+                gs.stream = Some(stream);
+            }
+            if let Some(prev) = was_nonblock {
+                gs.nonblock.store(prev, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    match res {
+        Ok(n) => n as i64,
+        Err(_) => -crate::errno::EIO,
+    }
+}
+
+/// `recvmsg(fd, msghdr, flags)` — read into the iovecs named by the
+/// msghdr. Honors:
+/// * `MSG_PEEK` — bytes are stashed in `SocketInner.peek_buf` and not
+///   consumed from the stream.
+/// * `MSG_DONTWAIT` — flip nonblock for the duration.
+/// * `MSG_CTRUNC` — `msg_controllen` is reported as 0 (no ancillary).
+/// * `MSG_TRUNC` — accepted; truncates the read to the buffer capacity.
+pub async fn recvmsg(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    use std::collections::VecDeque;
+    let fd = match u32::try_from(a[0]) {
+        Ok(f) => f,
+        Err(_) => return -EBADF,
+    };
+    let msghdr_ptr = a[1];
+    let flags_in = a[2] as i32;
+    let is_peek = flags_in & MSG_PEEK != 0;
+    let is_dontwait = flags_in & MSG_DONTWAIT != 0;
+
+    // Validate the fd up front so a bogus fd doesn't masquerade as EINVAL
+    // (which it would if we hit the empty-msghdr fast-path first).
+    let is_socket = {
+        let fds = &mut caller.data_mut().fds;
+        match fds.get_mut(fd) {
+            Ok(Resource::Socket(_)) => true,
+            Ok(_) => return -EBADF,
+            Err(_) => return -EBADF,
+        }
+    };
+    let _ = is_socket;
+
+    // Snapshot the msghdr fields we need; for output, we'll write back
+    // msg_controllen=0 (MSG_CTRUNC) and msg_namelen unchanged.
+    let mhdr = match mem::guest_slice(caller, msghdr_ptr, MSGHDR_SIZE) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let iov_ptr = u32::from_le_bytes(mhdr[MSG_IOV_OFF..MSG_IOV_OFF + 4].try_into().unwrap()) as i64;
+    let iov_count = u32::from_le_bytes(
+        mhdr[MSG_IOVLEN_OFF..MSG_IOVLEN_OFF + 4].try_into().unwrap(),
+    ) as i64;
+    let control_ptr = u32::from_le_bytes(
+        mhdr[MSG_CONTROL_OFF..MSG_CONTROL_OFF + 4].try_into().unwrap(),
+    ) as i64;
+    let _control_len = u32::from_le_bytes(
+        mhdr[MSG_CONTROLLEN_OFF..MSG_CONTROLLEN_OFF + 4].try_into().unwrap(),
+    );
+    let name_ptr = u32::from_le_bytes(mhdr[MSG_NAME_OFF..MSG_NAME_OFF + 4].try_into().unwrap()) as i64;
+    let _name_len = u32::from_le_bytes(
+        mhdr[MSG_NAMELEN_OFF..MSG_NAMELEN_OFF + 4].try_into().unwrap(),
+    );
+
+    if iov_count <= 0 || iov_ptr == 0 {
+        return -EINVAL;
+    }
+    let iov_count_us = iov_count as usize;
+    let total_iov_bytes = (iov_count as i64).checked_mul(8).unwrap_or(i64::MAX);
+    let iov_bytes = match mem::guest_slice(caller, iov_ptr, total_iov_bytes) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+
+    // Compute total capacity across all iovecs.
+    let mut total_cap: usize = 0;
+    let mut spans: Vec<(i64, usize)> = Vec::new();
+    for i in 0..iov_count_us {
+        let base = i * 8;
+        let iov_base = u32::from_le_bytes(iov_bytes[base..base + 4].try_into().unwrap()) as i64;
+        let iov_len = u32::from_le_bytes(iov_bytes[base + 4..base + 8].try_into().unwrap()) as i64;
+        let len = iov_len.max(0) as usize;
+        total_cap = total_cap.saturating_add(len);
+        spans.push((iov_base, len));
+    }
+    if total_cap == 0 {
+        return 0;
+    }
+
+    // Honor MSG_DONTWAIT.
+    let was_nonblock = if is_dontwait {
+        let fds = &mut caller.data_mut().fds;
+        match fds.get_mut(fd) {
+            Ok(Resource::Socket(s)) => {
+                let prev = s.lock().nonblock.load(std::sync::atomic::Ordering::Relaxed);
+                s.lock().nonblock.store(true, std::sync::atomic::Ordering::Relaxed);
+                Some(prev)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // Drain peek_buf first if there's anything queued.
+    let mut peeked: Vec<u8> = Vec::new();
+    {
+        let fds = &mut caller.data_mut().fds;
+        if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
+            let mut gs = s.lock();
+            let mut buf = gs.peek_buf.lock();
+            if !buf.is_empty() {
+                let take = buf.len().min(total_cap);
+                peeked.extend(buf.drain(..take));
+            }
+        }
+    }
+    if !peeked.is_empty() {
+        // We have peeked bytes — return them now and skip the actual read.
+        // (peek_buf was populated by a prior recvmsg MSG_PEEK.)
+        copy_bytes_to_spans(caller, &spans, &peeked);
+        write_back_msghdr(caller, msghdr_ptr, control_ptr, name_ptr, 0);
+        // restore nonblock
+        restore_nonblock(caller, fd, was_nonblock);
+        return peeked.len() as i64;
+    }
+
+    // Take the stream out; await outside the lock.
+    let mut stream = {
+        let fds = &mut caller.data_mut().fds;
+        match fds.get_mut(fd) {
+            Ok(Resource::Socket(s)) => {
+                let mut gs = s.lock();
+                if gs.shutdown_flags & 0b01 != 0 {
+                    return 0;
+                }
+                match gs.stream.take() {
+                    Some(st) => st,
+                    None => return -crate::errno::ENOTCONN,
+                }
+            }
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    };
+
+    use tokio::io::AsyncReadExt;
+    let want = total_cap;
+    let mut buf = vec![0u8; want];
+    let read_result = stream.read(&mut buf).await;
+
+    // Restore stream.
+    {
+        let fds = &mut caller.data_mut().fds;
+        if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
+            let mut gs = s.lock();
+            if gs.stream.is_none() {
+                gs.stream = Some(stream);
+            }
+        }
+    }
+
+    let n = match read_result {
+        Ok(n) => n,
+        Err(_) => {
+            restore_nonblock(caller, fd, was_nonblock);
+            return -crate::errno::EIO;
+        }
+    };
+    let data = &buf[..n];
+
+    if is_peek {
+        // Stash the bytes in peek_buf; do NOT consume from the stream.
+        let mut to_stash: VecDeque<u8> = VecDeque::with_capacity(n);
+        to_stash.extend(data.iter().copied());
+        let fds = &mut caller.data_mut().fds;
+        if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
+            // Append to existing peek_buf.
+            s.lock().peek_buf.lock().extend(to_stash);
+        }
+    }
+
+    // Copy into iovec spans.
+    copy_bytes_to_spans(caller, &spans, data);
+
+    // Write back msg_controllen=0 (MSG_CTRUNC) and msg_namelen unchanged.
+    write_back_msghdr(caller, msghdr_ptr, control_ptr, name_ptr, 0);
+
+    restore_nonblock(caller, fd, was_nonblock);
+
+    n as i64
+}
+
+fn copy_bytes_to_spans(
+    caller: &mut Caller<'_, Kernel>,
+    spans: &[(i64, usize)],
+    data: &[u8],
+) {
+    let mut offset = 0;
+    for (base, len) in spans {
+        if offset >= data.len() || *len == 0 {
+            continue;
+        }
+        let take = (data.len() - offset).min(*len);
+        if let Ok(dst) = mem::guest_slice_mut(caller, *base, take as i64) {
+            dst[..take].copy_from_slice(&data[offset..offset + take]);
+        }
+        offset += take;
+    }
+}
+
+fn write_back_msghdr(
+    caller: &mut Caller<'_, Kernel>,
+    msghdr_ptr: i64,
+    control_ptr: i64,
+    _name_ptr: i64,
+    msg_controllen: u32,
+) {
+    // msg_controllen is at offset 20 of msghdr; write back 0 to indicate
+    // MSG_CTRUNC.
+    if let Ok(b) = mem::guest_slice_mut(caller, msghdr_ptr + 20, 4) {
+        b.copy_from_slice(&msg_controllen.to_le_bytes());
+    }
+    let _ = control_ptr; // not used; we never report ancillary data
+}
+
+fn restore_nonblock(
+    caller: &mut Caller<'_, Kernel>,
+    fd: u32,
+    was_nonblock: Option<bool>,
+) {
+    if let Some(prev) = was_nonblock {
+        let fds = &mut caller.data_mut().fds;
+        if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
+            s.lock().nonblock.store(prev, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(test)]
+mod p2_c3_part1_tests {
+    //! P2-C3 part 1: sendmsg/recvmsg constants and flag values.
+    use super::*;
+
+    #[test]
+    fn sendmsg_nr_is_linux_46() {
+        assert_eq!(NR_SENDMSG, 46);
+    }
+
+    #[test]
+    fn recvmsg_nr_is_linux_47() {
+        assert_eq!(NR_RECVMSG, 47);
+    }
+
+    #[test]
+    fn msg_flag_values_match_linux() {
+        assert_eq!(MSG_PEEK, 0x2);
+        assert_eq!(MSG_DONTWAIT, 0x40);
+        assert_eq!(MSG_NOSIGNAL, 0x4000);
+        assert_eq!(MSG_TRUNC, 0x20);
+        assert_eq!(MSG_CTRUNC, 0x8);
+    }
+
+    #[test]
+    fn msghdr_size_is_32_on_wasm32() {
+        // 8 × u32 = 32 bytes.
+        assert_eq!(MSGHDR_SIZE, 32);
     }
 }

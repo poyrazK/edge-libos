@@ -202,6 +202,11 @@ pub struct SocketInner {
     /// (peer accepted, buffer drained). epoll_wait subscribes to this
     /// for `EPOLLOUT` watchers.
     pub notify_write: Arc<tokio::sync::Notify>,
+    /// P2-C3: PEEK buffer for `recvmsg(MSG_PEEK)`. Bytes peeked from the
+    /// stream are stashed here; subsequent non-peek reads drain this
+    /// queue first. Lock briefly when accessing; never hold a Mutex
+    /// guard across `.await`.
+    pub peek_buf: parking_lot::Mutex<VecDeque<u8>>,
 }
 
 impl SocketInner {
@@ -222,6 +227,7 @@ impl SocketInner {
             is_acceptor: false,
             notify_read: Arc::new(tokio::sync::Notify::new()),
             notify_write: Arc::new(tokio::sync::Notify::new()),
+            peek_buf: parking_lot::Mutex::new(VecDeque::new()),
         }
     }
 

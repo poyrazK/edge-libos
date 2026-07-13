@@ -588,7 +588,15 @@ pub async fn read(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                 if let Err(e) = eventfd::require_u64_buf(buf_len_raw) {
                     return e;
                 }
-                let val = eventfd::eventfd_read(e);
+                let val = match eventfd::eventfd_read(e) {
+                    Ok(v) => v,
+                    Err(e) => return e,
+                };
+                if val == 0 {
+                    // Blocking read with empty counter — nothing to do in
+                    // this v1 model (no real block), return 0 (EOF).
+                    return 0;
+                }
                 let bytes = val.to_ne_bytes();
                 let buf = match mem::guest_slice_mut(caller, buf_ptr, 8) {
                     Ok(b) => b,

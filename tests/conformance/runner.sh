@@ -133,6 +133,12 @@ expected_syscall() {
         arch_prctl)        echo "arch_prctl" ;;
         nanosleep)         echo "nanosleep" ;;
         exit)              echo "exit" ;;
+        sendmsg)           echo "sendmsg" ;;
+        recvmsg)           echo "recvmsg" ;;
+        ppoll)             echo "ppoll" ;;
+        epoll_pwait)       echo "epoll_pwait" ;;
+        select)            echo "select" ;;
+        eventfd_legacy)    echo "eventfd" ;;
         *) echo "UNREGISTERED: $1" >&2; return 1 ;;
     esac
 }

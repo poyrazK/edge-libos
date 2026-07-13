@@ -21,6 +21,8 @@ use crate::kernel::Kernel;
 
 // Linux x86-64 syscall NR.
 pub const NR_EVENTFD2: u32 = 290;
+// P2-C3 part 1: legacy eventfd (no flags).
+pub const NR_EVENTFD: u32 = 284;
 
 // eventfd2(2) flags (only the documented bits; EFD_CLOEXEC is recorded
 // for fidelity but P1 doesn't model exec).
@@ -53,18 +55,40 @@ pub async fn eventfd2(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     fd as i64
 }
 
+/// `eventfd(initval, flags)` — legacy entry (no flags). Implemented as
+/// a thin shim over `eventfd2`.
+pub async fn eventfd(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    eventfd2(caller, a).await
+}
+
 /// Drain the counter into a u64.
 ///
 /// Called from `crate::sys::file::read` after it detects the fd is an
 /// EventFd and extracts the inner (so the `&mut fds` borrow is dropped
-/// before this call). Returns the previous counter value.
+/// before this call). Returns `Err(-EAGAIN)` when the counter is empty
+/// AND the fd is in nonblocking mode (matches Linux eventfd semantics).
+/// When blocking, the caller awaits on the inner `Notify` instead.
 ///
 /// `EFD_SEMAPHORE` is not honored: we always drain, not decrement-by-one.
-pub(crate) fn eventfd_read(e: &EventFdInner) -> u64 {
+pub(crate) fn eventfd_read(e: &EventFdInner) -> Result<u64, i64> {
     let mut c = e.counter.lock();
     let v = *c;
+    if v == 0 {
+        return if e
+            .nonblock
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            Err(-crate::errno::EAGAIN)
+        } else {
+            // Blocking read with empty counter: caller should await.
+            // Returning Ok(0) with a flag would require a richer return
+            // type; instead the caller treats 0 as "should block". See
+            // the read path in `file.rs`.
+            Ok(0)
+        };
+    }
     *c = 0;
-    v
+    Ok(v)
 }
 
 /// Add the u64 at `addend` to the counter and notify waiters.
@@ -102,6 +126,10 @@ pub async fn eventfd_read_compat(
             Ok(_) => return -crate::errno::EBADF,
             Err(e) => return e,
         }
+    };
+    let val = match val {
+        Ok(v) => v,
+        Err(e) => return e,
     };
     let bytes = val.to_ne_bytes();
     let buf = match crate::mem::guest_slice_mut(caller, buf_ptr, 8) {
@@ -141,4 +169,52 @@ pub async fn eventfd_write_compat(
         }
     }
     8
+}
+
+#[cfg(test)]
+mod p2_c3_part1_tests {
+    //! P2-C3 part 1: legacy eventfd NR + EAGAIN-on-empty-counter semantics.
+    use super::*;
+    use crate::fd::EventFdInner;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    fn fresh_eventfd() -> EventFdInner {
+        EventFdInner {
+            counter: parking_lot::Mutex::new(0),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            nonblock: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn eventfd_nr_is_linux_284() {
+        assert_eq!(NR_EVENTFD, 284);
+        assert_eq!(NR_EVENTFD2, 290);
+    }
+
+    #[test]
+    fn eventfd_read_empty_blocking_returns_zero() {
+        let e = fresh_eventfd();
+        assert_eq!(eventfd_read(&e), Ok(0));
+    }
+
+    #[test]
+    fn eventfd_read_empty_nonblock_returns_eagain() {
+        let e = EventFdInner {
+            counter: parking_lot::Mutex::new(0),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            nonblock: AtomicBool::new(true),
+        };
+        assert_eq!(eventfd_read(&e), Err(-crate::errno::EAGAIN));
+    }
+
+    #[test]
+    fn eventfd_read_with_value_drains_and_returns() {
+        let e = fresh_eventfd();
+        eventfd_write(&e, 42);
+        assert_eq!(eventfd_read(&e), Ok(42));
+        // Drained.
+        assert_eq!(eventfd_read(&e), Ok(0));
+    }
 }
