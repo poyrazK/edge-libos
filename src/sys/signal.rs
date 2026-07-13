@@ -103,10 +103,8 @@ pub fn rt_sigaction(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         let flags = prev.flags as u32;
         bytes[SIG_HANDLER_REAL_OFF..SIG_HANDLER_REAL_OFF + 4]
             .copy_from_slice(&handler.to_le_bytes());
-        bytes[SIG_FLAGS_REAL_OFF..SIG_FLAGS_REAL_OFF + 4]
-            .copy_from_slice(&flags.to_le_bytes());
-        bytes[SIG_MASK_REAL_OFF..SIG_MASK_REAL_OFF + 8]
-            .copy_from_slice(&prev.mask.to_le_bytes());
+        bytes[SIG_FLAGS_REAL_OFF..SIG_FLAGS_REAL_OFF + 4].copy_from_slice(&flags.to_le_bytes());
+        bytes[SIG_MASK_REAL_OFF..SIG_MASK_REAL_OFF + 8].copy_from_slice(&prev.mask.to_le_bytes());
         bytes[SIG_RESTORER_REAL_OFF..SIG_RESTORER_REAL_OFF + 4]
             .copy_from_slice(&(prev.restorer as u32).to_le_bytes());
     }
@@ -227,9 +225,7 @@ pub fn sigaltstack(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
             Err(e) => return e,
         };
         // Honor SS_DISABLE explicitly: clear alt_stack.
-        let flags = i32::from_le_bytes(
-            bytes[SS_FLAGS_OFF..SS_FLAGS_OFF + 4].try_into().unwrap(),
-        );
+        let flags = i32::from_le_bytes(bytes[SS_FLAGS_OFF..SS_FLAGS_OFF + 4].try_into().unwrap());
         if flags & SS_DISABLE != 0 {
             caller.data_mut().signals.alt_stack = None;
         } else {

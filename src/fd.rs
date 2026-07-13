@@ -290,10 +290,10 @@ impl SocketInner {
             return 1; // AF_UNIX
         }
         match self.bound {
-            Some(SockAddr::V4 { .. }) => 2,    // AF_INET
-            Some(SockAddr::V6 { .. }) => 10,   // AF_INET6
-            Some(SockAddr::Unix { .. }) => 1,  // AF_UNIX (defensive — family_unix catches first)
-            None => 2,                          // default AF_INET for unbound
+            Some(SockAddr::V4 { .. }) => 2,   // AF_INET
+            Some(SockAddr::V6 { .. }) => 10,  // AF_INET6
+            Some(SockAddr::Unix { .. }) => 1, // AF_UNIX (defensive — family_unix catches first)
+            None => 2,                        // default AF_INET for unbound
         }
     }
 }

@@ -56,8 +56,8 @@ async fn run(wasm_path: &str, _script_args: &[String]) -> Result<i32> {
     let kernel = Kernel::new(vec![], vec![]);
 
     let mut store = build_store(&engine, kernel);
-    let bytes = std::fs::read(wasm_path)
-        .map_err(|e| anyhow::anyhow!("reading {wasm_path}: {e}"))?;
+    let bytes =
+        std::fs::read(wasm_path).map_err(|e| anyhow::anyhow!("reading {wasm_path}: {e}"))?;
     let module = if bytes.len() >= 4 && &bytes[0..4] == b"\0asm" {
         wasmtime::Module::new(&engine, &bytes)?
     } else {
@@ -75,12 +75,9 @@ async fn run(wasm_path: &str, _script_args: &[String]) -> Result<i32> {
 
     // Call `_start`. Multiple signatures: () -> void (zig cc / CPython),
     // () -> i32 (emscripten).
-    let call_result = if let Ok(start) =
-        instance.get_typed_func::<(), ()>(&mut store, "_start")
-    {
+    let call_result = if let Ok(start) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
         start.call_async(&mut store, ()).await
-    } else if let Ok(start) = instance.get_typed_func::<(), i32>(&mut store, "_start")
-    {
+    } else if let Ok(start) = instance.get_typed_func::<(), i32>(&mut store, "_start") {
         start.call_async(&mut store, ()).await.map(|_| ())
     } else {
         eprintln!("edge-python: no _start export in {wasm_path}");

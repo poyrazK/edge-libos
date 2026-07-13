@@ -111,7 +111,8 @@ impl LinearAllocator {
         // 2. Need a fresh arena; check if we have room.
         let needed = self.high_water as usize + ARENA_SIZE;
         if needed > cur_mem_size {
-            let pages = ((needed - cur_mem_size + PAGE_SIZE as usize - 1) / PAGE_SIZE as usize) as u64;
+            let pages =
+                ((needed - cur_mem_size + PAGE_SIZE as usize - 1) / PAGE_SIZE as usize) as u64;
             return MmapResult::NeedGrow(pages);
         }
 
@@ -148,12 +149,7 @@ impl LinearAllocator {
     /// Strategy: if the existing range lives in an arena and the arena
     /// has free space at the end (or in the free list adjacent to it),
     /// just bump `used`. Otherwise return `-ENOMEM`.
-    pub fn grow_in_place(
-        &mut self,
-        old: u32,
-        old_len: usize,
-        new_len: usize,
-    ) -> Result<u32, i64> {
+    pub fn grow_in_place(&mut self, old: u32, old_len: usize, new_len: usize) -> Result<u32, i64> {
         if new_len <= old_len {
             return Ok(old);
         }
@@ -165,9 +161,7 @@ impl LinearAllocator {
             };
             // The existing allocation must be at the top of the arena
             // (rel + old_len == arena.used) for us to safely grow it.
-            if rel + old_len == arena.used
-                && arena.used + extra <= ARENA_SIZE
-            {
+            if rel + old_len == arena.used && arena.used + extra <= ARENA_SIZE {
                 arena.used += extra;
                 return Ok(old);
             }

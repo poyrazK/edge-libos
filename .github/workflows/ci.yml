@@ -147,7 +147,25 @@ jobs:
           set -euo pipefail
           bash scripts/check_nr_consistency.sh
 
-      - name: 5. cargo test --profile ci (full Rust suite, one compile)
+      - name: 5. cargo fmt --check (formatting drift gate)
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+
+      - name: 6. cargo clippy --all-targets (lint gate, -D warnings)
+        # Shares build's warm target/ci/ — marginal cost is ~30-60 s on
+        # warm cache, ~3-6 min on cold. The lint config lives in
+        # Cargo.toml [lints.clippy] / [lints.rust].
+        run: |
+          set -euo pipefail
+          cargo clippy --profile ci --all-targets -- -D warnings
+
+      - name: 7. cargo doc --no-deps (broken-docs gate)
+        run: |
+          set -euo pipefail
+          RUSTDOCFLAGS="-D warnings" cargo doc --profile ci --no-deps --document-private-items
+
+      - name: 8. cargo test --profile ci (full Rust suite, one compile)
         # Compiles the whole graph ONCE (unwind + no LTO). Includes the
         # strace_baseline_diff and edge_python_* integration tests, so
         # they don't need separate invocations.
@@ -155,7 +173,7 @@ jobs:
           set -euo pipefail
           cargo test --profile ci
 
-      - name: 5. cargo build --profile ci binaries (reuses step 4)
+      - name: 9. cargo build --profile ci binaries (reuses step 8)
         run: |
           set -euo pipefail
           cargo build --profile ci --bin trace-host --bin edge-python
@@ -165,7 +183,7 @@ jobs:
           cp target/ci/trace-host target/ci/edge-python target/release/
           ls -la target/release/trace-host target/release/edge-python
 
-      - name: 6. Upload binaries (7-day retention)
+      - name: 10. Upload binaries (7-day retention)
         uses: actions/upload-artifact@v4
         with:
           name: release-binaries

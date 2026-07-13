@@ -45,8 +45,8 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 /// Compile the guest WAT and run the full DoD sequence.
 #[test]
 fn serve_one_request_end_to_end() -> Result<()> {
-    let wat_src = std::fs::read_to_string(WAT_PATH)
-        .map_err(|e| anyhow::anyhow!("read {WAT_PATH}: {e}"))?;
+    let wat_src =
+        std::fs::read_to_string(WAT_PATH).map_err(|e| anyhow::anyhow!("read {WAT_PATH}: {e}"))?;
     let (engine, linker) = common::engine_and_linker()?;
     let module = common::compile_wat(&engine, &wat_src)?;
 
@@ -107,7 +107,8 @@ fn serve_one_request_end_to_end() -> Result<()> {
 
         // Read the response.
         let mut buf = Vec::new();
-        let read_result = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf)).await;
+        let read_result =
+            tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf)).await;
         let _ = guest_handle.await;
 
         let n = read_result
@@ -137,8 +138,8 @@ fn serve_one_request_end_to_end() -> Result<()> {
 /// but at the WAT-source level (the runner.sh covers C tests).
 #[test]
 fn guest_wat_uses_correct_syscall_numbers() -> Result<()> {
-    let wat = std::fs::read_to_string(WAT_PATH)
-        .map_err(|e| anyhow::anyhow!("read {WAT_PATH}: {e}"))?;
+    let wat =
+        std::fs::read_to_string(WAT_PATH).map_err(|e| anyhow::anyhow!("read {WAT_PATH}: {e}"))?;
     // NR constants used in the guest:
     let expect_nrs: &[(u32, &str)] = &[
         (3, "close"),
@@ -169,8 +170,8 @@ fn guest_wat_uses_correct_syscall_numbers() -> Result<()> {
 /// a fast compile check.)
 #[test]
 fn guest_wat_compiles_and_instantiates() -> Result<()> {
-    let wat_src = std::fs::read_to_string(WAT_PATH)
-        .map_err(|e| anyhow::anyhow!("read {WAT_PATH}: {e}"))?;
+    let wat_src =
+        std::fs::read_to_string(WAT_PATH).map_err(|e| anyhow::anyhow!("read {WAT_PATH}: {e}"))?;
     let (engine, linker) = common::engine_and_linker()?;
     let _module = common::compile_wat(&engine, &wat_src)?;
     // Instantiate briefly — fail fast if the linker can't resolve

@@ -177,7 +177,10 @@ fn munmap_then_mmap_works() -> Result<()> {
         REUSE_AFTER_FREE_WAT,
         "alloc_free_alloc",
     ))?;
-    assert!(second > 0, "second mmap after munmap must return a positive address (got {second})");
+    assert!(
+        second > 0,
+        "second mmap after munmap must return a positive address (got {second})"
+    );
     Ok(())
 }
 
@@ -286,7 +289,11 @@ fn munmap_returns_einval_for_out_of_arena() -> Result<()> {
     "#;
     let (engine, linker) = common::engine_and_linker()?;
     let ret = block_on(run_noargs(&engine, &linker, WAT, "go"))?;
-    assert_eq!(ret, -errno::EINVAL, "munmap of unmapped range must return -EINVAL");
+    assert_eq!(
+        ret,
+        -errno::EINVAL,
+        "munmap of unmapped range must return -EINVAL"
+    );
     Ok(())
 }
 

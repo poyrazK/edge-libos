@@ -158,7 +158,15 @@ pub async fn epoll_ctl(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
             let fds = &mut caller.data_mut().fds;
             match fds.get_mut(epfd) {
                 Ok(Resource::Epoll(e)) => {
-                    e.entries.lock().insert(fd, EpollEntry { fd, events, data, wake });
+                    e.entries.lock().insert(
+                        fd,
+                        EpollEntry {
+                            fd,
+                            events,
+                            data,
+                            wake,
+                        },
+                    );
                 }
                 _ => return -EBADF,
             }
@@ -187,7 +195,15 @@ pub async fn epoll_ctl(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
             let fds = &mut caller.data_mut().fds;
             match fds.get_mut(epfd) {
                 Ok(Resource::Epoll(e)) => {
-                    e.entries.lock().insert(fd, EpollEntry { fd, events, data, wake });
+                    e.entries.lock().insert(
+                        fd,
+                        EpollEntry {
+                            fd,
+                            events,
+                            data,
+                            wake,
+                        },
+                    );
                 }
                 _ => return -EBADF,
             }
@@ -278,10 +294,8 @@ pub async fn epoll_wait(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     };
 
     // Clone the wake primitives so they outlive the await.
-    let wakes: Vec<Arc<tokio::sync::Notify>> = entries_snapshot
-        .values()
-        .map(|e| e.wake.clone())
-        .collect();
+    let wakes: Vec<Arc<tokio::sync::Notify>> =
+        entries_snapshot.values().map(|e| e.wake.clone()).collect();
     let cancel_for_wait = cancel.clone();
 
     tokio::select! {
@@ -449,14 +463,20 @@ fn compute_revents(fds: &crate::fd::FdTable, fd: u32, requested: u32) -> u32 {
         }
         Resource::File(_) => {
             // Regular files are always ready in both directions.
-            if (requested & EPOLLIN) != 0 { r |= EPOLLIN; }
-            if (requested & EPOLLOUT) != 0 { r |= EPOLLOUT; }
+            if (requested & EPOLLIN) != 0 {
+                r |= EPOLLIN;
+            }
+            if (requested & EPOLLOUT) != 0 {
+                r |= EPOLLOUT;
+            }
         }
         Resource::EventFd(_) => {
             // P1-7: eventfd counter changes are observable via read().
             // We don't actually read it here (we'd need the buffer); just
             // signal readable so the caller knows something happened.
-            if (requested & EPOLLIN) != 0 { r |= EPOLLIN; }
+            if (requested & EPOLLIN) != 0 {
+                r |= EPOLLIN;
+            }
         }
         Resource::Epoll(_) => {
             // Epoll fds aren't supported as watch targets in P1-7.
@@ -483,9 +503,9 @@ fn pack_events(
         let off = i * EPOLL_EVENT_SIZE;
         // wasm32-musl `struct epoll_event` is 12 bytes: u32 events + u64 data.
         // `data` is preserved through the round-trip from `EpollEntry::data`
-        // (set by the guest's `EPOLL_CTL_ADD`).
-        let ev_u32: u32 = revents & 0xFFFF_FFFF;
-        buf[off..off + 4].copy_from_slice(&ev_u32.to_le_bytes());
+        // (set by the guest's `EPOLL_CTL_ADD`). `revents` is the low 32
+        // bits of the kernel-shaped epoll_event.events field.
+        buf[off..off + 4].copy_from_slice(&revents.to_le_bytes());
         buf[off + 4..off + 12].copy_from_slice(&entry.data.to_le_bytes());
     }
     count as i64
@@ -526,7 +546,11 @@ pub async fn epoll_pwait(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         (sec as i64).saturating_mul(1000) + (nsec as i64) / 1_000_000
     };
 
-    epoll_wait(caller, [epfd as i64, events_ptr, maxevents as i64, timeout_ms, 0, 0]).await
+    epoll_wait(
+        caller,
+        [epfd as i64, events_ptr, maxevents as i64, timeout_ms, 0, 0],
+    )
+    .await
 }
 
 #[cfg(test)]

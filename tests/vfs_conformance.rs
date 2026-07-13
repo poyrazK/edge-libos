@@ -18,8 +18,7 @@ impl TmpDir {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
-        let dir =
-            std::env::temp_dir().join(format!("edge-libos-vfs-test-{pid}-{id}"));
+        let dir = std::env::temp_dir().join(format!("edge-libos-vfs-test-{pid}-{id}"));
         fs::create_dir_all(&dir).unwrap();
         Self(dir)
     }
@@ -856,7 +855,11 @@ fn getcwd_returns_root_path() -> Result<()> {
         assert_eq!(data[nul_pos], 0, "kernel must NUL-terminate at byte {n}");
         Ok::<_, anyhow::Error>((r, data[8192..nul_pos].to_vec()))
     })?;
-    assert_eq!(ret as usize, path_bytes.len(), "returned length must match bytes written");
+    assert_eq!(
+        ret as usize,
+        path_bytes.len(),
+        "returned length must match bytes written"
+    );
     assert!(!path_bytes.is_empty(), "cwd should not be empty");
     Ok(())
 }
@@ -877,7 +880,11 @@ fn getcwd_truncates_returns_erange() -> Result<()> {
         let f = inst.get_typed_func::<i64, i64>(&mut store, "go")?;
         f.call_async(&mut store, 4_i64).await
     })?;
-    assert_eq!(ret, -edge_libos::errno::ERANGE, "tiny buf must return -ERANGE");
+    assert_eq!(
+        ret,
+        -edge_libos::errno::ERANGE,
+        "tiny buf must return -ERANGE"
+    );
     Ok(())
 }
 
@@ -993,8 +1000,11 @@ fn stat_faulty_path_returns_efault_not_enoent() -> Result<()> {
         let f = inst.get_typed_func::<(), i64>(&mut store, "go")?;
         f.call_async(&mut store, ()).await
     })?;
-    assert_eq!(ret, -edge_libos::errno::EFAULT,
-        "stat() with OOB path pointer must return -EFAULT (not -ENOENT)");
+    assert_eq!(
+        ret,
+        -edge_libos::errno::EFAULT,
+        "stat() with OOB path pointer must return -EFAULT (not -ENOENT)"
+    );
     Ok(())
 }
 
@@ -1016,7 +1026,11 @@ fn stat_existing_missing_file_returns_enoent() -> Result<()> {
         let f = inst.get_typed_func::<(), i64>(&mut store, "go")?;
         f.call_async(&mut store, ()).await
     })?;
-    assert_eq!(ret, -edge_libos::errno::ENOENT, "stat() on missing file should return -ENOENT");
+    assert_eq!(
+        ret,
+        -edge_libos::errno::ENOENT,
+        "stat() on missing file should return -ENOENT"
+    );
     Ok(())
 }
 
@@ -1036,7 +1050,11 @@ fn lstat_existing_missing_file_returns_enoent() -> Result<()> {
         let f = inst.get_typed_func::<(), i64>(&mut store, "go")?;
         f.call_async(&mut store, ()).await
     })?;
-    assert_eq!(ret, -edge_libos::errno::ENOENT, "lstat() on missing file should return -ENOENT");
+    assert_eq!(
+        ret,
+        -edge_libos::errno::ENOENT,
+        "lstat() on missing file should return -ENOENT"
+    );
     Ok(())
 }
 
@@ -1066,7 +1084,10 @@ fn readv_short_read() -> Result<()> {
         let f = readv_inst.get_typed_func::<i64, i64>(&mut store, "go")?;
         f.call_async(&mut store, fd).await
     })?;
-    assert_eq!(ret, 2, "readv into 6-byte iov from 2-byte file should return 2");
+    assert_eq!(
+        ret, 2,
+        "readv into 6-byte iov from 2-byte file should return 2"
+    );
     Ok(())
 }
 
@@ -1123,7 +1144,10 @@ fn getcwd_exact_size_returns_path() -> Result<()> {
         Ok::<_, anyhow::Error>((r1, r2))
     })?;
     assert!(probe > 0, "probe must return positive length, got {probe}");
-    assert_eq!(exact_fit, probe, "exact-fit getcwd must return the same path length as probe");
+    assert_eq!(
+        exact_fit, probe,
+        "exact-fit getcwd must return the same path length as probe"
+    );
     Ok(())
 }
 
@@ -1147,8 +1171,11 @@ fn getcwd_one_byte_short_returns_erange() -> Result<()> {
         // One byte short — no room for the trailing NUL.
         f.call_async(&mut store, r1).await
     })?;
-    assert_eq!(ret, -edge_libos::errno::ERANGE,
-        "size == cwd.len() must return -ERANGE (no room for NUL)");
+    assert_eq!(
+        ret,
+        -edge_libos::errno::ERANGE,
+        "size == cwd.len() must return -ERANGE (no room for NUL)"
+    );
     Ok(())
 }
 
@@ -1183,7 +1210,11 @@ fn stat_empty_path_returns_enoent() -> Result<()> {
         let f = inst.get_typed_func::<(), i64>(&mut store, "go")?;
         f.call_async(&mut store, ()).await
     })?;
-    assert_eq!(ret, -edge_libos::errno::ENOENT, "stat(\"\") should return -ENOENT");
+    assert_eq!(
+        ret,
+        -edge_libos::errno::ENOENT,
+        "stat(\"\") should return -ENOENT"
+    );
     Ok(())
 }
 
@@ -1216,6 +1247,10 @@ fn lstat_empty_path_returns_enoent() -> Result<()> {
         let f = inst.get_typed_func::<(), i64>(&mut store, "go")?;
         f.call_async(&mut store, ()).await
     })?;
-    assert_eq!(ret, -edge_libos::errno::ENOENT, "lstat(\"\") should return -ENOENT");
+    assert_eq!(
+        ret,
+        -edge_libos::errno::ENOENT,
+        "lstat(\"\") should return -ENOENT"
+    );
     Ok(())
 }
