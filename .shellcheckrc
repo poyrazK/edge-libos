@@ -15,5 +15,31 @@
 #            scripts/reproduce_dod.sh read ${SKIP_*_SETUP} / ${SKIP_BUILD}
 #            etc. which are environment-variable inputs (defaulted to "0"
 #            further down). shellcheck can't trace env-var assignment.
+#
+#   SC2012 — "Use find instead of ls". tests/count_tests.sh and
+#            tests/conformance/runner.sh use `ls tests/conformance/*.c`
+#            to count version-controlled test fixtures. The names are
+#            pinned (no whitespace, no newlines) so the warning is
+#            theoretical; switching to `find ... -maxdepth 1` would
+#            slow these 1-shot cosmetic counters without buying anything.
+#
+#   SC2015 — "A && B || C is not if-then-else". tests/conformance/runner.sh
+#            uses `cargo test --release -- --list 2>&1 || true` to swallow
+#            a missing-cargo path (SKIP_TEST_COUNT). The `|| true` makes
+#            the &&/|| not actually be an if-then-else; shellcheck can't
+#            trace that. Comment at the call site documents intent.
+#
+#   SC2016 — "Expressions don't expand in single quotes". scripts/preflight.sh
+#            passes single-quoted shell snippets to `bash -c ...` for
+#            run_step; the `$0`-style args inside those snippets are
+#            intentionally literal at preflight-time (they expand inside
+#            the sub-bash).
+#
+# `guest/build.sh` exports CC="$ZIG cc -target wasm32-freestanding -O2"
+# at the top as a conventional overridable handle (build-script readers
+# expect to be able to `CC=other-cc ./guest/build.sh`); shellcheck can't
+# trace through Makefile-generated recipes at line 63. SC2034 is silenced
+# only for that single declaration via an inline `# shellcheck disable=SC2034`
+# next to the variable.
 
-disable=SC2317,SC2154
+disable=SC2317,SC2154,SC2012,SC2015,SC2016

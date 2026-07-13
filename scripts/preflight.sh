@@ -27,7 +27,6 @@ cd "$ROOT"
 
 PASS=0
 FAIL=0
-SKIPPED=0
 FAILED_STEPS=()
 
 # Run a step: print its number + name, run the command, record exit.
