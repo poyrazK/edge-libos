@@ -165,6 +165,16 @@ int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
 #define NR_SYSINFO 99
 #define NR_TIMES 100
 
+// Mirrored NRs (P2-CI-2 NR-consistency gate). These NRs are present in
+// src/dispatch.rs but had no C conformance test yet, so no #define had
+// been needed. Adding them here so check_nr_consistency.sh sees a
+// three-way mirror.
+#define NR_ACCEPT 43
+#define NR_ACCEPT4 288
+#define NR_EXIT_GROUP 231
+#define NR_MADVISE 28
+#define NR_NEWFSTATAT 262
+
 // sendmsg / recvmsg flags.
 #define MSG_PEEK 0x2
 #define MSG_DONTWAIT 0x40
