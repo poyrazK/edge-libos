@@ -613,14 +613,13 @@ pub async fn openat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         Err(e) => return e,
     };
 
-    let (root, cwd) = {
-        let kern = caller.data();
-        (kern.vfs.root.clone(), kern.vfs.cwd.clone())
-    };
-    let vfs = Vfs { root, cwd };
-    let abs = match vfs.resolve_path(dirfd, &path) {
+    let abs = match crate::sys::path::resolve(caller, dirfd, &path) {
         Ok(p) => p,
         Err(e) => return e,
+    };
+    let vfs = {
+        let kern = caller.data();
+        Vfs { root: kern.vfs.root.clone(), cwd: kern.vfs.cwd.clone() }
     };
     let _ = mode;
     let file = match vfs.open(&abs, flags, mode) {
@@ -748,14 +747,13 @@ pub async fn newfstatat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         return -ENOENT;
     }
 
-    let (root, cwd) = {
-        let kern = caller.data();
-        (kern.vfs.root.clone(), kern.vfs.cwd.clone())
-    };
-    let vfs = Vfs { root, cwd };
-    let abs = match vfs.resolve_path(dirfd, &path) {
+    let abs = match crate::sys::path::resolve(caller, dirfd, &path) {
         Ok(p) => p,
         Err(e) => return e,
+    };
+    let vfs = {
+        let kern = caller.data();
+        Vfs { root: kern.vfs.root.clone(), cwd: kern.vfs.cwd.clone() }
     };
     let stat = match vfs.stat(&abs) {
         Ok(s) => s,
@@ -815,14 +813,13 @@ pub async fn statx(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         if path.is_empty() {
             return -ENOENT;
         }
-        let (root, cwd) = {
-            let kern = caller.data();
-            (kern.vfs.root.clone(), kern.vfs.cwd.clone())
-        };
-        let vfs = crate::vfs::Vfs { root, cwd };
-        let abs = match vfs.resolve_path(dirfd, &path) {
+        let abs = match crate::sys::path::resolve(caller, dirfd, &path) {
             Ok(p) => p,
             Err(e) => return e,
+        };
+        let vfs = {
+            let kern = caller.data();
+            crate::vfs::Vfs { root: kern.vfs.root.clone(), cwd: kern.vfs.cwd.clone() }
         };
         // AT_SYMLINK_NOFOLLOW is accepted; we don't differentiate here
         // because the host std always follows symlinks. If we ever need

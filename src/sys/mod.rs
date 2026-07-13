@@ -13,6 +13,7 @@ pub mod eventfd;
 pub mod file;
 pub mod identity;
 pub mod memory;
+pub mod path;
 pub mod poll;
 pub mod process;
 pub mod random;
