@@ -1,35 +1,38 @@
 # GitHub Actions CI for edge-libos.
 #
-# Single 'verify' job on ubuntu-22.04. Mirrors the local verification
-# harness (`scripts/preflight.sh`) step-for-step so "green CI" implies
-# "would also pass locally on a fresh checkout" and vice versa.
+# 4 parallel jobs (build → 3 fans) — replaces the previous single 14-step
+# job. Wall-clock target: 4-5 min vs ~13 min before.
+#
+# Job graph:
+#
+#   tools ──▶ build ──┬──▶ rust-tests
+#                     ├──▶ c-tests
+#                     └──▶ reproduce
+#
+# All jobs run on ubuntu-22.04.
 #
 # Triggers:
 #   - push to main
-#   - pull_request against any branch (so feature branches get CI too)
+#   - pull_request against any branch
 #
-# Pipeline summary (14 steps):
-#   1.  checkout (with future-proof submodule recursion)
-#   2.  pin rust toolchain to 1.93.0 (matches rust-toolchain.toml)
-#   3.  cache ~/.cargo + target/ (aggressive)
-#   4.  cache wasm32 target (warm-up for A6)
-#   5.  install zig 0.16.0 via release tarball (apt's zig is 0.10)
-#   6.  install wabt (apt) — for wat2wasm
-#   7.  install strace (apt) — for Linux baseline diff
-#   8.  cargo build --release trace-host + edge-python
-#   9.  cargo test --release                  (~all Rust tests)
-#   10. bash tests/conformance/runner.sh      (marker-enforced C tests; CI gate)
-#   11. cargo test --release --test strace_baseline_diff
-#   12. bash scripts/reproduce_dod.sh          (8-step DoD; skips CPython steps)
-#   13. upload trace-host + edge-python as artifacts
-#   14. bash tests/count_tests.sh             (canonical test-total summary)
+# Required checks (set in docs/branch-protection.md):
+#   - tools        : checkpoint + toolchain install + caches
+#   - build        : cargo build --release, uploads release binaries
+#   - rust-tests   : cargo test --release (full Rust suite)
+#   - c-tests      : marker-enforced C conformance via zig cc
+#   - reproduce    : reproduce_dod.sh in CI fan-out mode (skips work
+#                    the other jobs already covered)
 #
-# Decisions (P2-CI-1 plan):
-#   - ubuntu-22.04 only (per user choice; AF_UNIX macOS would double CI minutes)
+# Local mirror: scripts/preflight.sh — but preflight runs the whole suite
+# sequentially (no fan-out); the workflow and preflight share CI-1's
+# setup steps exactly, then diverge only in job structure.
+#
+# Decisions (P2-CI-1 + P2-CI-2):
+#   - ubuntu-22.04 only (per user choice; AF_UNIX macOS would double minutes)
 #   - Aggressive caching on Cargo.lock (per user choice)
-#   - Skip CPython steps in step 12 until A6 lands (per user choice)
-#
-# Local mirror: scripts/preflight.sh. Keep this file and preflight in sync.
+#   - 5 env SKIP_* hooks in reproduce_dod.sh let the parallel jobs not
+#     duplicate cargo test / c conformance / strace diff (per user choice)
+#   - Skip CPython steps in reproduce until A6 lands (per user choice)
 
 name: verify
 
@@ -43,30 +46,26 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# No permissions are needed beyond the defaults for this job.
+# No permissions are needed beyond the defaults for these jobs.
 permissions:
   contents: read
 
-jobs:
-  verify:
-    name: verify (ubuntu-22.04)
-    runs-on: ubuntu-22.04
-    timeout-minutes: 15
+# Shared environment + version pins. Every job inherits these.
+env:
+  ZIG_VERSION: "0.16.0"
+  CARGO_TERM_COLOR: always
 
-    env:
-      # Pin zig exactly. dev_setup.sh also documents this URL.
-      ZIG_VERSION: "0.16.0"
-      # Repository root (default in Actions; explicit for clarity).
-      ROOT: ${{ github.workspace }}
-      # Keep release binaries small and reproducible.
-      CARGO_TERM_COLOR: always
+jobs:
+  # ─── Stage 1: prepare the toolchain ────────────────────────────────
+  tools:
+    name: toolchain + caches
+    runs-on: ubuntu-22.04
+    timeout-minutes: 8
 
     steps:
       - name: 1. Checkout
         uses: actions/checkout@v4
         with:
-          # Future-proof for A6 (cpython submodule). When the submodule
-          # is absent, checkout is a no-op for submodules.
           submodules: recursive
           lfs: false
 
@@ -79,7 +78,6 @@ jobs:
       - name: 3. Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
-          # Auto-keyed on Cargo.lock; no manual key needed.
           workspaces: |
             ${{ github.workspace }} -> target
           cache-on-failure: true
@@ -103,8 +101,6 @@ jobs:
         # https://ziglang.org/download/index.json on 2026-07-13.
         # Use the absolute /opt/zig path for THIS step's verification, and
         # also export PATH + persist GITHUB_PATH for subsequent steps.
-        env:
-          ZIG_VERSION: ${{ env.ZIG_VERSION }}
         run: |
           set -euo pipefail
           ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
@@ -114,12 +110,8 @@ jobs:
           sudo tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
           echo "/opt/zig" | sudo tee /etc/ld.so.conf.d/zig.conf >/dev/null
           sudo ldconfig
-          # Persist /opt/zig on PATH for subsequent steps in this job.
           echo "/opt/zig" | sudo tee -a "$GITHUB_PATH" >/dev/null
           rm -f /tmp/zig.tar.xz
-          # In this step's shell, /opt/zig is NOT on PATH yet — use the
-          # absolute path so `zig version` runs against the freshly installed
-          # binary.
           /opt/zig/zig version
 
       - name: 6. Install wabt (wat2wasm)
@@ -135,36 +127,44 @@ jobs:
           sudo apt-get install -y -qq strace
           strace --version 2>&1 | head -1
 
-      - name: 8. cargo build --release (trace-host + edge-python)
+  # ─── Stage 2: build release binaries + upload artifacts ────────────
+  build:
+    name: cargo build --release (binaries)
+    runs-on: ubuntu-22.04
+    needs: tools
+    timeout-minutes: 12
+
+    steps:
+      - name: 1. Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: false
+
+      - name: 2. Install Rust toolchain (1.93.0)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - name: 3. Cache cargo registry + target (build shares cache key)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            ${{ github.workspace }} -> target
+          cache-on-failure: true
+          cache-directories: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+
+      - name: 4. cargo build --release trace-host + edge-python
         run: |
           set -euo pipefail
           cargo build --release --bin trace-host --bin edge-python
+          ls -la target/release/trace-host target/release/edge-python
+          file target/release/trace-host
 
-      - name: 9. cargo test --release
-        run: |
-          set -euo pipefail
-          cargo test --release
-
-      - name: 10. C conformance (marker-enforced, CI gate)
-        # This is the gating step. A single failed C test fails CI.
-        run: |
-          set -euo pipefail
-          bash tests/conformance/runner.sh
-
-      - name: 11. Strace baseline diff
-        run: |
-          set -euo pipefail
-          cargo test --release --test strace_baseline_diff
-
-      - name: 12. scripts/reproduce_dod.sh (8 steps; CPython steps auto-skip)
-        # Steps 6-8 of reproduce_dod.sh skip automatically until A6 lands
-        # the guest/cpython submodule (the script's existing skip mechanism
-        # falls back to edge_python_smoke + edge_python_import_smoke).
-        run: |
-          set -uo pipefail
-          bash scripts/reproduce_dod.sh
-
-      - name: 13. Upload release binaries (7-day retention)
+      - name: 5. Upload release binaries (7-day retention)
         uses: actions/upload-artifact@v4
         with:
           name: release-binaries
@@ -172,8 +172,150 @@ jobs:
             target/release/trace-host
             target/release/edge-python
           retention-days: 7
-          if-no-files-found: warn
+          if-no-files-found: error
 
-      - name: 14. Print canonical test total
+  # ─── Stage 3a: full Rust test suite ────────────────────────────────
+  rust-tests:
+    name: cargo test --release
+    runs-on: ubuntu-22.04
+    needs: tools  # uses toolchain + cargo cache; binaries fetched separately
+    timeout-minutes: 12
+
+    steps:
+      - name: 1. Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: false
+
+      - name: 2. Install Rust toolchain (1.93.0)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - name: 3. Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            ${{ github.workspace }} -> target
+          cache-on-failure: true
+
+      - name: 4. Run all Rust tests
         run: |
-          bash tests/count_tests.sh
+          set -euo pipefail
+          cargo test --release
+
+  # ─── Stage 3b: marker-enforced C conformance ───────────────────────
+  c-tests:
+    name: C conformance (marker-enforced, CI gate)
+    runs-on: ubuntu-22.04
+    needs: [tools, build]   # needs zig (tools) AND trace-host (build)
+    timeout-minutes: 8
+
+    steps:
+      - name: 1. Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: false
+
+      - name: 2. Install Rust toolchain (1.93.0)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - name: 3. Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            ${{ github.workspace }} -> target
+          cache-on-failure: true
+
+      - name: 4. Reinstall zig 0.16.0 (each job gets its own runner)
+        run: |
+          set -euo pipefail
+          ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          sudo mkdir -p /opt/zig
+          curl -fSL --retry 3 -o /tmp/zig.tar.xz "$ZIG_URL"
+          sudo tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          echo "/opt/zig" | sudo tee /etc/ld.so.conf.d/zig.conf >/dev/null
+          sudo ldconfig
+          echo "/opt/zig" | sudo tee -a "$GITHUB_PATH" >/dev/null
+          rm -f /tmp/zig.tar.xz
+          /opt/zig/zig version
+
+      - name: 5. Install wabt (for wat2wasm; C runner may compile .wat)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wabt
+          wat2wasm --version
+
+      - name: 6. Download release binaries (trace-host)
+        uses: actions/download-artifact@v4
+        with:
+          name: release-binaries
+          path: target/release
+
+      - name: 7. C conformance (marker-enforced)
+        # This is the gating step. A single failed C test fails CI.
+        run: |
+          set -euo pipefail
+          ls -la target/release/trace-host
+          bash tests/conformance/runner.sh
+
+  # ─── Stage 3c: full reproduce_dod.sh (with skips for parallel work) ─
+  reproduce:
+    name: reproduce_dod.sh (fan-out mode)
+    runs-on: ubuntu-22.04
+    needs: [tools, build]
+    timeout-minutes: 12
+
+    env:
+      # The parallel jobs (rust-tests, c-tests) already covered cargo test
+      # and the C conformance gate. Skip those steps inside reproduce_dod.sh
+      # so it can focus on the integration pieces (dev_setup, guest build,
+      # DoD smoke tests, count totals).
+      SKIP_DEV_SETUP: "1"     # tools job already installed everything
+      SKIP_BUILD: "1"         # build job already built
+      SKIP_RUST_TEST: "1"     # rust-tests job already ran cargo test
+      SKIP_C_CONFORMANCE: "1" # c-tests job already ran the C runner
+      SKIP_STRACE_DIFF: "1"   # optional extra; uncomment if you want it back
+
+    steps:
+      - name: 1. Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: false
+
+      - name: 2. Install Rust toolchain (1.93.0)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - name: 3. Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            ${{ github.workspace }} -> target
+          cache-on-failure: true
+
+      - name: 4. Install strace (used by some baseline diff scripts)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq strace
+          strace --version 2>&1 | head -1
+
+      - name: 5. Download release binaries (trace-host + edge-python)
+        uses: actions/download-artifact@v4
+        with:
+          name: release-binaries
+          path: target/release
+
+      - name: 6. Run scripts/reproduce_dod.sh (skips parallel work)
+        run: |
+          set -uo pipefail
+          ls -la target/release/
+          bash scripts/reproduce_dod.sh
