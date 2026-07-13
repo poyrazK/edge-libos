@@ -9,6 +9,7 @@
 //! streams, not seekable files).
 
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use wasmtime::Caller;
@@ -66,6 +67,43 @@ pub const NR_FTRUNCATE: u32 = 77;
 pub const RENAME_NOREPLACE: i32 = 0x1;
 pub const RENAME_EXCHANGE: i32 = 0x2;
 pub const RENAME_WHITEOUT: i32 = 0x4;
+
+// P2-C1 part 3: readlink / readlinkat / symlink / symlinkat / link / linkat
+//                utimensat / chmod / fchmod / fchmodat
+//                faccessat / faccessat2 / chdir / chroot.
+pub const NR_READLINK: u32 = 89;
+pub const NR_READLINKAT: u32 = 267;
+pub const NR_SYMLINK: u32 = 88;
+pub const NR_SYMLINKAT: u32 = 266;
+pub const NR_LINK: u32 = 86;
+pub const NR_LINKAT: u32 = 265;
+pub const NR_UTIMENSAT: u32 = 280;
+pub const NR_CHMOD: u32 = 90;
+pub const NR_FCHMOD: u32 = 91;
+pub const NR_FCHMODAT: u32 = 268;
+pub const NR_FACCESSAT: u32 = 269;
+pub const NR_FACCESSAT2: u32 = 439;
+pub const NR_CHDIR: u32 = 80;
+pub const NR_CHROOT: u32 = 161;
+
+// faccessat(2) mode bits (linux/fcntl.h).
+pub const R_OK: i32 = 4;
+pub const W_OK: i32 = 2;
+pub const X_OK: i32 = 1;
+pub const F_OK: i32 = 0;
+
+// fchmodat(2) flags.
+pub const AT_SYMLINK_NOFOLLOW_FCHMODAT: i32 = 0x100;
+
+// utimensat(2) flags.
+pub const AT_SYMLINK_NOFOLLOW_UTIMENSAT: i32 = 0x100;
+
+// faccessat(2) flags.
+pub const AT_EACCESS: i32 = 0x200;
+
+// Linux PATH_MAX. readlink truncates to `buf_len`; if the link is longer
+// than `buf_len` it returns -ENAMETOOLONG.
+pub const PATH_MAX: i64 = 4096;
 
 /// Map a `std::io::Error` to a positive errno. Mirrors the helper in
 /// `vfs.rs` — kept local here so `sys/file.rs` doesn't depend on
@@ -1779,6 +1817,361 @@ fn synth_char() -> Stat {
         st_mtime_nsec: 0,
         st_ctime: 0,
         st_ctime_nsec: 0,
+    }
+}
+
+// ─── P2-C1 part 3: readlink, readlinkat, symlink, symlinkat, link, linkat,
+//     utimensat, chmod, fchmod, fchmodat, faccessat, faccessat2, chdir, chroot.
+
+/// `readlink(path, buf, buf_len)` — read the target of a symlink. Writes
+/// up to `buf_len` bytes (no NUL terminator). Returns the number of bytes
+/// written, or -EINVAL if the path is not a symlink.
+pub async fn readlink(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    readlinkat(caller, [-100, a[0], a[1], a[2], 0, 0]).await
+}
+
+/// `readlinkat(dirfd, path, buf, buf_len)` — symlink read with explicit
+/// dirfd. Truncates the link target to `buf_len`; if the link is longer
+/// than `buf_len` it returns -ENAMETOOLONG (= -36).
+pub async fn readlinkat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let dirfd = a[0];
+    let path_ptr = a[1];
+    let buf_ptr = a[2];
+    let buf_len = match usize::try_from(a[3]) {
+        Ok(n) => n,
+        Err(_) => return -EINVAL,
+    };
+
+    let path = match mem::guest_str(caller, path_ptr, PATH_MAX) {
+        Ok(s) => s.to_string(),
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return -ENOENT;
+    }
+    let abs = match crate::sys::path::resolve(caller, dirfd, &path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    let target = match std::fs::read_link(&abs) {
+        Ok(p) => p,
+        Err(e) => return -io_to_errno(e),
+    };
+    let bytes = target.to_string_lossy().into_owned().into_bytes();
+    if bytes.len() > buf_len {
+        return -crate::errno::ENAMETOOLONG;
+    }
+    let buf = match mem::guest_slice_mut(caller, buf_ptr, bytes.len() as i64) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    buf.copy_from_slice(&bytes);
+    bytes.len() as i64
+}
+
+/// `symlink(target, linkpath)` — create a symlink at `linkpath` whose
+/// contents are `target`. `target` is not resolved; it is stored verbatim.
+pub async fn symlink(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    symlinkat(caller, [a[0], -100, a[1], 0, 0, 0]).await
+}
+
+/// `symlinkat(target, newdirfd, linkpath)` — symlink with explicit dirfd.
+pub async fn symlinkat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let target_ptr = a[0];
+    let dirfd = a[1];
+    let path_ptr = a[2];
+
+    let target = match mem::guest_str(caller, target_ptr, PATH_MAX) {
+        Ok(s) => s.to_string(),
+        Err(e) => return e,
+    };
+    let path = match mem::guest_str(caller, path_ptr, PATH_MAX) {
+        Ok(s) => s.to_string(),
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return -ENOENT;
+    }
+    let abs = match crate::sys::path::resolve(caller, dirfd, &path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    match std::os::unix::fs::symlink(&target, &abs) {
+        Ok(()) => 0,
+        Err(e) => -io_to_errno(e),
+    }
+}
+
+/// `link(oldpath, newpath)` — create a hard link. AT_EMPTY_PATH not
+/// modeled; returns -EINVAL if the new path is empty.
+pub async fn link(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    linkat(caller, [-100, a[0], -100, a[1], 0, 0]).await
+}
+
+/// `linkat(olddirfd, oldpath, newdirfd, newpath, flags)` — hard link with
+/// explicit dirfds. AT_EMPTY_PATH (0x1000) and AT_SYMLINK_FOLLOW (0x400)
+/// are ignored.
+pub async fn linkat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let olddirfd = a[0];
+    let old_ptr = a[1];
+    let newdirfd = a[2];
+    let new_ptr = a[3];
+    let flags = a[4] as i32;
+    let _ = flags; // AT_EMPTY_PATH / AT_SYMLINK_FOLLOW ignored
+
+    let old = match mem::guest_str(caller, old_ptr, PATH_MAX) {
+        Ok(s) => s.to_string(),
+        Err(e) => return e,
+    };
+    let new = match mem::guest_str(caller, new_ptr, PATH_MAX) {
+        Ok(s) => s.to_string(),
+        Err(e) => return e,
+    };
+    if old.is_empty() || new.is_empty() {
+        return -ENOENT;
+    }
+    let old_abs = match crate::sys::path::resolve(caller, olddirfd, &old) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let new_abs = match crate::sys::path::resolve(caller, newdirfd, &new) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    match std::fs::hard_link(&old_abs, &new_abs) {
+        Ok(()) => 0,
+        Err(e) => -io_to_errno(e),
+    }
+}
+
+/// `utimensat(dirfd, path, times, flags)` — set file timestamps. `times`
+/// is a pointer to an array of two `struct timespec` (16 bytes each, 32
+/// bytes total) on wasm32-musl. `NULL` times sets both atime+mtime to the
+/// current time.
+///
+/// `AT_SYMLINK_NOFOLLOW` is ignored — host std always follows.
+pub async fn utimensat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let dirfd = a[0];
+    let path_ptr = a[1];
+    let times_ptr = a[2];
+    let flags = a[3] as i32;
+    let _ = flags; // AT_SYMLINK_NOFOLLOW ignored
+
+    let path = match mem::guest_str(caller, path_ptr, PATH_MAX) {
+        Ok(s) => s.to_string(),
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return -ENOENT;
+    }
+    let abs = match crate::sys::path::resolve(caller, dirfd, &path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    // Read two timespecs (16 bytes each on wasm32-musl: tv_sec i64, tv_nsec i64).
+    let (atime, mtime) = if times_ptr == 0 {
+        (std::time::SystemTime::now(), std::time::SystemTime::now())
+    } else {
+        let bytes = match mem::guest_slice(caller, times_ptr, 32) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        let atime = timespec_from_bytes(&bytes[0..16]);
+        let mtime = timespec_from_bytes(&bytes[16..32]);
+        (atime, mtime)
+    };
+
+    let f = match std::fs::OpenOptions::new().write(true).open(&abs) {
+        Ok(f) => f,
+        Err(e) => return -io_to_errno(e),
+    };
+    // mtime is what most filesystems persist; atime is best-effort and
+    // not exposed via std on stable for File::set_accessed. We swallow
+    // any atime error since the syscall's main observable effect is mtime.
+    let _ = atime;
+    match f.set_modified(mtime) {
+        Ok(()) => 0,
+        Err(e) => -io_to_errno(e),
+    }
+}
+
+fn timespec_from_bytes(b: &[u8]) -> std::time::SystemTime {
+    // tv_sec: 8 bytes little-endian; tv_nsec: 8 bytes LE.
+    let sec = i64::from_le_bytes(b[0..8].try_into().unwrap());
+    let nsec = i64::from_le_bytes(b[8..16].try_into().unwrap());
+    if sec < 0 || nsec < 0 {
+        return std::time::UNIX_EPOCH;
+    }
+    std::time::UNIX_EPOCH
+        + std::time::Duration::from_secs(sec as u64)
+        + std::time::Duration::from_nanos(nsec as u64)
+}
+
+/// `chmod(path, mode)` — change permissions of the file at `path`. Only
+/// the low 12 bits of `mode` are honored (S_ISUID | S_ISGID | S_ISVTX |
+/// 3×rwx). Symlinks are followed.
+pub async fn chmod(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    fchmodat(caller, [-100, a[0], a[1], 0, 0, 0]).await
+}
+
+/// `fchmod(fd, mode)` — change permissions via fd.
+///
+/// Lock discipline: brief lock to clone the `File`, drop guard, call
+/// `set_permissions` outside the lock.
+pub async fn fchmod(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let fd = a[0] as u32;
+    let mode_raw = a[1] as u32;
+    let mode = mode_raw & 0o7777;
+
+    // Look up + try_clone under a short lock, then drop guard.
+    let file_clone = {
+        let fds = &mut caller.data_mut().fds;
+        match fds.get_mut(fd) {
+            Ok(Resource::File(fp)) => {
+                let fp = fp.lock();
+                match fp.inner.try_clone() {
+                    Ok(f) => f,
+                    Err(e) => return -io_to_errno(e),
+                }
+            }
+            Ok(_) => return -crate::errno::EBADF,
+            Err(e) => return e,
+        }
+    };
+
+    let mut perms = match file_clone.metadata() {
+        Ok(m) => m.permissions(),
+        Err(e) => return -io_to_errno(e),
+    };
+    perms.set_mode(mode);
+    match file_clone.set_permissions(perms) {
+        Ok(()) => 0,
+        Err(e) => -io_to_errno(e),
+    }
+}
+
+/// `fchmodat(dirfd, path, mode, flags)` — chmod with explicit dirfd.
+/// `AT_SYMLINK_NOFOLLOW (0x100)` is ignored (host std follows). `flags=0`
+/// or empty path is the same as plain `chmod`.
+pub async fn fchmodat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let dirfd = a[0];
+    let path_ptr = a[1];
+    let mode_raw = a[2] as u32;
+    let flags = a[3] as i32;
+    let mode = mode_raw & 0o7777;
+    let _ = flags;
+
+    let path = match mem::guest_str(caller, path_ptr, PATH_MAX) {
+        Ok(s) => s.to_string(),
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return -ENOENT;
+    }
+    let abs = match crate::sys::path::resolve(caller, dirfd, &path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    match std::fs::set_permissions(&abs, std::fs::Permissions::from_mode(mode)) {
+        Ok(()) => 0,
+        Err(e) => -io_to_errno(e),
+    }
+}
+
+/// `faccessat(dirfd, path, mode, flags)` — check access. `mode` bits:
+/// `R_OK (4)`, `W_OK (2)`, `X_OK (1)`. `F_OK (0)` checks existence.
+/// `AT_EACCESS (0x200)` and `AT_SYMLINK_NOFOLLOW (0x100)` are ignored.
+pub async fn faccessat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    faccessat2(caller, a).await
+}
+
+/// `faccessat2(dirfd, path, mode, flags)` — same as `faccessat` but with
+/// a fixed `flags` layout (added in Linux 5.8).
+pub async fn faccessat2(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let dirfd = a[0];
+    let path_ptr = a[1];
+    let mode = a[2] as i32;
+    let _flags = a[3] as i32;
+
+    let path = match mem::guest_str(caller, path_ptr, PATH_MAX) {
+        Ok(s) => s.to_string(),
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return -ENOENT;
+    }
+    let abs = match crate::sys::path::resolve(caller, dirfd, &path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let meta = match std::fs::metadata(&abs) {
+        Ok(m) => m,
+        Err(e) => return -io_to_errno(e),
+    };
+    let perms = meta.permissions();
+    let readonly = perms.readonly();
+    let m = perms.mode();
+
+    // F_OK (mode 0): existence only.
+    if mode == F_OK {
+        return 0;
+    }
+    if mode & R_OK != 0 && (m & 0o444) == 0 {
+        return -crate::errno::EACCES;
+    }
+    if mode & W_OK != 0 && (readonly || (m & 0o222) == 0) {
+        return -crate::errno::EACCES;
+    }
+    if mode & X_OK != 0 && (m & 0o111) == 0 {
+        return -crate::errno::EACCES;
+    }
+    0
+}
+
+/// `chdir(path)` — change the working directory. Resolves via the
+/// `path::resolve` helper (so dirfd-as-fd is honored). Permanent for
+/// the process.
+pub async fn chdir(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let path_ptr = a[0];
+    let path = match mem::guest_str(caller, path_ptr, PATH_MAX) {
+        Ok(s) => s.to_string(),
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return -ENOENT;
+    }
+    let abs = match crate::sys::path::resolve(caller, -100, &path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    match caller.data_mut().vfs.chdir(&abs) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// `chroot(path)` — set the new root for path resolution. **Permanent**
+/// for the process (no saved-root model). Sets both `root` and `cwd` to
+/// `path`.
+pub async fn chroot(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let path_ptr = a[0];
+    let path = match mem::guest_str(caller, path_ptr, PATH_MAX) {
+        Ok(s) => s.to_string(),
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return -ENOENT;
+    }
+    let abs = match crate::sys::path::resolve(caller, -100, &path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    match caller.data_mut().vfs.chroot(&abs) {
+        Ok(()) => 0,
+        Err(e) => e,
     }
 }
 

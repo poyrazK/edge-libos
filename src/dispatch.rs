@@ -170,6 +170,22 @@ pub async fn dispatch(
         sys::file::NR_RENAMEAT2 => sys::file::renameat2(&mut caller, a).await,
         sys::file::NR_TRUNCATE => sys::file::truncate(&mut caller, a).await,
         sys::file::NR_FTRUNCATE => sys::file::ftruncate(&mut caller, a).await,
+        // P2-C1 part 3: readlink / symlink / link / utimensat / chmod /
+        // faccessat / chdir / chroot (+at variants).
+        sys::file::NR_READLINK => sys::file::readlink(&mut caller, a).await,
+        sys::file::NR_READLINKAT => sys::file::readlinkat(&mut caller, a).await,
+        sys::file::NR_SYMLINK => sys::file::symlink(&mut caller, a).await,
+        sys::file::NR_SYMLINKAT => sys::file::symlinkat(&mut caller, a).await,
+        sys::file::NR_LINK => sys::file::link(&mut caller, a).await,
+        sys::file::NR_LINKAT => sys::file::linkat(&mut caller, a).await,
+        sys::file::NR_UTIMENSAT => sys::file::utimensat(&mut caller, a).await,
+        sys::file::NR_CHMOD => sys::file::chmod(&mut caller, a).await,
+        sys::file::NR_FCHMOD => sys::file::fchmod(&mut caller, a).await,
+        sys::file::NR_FCHMODAT => sys::file::fchmodat(&mut caller, a).await,
+        sys::file::NR_FACCESSAT => sys::file::faccessat(&mut caller, a).await,
+        sys::file::NR_FACCESSAT2 => sys::file::faccessat2(&mut caller, a).await,
+        sys::file::NR_CHDIR => sys::file::chdir(&mut caller, a).await,
+        sys::file::NR_CHROOT => sys::file::chroot(&mut caller, a).await,
 
         // Sockets (P1-1: socket only; bind/listen/accept/connect/recv/send
         // land in later sub-steps).
@@ -272,6 +288,21 @@ pub fn syscall_name(nr: u32) -> &'static str {
         sys::file::NR_RENAMEAT2 => "renameat2",
         sys::file::NR_TRUNCATE => "truncate",
         sys::file::NR_FTRUNCATE => "ftruncate",
+        // P2-C1 part 3
+        sys::file::NR_READLINK => "readlink",
+        sys::file::NR_READLINKAT => "readlinkat",
+        sys::file::NR_SYMLINK => "symlink",
+        sys::file::NR_SYMLINKAT => "symlinkat",
+        sys::file::NR_LINK => "link",
+        sys::file::NR_LINKAT => "linkat",
+        sys::file::NR_UTIMENSAT => "utimensat",
+        sys::file::NR_CHMOD => "chmod",
+        sys::file::NR_FCHMOD => "fchmod",
+        sys::file::NR_FCHMODAT => "fchmodat",
+        sys::file::NR_FACCESSAT => "faccessat",
+        sys::file::NR_FACCESSAT2 => "faccessat2",
+        sys::file::NR_CHDIR => "chdir",
+        sys::file::NR_CHROOT => "chroot",
 
         sys::socket::NR_SOCKET => "socket",
         sys::socket::NR_BIND => "bind",

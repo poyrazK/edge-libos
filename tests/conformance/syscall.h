@@ -107,6 +107,29 @@ int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
 #define NR_TRUNCATE 76
 #define NR_FTRUNCATE 77
 
+// P2-C1 part 3: readlink / symlink / link / utimensat / chmod / faccessat /
+// chdir / chroot (+at variants).
+#define NR_READLINK 89
+#define NR_READLINKAT 267
+#define NR_SYMLINK 88
+#define NR_SYMLINKAT 266
+#define NR_LINK 86
+#define NR_LINKAT 265
+#define NR_UTIMENSAT 280
+#define NR_CHMOD 90
+#define NR_FCHMOD 91
+#define NR_FCHMODAT 268
+#define NR_FACCESSAT 269
+#define NR_FACCESSAT2 439
+#define NR_CHDIR 80
+#define NR_CHROOT 161
+
+// faccessat mode bits (linux/fcntl.h).
+#define F_OK 0
+#define R_OK 4
+#define W_OK 2
+#define X_OK 1
+
 // Standard *at() dirfd values. AT_FDCWD = -100 means "use cwd".
 #define AT_FDCWD (-100)
 

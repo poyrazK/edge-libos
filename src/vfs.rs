@@ -216,6 +216,19 @@ impl Vfs {
         self.cwd = abs.to_path_buf();
         Ok(())
     }
+
+    /// Set `abs` as the new root + cwd. P2-C1 `chroot(2)`: there is no
+    /// saved-root model; the change is permanent for the process.
+    /// `abs` must exist and be a directory.
+    pub fn chroot(&mut self, abs: &Path) -> VfsResult<()> {
+        let meta = fs::metadata(abs).map_err(io_to_errno)?;
+        if !meta.is_dir() {
+            return Err(-ENOTDIR);
+        }
+        self.root = abs.to_path_buf();
+        self.cwd = abs.to_path_buf();
+        Ok(())
+    }
 }
 
 /// Linux `struct stat` for wasm32-musl (120 bytes).
