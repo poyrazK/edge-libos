@@ -27,6 +27,12 @@ Milestones use CPython as the acceptance criterion: P0 (boot a guest — proven 
 CPython) ✅, P1 (serve one HTTP request via uvicorn's epoll/eventfd syscall
 sequence) ✅, P2 (production-ish single instance) 🚧.
 
+##Behavioral 
+
+Never commit main unless user wants 
+Our workflows : determine the goal/issue , create imp plan , create new branch , commit small , create pr , review , verify all ci green and merge 
+NEVER EVER merge , its users job 
+
 ## Commands
 
 ```bash
