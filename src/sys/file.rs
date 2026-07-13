@@ -19,6 +19,7 @@ use crate::fd::Resource;
 use crate::kernel::Kernel;
 use crate::mem;
 use crate::sys::eventfd;
+use crate::sys::socket;
 use crate::vfs::{Stat, Vfs};
 
 // NR_* (Linux x86-64 unistd_64.h)
@@ -605,6 +606,19 @@ pub async fn read(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                 buf[..8].copy_from_slice(&bytes);
                 return 8;
             }
+            Resource::Socket(_s) => {
+                // P2-C3 part 2: dispatch read(2) against a Socket to the
+                // existing recvfrom(fd, buf, len, flags=0, addr=0, addrlen=0)
+                // path. recvfrom already covers both V4 and AF_UNIX streams
+                // and honors SHUT_RD EOF semantics.
+                drop(tmp);
+                drop(eof);
+                return socket::recvfrom(
+                    caller,
+                    [a[0], a[1], a[2], 0, 0, 0],
+                )
+                .await;
+            }
             _ => return -EBADF,
         }
     }
@@ -682,6 +696,18 @@ pub async fn write(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                 let addend = u64::from_ne_bytes(be);
                 let _new = eventfd::eventfd_write(e, addend);
                 8
+            }
+            Resource::Socket(_s) => {
+                // P2-C3 part 2: dispatch write(2) against a Socket to the
+                // existing sendto(fd, buf, len, flags=0, addr=0, addrlen=0)
+                // path. sendto already covers both V4 and AF_UNIX streams
+                // and honors SHUT_WR EPIPE semantics.
+                drop(bytes);
+                return socket::sendto(
+                    caller,
+                    [a[0], a[1], a[2], 0, 0, 0],
+                )
+                .await;
             }
             _ => return -EBADF,
         }

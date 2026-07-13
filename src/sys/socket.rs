@@ -33,6 +33,8 @@ pub const NR_RECVFROM: u32 = 45;
 // P2-C3 part 1: sendmsg / recvmsg.
 pub const NR_SENDMSG: u32 = 46;
 pub const NR_RECVMSG: u32 = 47;
+// P2-C3 part 2: socketpair + AF_UNIX.
+pub const NR_SOCKETPAIR: u32 = 53;
 
 // sendmsg/recvmsg flag bits (linux/socket.h).
 pub const MSG_PEEK: i32 = 0x2;
@@ -86,6 +88,9 @@ pub const SOCK_CLOEXEC: i32 = 0o2000000;
 pub const SOCKADDR_STORAGE_SIZE: usize = 128; // sizeof(struct sockaddr_storage)
 pub const SOCKADDR_IN_SIZE: usize = 16;
 pub const SOCKADDR_IN6_SIZE: usize = 28;
+/// `struct sockaddr_un` on Linux is 2 (sun_family) + 108 (sun_path) = 110 bytes.
+/// We round up to 112 to keep the write-back 4-byte aligned.
+pub const SOCKADDR_UN_SIZE: usize = 110;
 
 /// `socket(family, type_and_flags, protocol)` — allocate a fresh socket fd.
 ///
@@ -93,6 +98,8 @@ pub const SOCKADDR_IN6_SIZE: usize = 28;
 /// `AF_INET` and `AF_INET6`; types are `SOCK_STREAM` and `SOCK_DGRAM`.
 /// `protocol` is ignored (always 0 today). Unknown family → -EAFNOSUPPORT;
 /// unsupported type for a known family → -EPROTONOSUPPORT.
+///
+/// P2-C3 part 2: `AF_UNIX` + `SOCK_STREAM`/`SOCK_DGRAM` accepted.
 pub async fn socket(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let family = a[0] as i32;
     let type_and_flags = a[1] as i32;
@@ -109,15 +116,20 @@ pub async fn socket(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         (AF_INET, SOCK_DGRAM) => SocketKind::Datagram,
         (AF_INET6, SOCK_STREAM) => SocketKind::Stream,
         (AF_INET6, SOCK_DGRAM) => SocketKind::Datagram,
+        // P2-C3 part 2: AF_UNIX stream + dgram.
+        (AF_UNIX, SOCK_STREAM) => SocketKind::Stream,
+        (AF_UNIX, SOCK_DGRAM) => SocketKind::Datagram,
         // Known families but unsupported types (e.g. AF_INET SOCK_SEQPACKET).
-        (AF_INET | AF_INET6, _) => return -EPROTONOSUPPORT,
-        // AF_UNIX is P2.
-        (AF_UNIX, _) => return -EAFNOSUPPORT,
+        (AF_INET | AF_INET6 | AF_UNIX, _) => return -EPROTONOSUPPORT,
         // Everything else: family not supported.
         _ => return -EAFNOSUPPORT,
     };
 
-    let inner = std::sync::Arc::new(parking_lot::Mutex::new(SocketInner::new(kind, nonblock)));
+    let inner = if family == AF_UNIX {
+        std::sync::Arc::new(parking_lot::Mutex::new(SocketInner::new_unix(kind, nonblock)))
+    } else {
+        std::sync::Arc::new(parking_lot::Mutex::new(SocketInner::new(kind, nonblock)))
+    };
     let fd = caller
         .data_mut()
         .fds
@@ -138,14 +150,23 @@ pub fn socket_for_test(
     let kind = match (family, sock_type) {
         (AF_INET, SOCK_STREAM) | (AF_INET6, SOCK_STREAM) => SocketKind::Stream,
         (AF_INET, SOCK_DGRAM) | (AF_INET6, SOCK_DGRAM) => SocketKind::Datagram,
-        (AF_INET | AF_INET6, _) => return Err(-EPROTONOSUPPORT),
-        (AF_UNIX, _) => return Err(-EAFNOSUPPORT),
+        (AF_UNIX, SOCK_STREAM) | (AF_UNIX, SOCK_DGRAM) => {
+            if sock_type == SOCK_STREAM {
+                SocketKind::Stream
+            } else {
+                SocketKind::Datagram
+            }
+        }
+        (AF_INET | AF_INET6 | AF_UNIX, _) => return Err(-EPROTONOSUPPORT),
         _ => return Err(-EAFNOSUPPORT),
     };
     let _ = nonblock;
-    Ok(fds.insert(Resource::Socket(std::sync::Arc::new(parking_lot::Mutex::new(
-        SocketInner::new(kind, false),
-    )))))
+    let inner = if family == AF_UNIX {
+        SocketInner::new_unix(kind, false)
+    } else {
+        SocketInner::new(kind, false)
+    };
+    Ok(fds.insert(Resource::Socket(std::sync::Arc::new(parking_lot::Mutex::new(inner)))))
 }
 
 #[cfg(test)]
@@ -224,7 +245,33 @@ fn parse_sockaddr(caller: &mut Caller<'_, Kernel>, addr_ptr: i64, addr_len: i64)
             addr.copy_from_slice(&bytes[8..24]);
             Ok(SockAddr::V6 { port, addr })
         }
-        AF_UNIX => Err(-EOPNOTSUPP), // AF_UNIX is P2; EOPNOTSUPP is the more common errno
+        AF_UNIX => {
+            // P2-C3 part 2: parse `struct sockaddr_un` (110 bytes).
+            // `sun_family` (u16 LE) at offset 0, `sun_path` (108 bytes) at offset 2.
+            if (len as usize) < 3 {
+                // At least family + 1 byte of path (or NUL) required.
+                return Err(-EINVAL);
+            }
+            let bytes = match mem::guest_slice(caller, addr_ptr, SOCKADDR_UN_SIZE as i64) {
+                Ok(b) => b,
+                Err(e) => return Err(e),
+            };
+            // Abstract namespace (sun_path[0] == 0) → -EOPNOTSUPP.
+            if bytes[2] == 0 {
+                return Err(-EOPNOTSUPP);
+            }
+            // sun_path is NUL-terminated; find NUL or end-of-buffer.
+            let path_end = bytes[2..110]
+                .iter()
+                .position(|&b| b == 0)
+                .map(|p| p + 2)
+                .unwrap_or(110);
+            let path = match std::str::from_utf8(&bytes[2..path_end]) {
+                Ok(s) => std::path::PathBuf::from(s),
+                Err(_) => return Err(-EINVAL),
+            };
+            Ok(SockAddr::Unix { path })
+        }
         _ => Err(-EAFNOSUPPORT),
     }
 }
@@ -236,6 +283,12 @@ fn parse_sockaddr(caller: &mut Caller<'_, Kernel>, addr_ptr: i64, addr_len: i64)
 /// `SocketInner`, and return 0. Duplicate-bind on the same `(addr, port)`
 /// is not detected here — Linux's `EADDRINUSE` requires a real listener,
 /// which we don't have until P1-4.
+///
+/// P2-C3 part 2: AF_UNIX + SOCK_STREAM opens a `tokio::net::UnixListener`
+/// immediately (path-binding is the only sane behavior). Errors map:
+///   - `AddrInUse` → `-EADDRINUSE`
+///   - `NotFound` → `-ENOENT` (parent dir missing)
+///   - anything else → `-EIO`
 pub async fn bind(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let fd = match u32::try_from(a[0]) {
         Ok(f) => f,
@@ -249,14 +302,58 @@ pub async fn bind(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         Err(e) => return e,
     };
 
-    let fds = &mut caller.data_mut().fds;
-    match fds.get_mut(fd) {
-        Ok(Resource::Socket(s)) => {
-            s.lock().bound = Some(addr);
-            0
+    // AF_UNIX path: validate the fd is a Unix socket, then bind the host
+    // UnixListener immediately. We do this BEFORE recording `bound` so a
+    // bind failure leaves the socket in a clean (unbound) state.
+    if let SockAddr::Unix { path } = &addr {
+        let is_unix_stream = {
+            let fds = &mut caller.data_mut().fds;
+            match fds.get_mut(fd) {
+                Ok(Resource::Socket(s)) => s.lock().family_unix,
+                _ => false,
+            }
+        };
+        if !is_unix_stream {
+            return -EOPNOTSUPP; // not an AF_UNIX socket
         }
-        Ok(_) => -EBADF,
-        Err(e) => e,
+        // UnixListener::bind removes any existing file at `path`.
+        let listener = match tokio::net::UnixListener::bind(path) {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                // Another fd already bound this path (rare; refcount would
+                // normally unlink first). Surface as EADDRINUSE.
+                return -crate::errno::EADDRINUSE;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return -crate::errno::ENOENT;
+            }
+            Err(_) => return -crate::errno::EIO,
+        };
+        // Install the listener + record the path under the socket lock.
+        let fds = &mut caller.data_mut().fds;
+        match fds.get_mut(fd) {
+            Ok(Resource::Socket(s)) => {
+                let mut gs = s.lock();
+                gs.bound = Some(addr.clone());
+                if let Some(unix) = gs.unix.as_mut() {
+                    unix.path = Some(path.clone());
+                    unix.listener = Some(listener);
+                }
+                0
+            }
+            Ok(_) => -EBADF,
+            Err(e) => e,
+        }
+    } else {
+        let fds = &mut caller.data_mut().fds;
+        match fds.get_mut(fd) {
+            Ok(Resource::Socket(s)) => {
+                s.lock().bound = Some(addr);
+                0
+            }
+            Ok(_) => -EBADF,
+            Err(e) => e,
+        }
     }
 }
 
@@ -308,6 +405,22 @@ pub async fn accept4(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     // listener installed in SocketInner so a concurrent accept4 caller
     // doesn't race a duplicate TcpListener::bind. The actual take-out
     // for `accept().await` happens just below, also under a brief lock.
+    //
+    // P2-C3 part 2: AF_UNIX dispatch — taken early and run on its own
+    // path because the host type (UnixListener vs TcpListener) and
+    // sockaddr layout differ.
+    let is_unix = {
+        let fds = &mut caller.data_mut().fds;
+        match fds.get_mut(fd) {
+            Ok(Resource::Socket(s)) => s.lock().family_unix,
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    };
+    if is_unix {
+        return accept4_unix(caller, fd, addr_ptr, addrlen_ptr, sock_nonblock).await;
+    }
+
     let kind;
     let parent_nonblock: bool;
     let bound_addr: Option<std::net::SocketAddrV4> = {
@@ -326,6 +439,7 @@ pub async fn accept4(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                         *port,
                     )),
                     Some(SockAddr::V6 { .. }) => return -EOPNOTSUPP,
+                    Some(SockAddr::Unix { .. }) => return -EOPNOTSUPP,
                     None => return -EINVAL,
                 }
             }
@@ -448,6 +562,115 @@ pub async fn accept(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     accept4(caller, [a[0], a[1], a[2], 0, 0, 0]).await
 }
 
+/// P2-C3 part 2: AF_UNIX accept4 path.
+///
+/// Listener was materialized at `bind()` time (path-bind is the only
+/// sane behavior), so we just await on the listener. The accepted
+/// UnixStream goes into a fresh SocketInner; the peer address is the
+/// abstract `std::os::unix::net::SocketAddr` (empty for unnamed peers).
+async fn accept4_unix(
+    caller: &mut Caller<'_, Kernel>,
+    fd: u32,
+    addr_ptr: i64,
+    addrlen_ptr: i64,
+    sock_nonblock: bool,
+) -> i64 {
+    // Validate output pointers up front.
+    if addr_ptr != 0 {
+        if let Err(e) = mem::guest_slice_mut(caller, addr_ptr, SOCKADDR_UN_SIZE as i64) {
+            return e;
+        }
+    }
+    if addrlen_ptr != 0 {
+        if let Err(e) = mem::guest_slice_mut(caller, addrlen_ptr, 4) {
+            return e;
+        }
+    }
+
+    // Clone the listener (sync), then put the original back so subsequent
+    // accepts still work. tokio's UnixListener doesn't expose `try_clone`
+    // directly — clone via the std listener (independent handle that
+    // shares the same OS fd).
+    let listener = {
+        let fds = &mut caller.data_mut().fds;
+        match fds.get_mut(fd) {
+            Ok(Resource::Socket(s)) => {
+                let mut gs = s.lock();
+                if !gs.is_listening() {
+                    return -EINVAL;
+                }
+                let unix = match gs.unix.as_mut() {
+                    Some(u) => u,
+                    None => return -EINVAL,
+                };
+                let l = match unix.listener.take() {
+                    Some(l) => l,
+                    None => return -EINVAL,
+                };
+                let std_l = l.into_std().expect("listener into_std");
+                let cloned = std_l.try_clone().expect("std listener try_clone");
+                let tokio_cloned =
+                    tokio::net::UnixListener::from_std(cloned).expect("from_std");
+                // Put the original back so the next accept finds it.
+                unix.listener = Some(tokio::net::UnixListener::from_std(std_l).expect("from_std"));
+                tokio_cloned
+            }
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    };
+
+    // Phase 2: await a connection.
+    let (stream, peer) = match listener.accept().await {
+        Ok(pair) => pair,
+        Err(_) => return -crate::errno::EIO,
+    };
+
+    // Phase 3: write back the peer sockaddr if requested. For an unnamed
+    // peer (which is what we get from a process that connected without
+    // bind), `peer.as_pathname()` is None — write family + zero path.
+    if addr_ptr != 0 {
+        if let Ok(buf) = mem::guest_slice_mut(caller, addr_ptr, SOCKADDR_UN_SIZE as i64) {
+            buf[0..2].copy_from_slice(&(AF_UNIX as u16).to_le_bytes());
+            for b in &mut buf[2..SOCKADDR_UN_SIZE] {
+                *b = 0;
+            }
+            // sun_path can hold a peer name (if connected from a bound socket).
+            if let Some(path) = peer.as_pathname().and_then(|p| p.to_str()) {
+                let bytes = path.as_bytes();
+                let n = bytes.len().min(108);
+                buf[2..2 + n].copy_from_slice(&bytes[..n]);
+                buf[2 + n] = 0; // NUL terminate
+            }
+        }
+    }
+    if addrlen_ptr != 0 {
+        let len = peer
+            .as_pathname()
+            .and_then(|p| p.to_str())
+            .map(|s| (2 + s.len() + 1) as u32)
+            .unwrap_or(2);
+        if let Ok(buf) = mem::guest_slice_mut(caller, addrlen_ptr, 4) {
+            buf[0..4].copy_from_slice(&len.to_le_bytes());
+        }
+    }
+
+    // Insert accepted stream as a fresh fd.
+    let mut accepted = SocketInner::new_unix(SocketKind::Stream, sock_nonblock);
+    accepted.stream_unix = Some(stream);
+    // tokio's SocketAddr isn't directly the std type; only store a peer
+    // address when the connecting peer was bound to a filesystem path.
+    if let Some(p) = peer.as_pathname() {
+        if let Ok(sa) = std::os::unix::net::SocketAddr::from_pathname(p) {
+            accepted.peer_addr_unix = Some(sa);
+        }
+    }
+    let new_fd = caller.data_mut().fds.insert(Resource::Socket(std::sync::Arc::new(
+        parking_lot::Mutex::new(accepted),
+    )));
+    new_fd as i64
+}
+
 /// `connect(sockfd, addr, addrlen)` — connect a Socket to a peer.
 ///
 /// P1-5 supports AF_INET + SOCK_STREAM only. UDP connect (for a future
@@ -474,11 +697,64 @@ pub async fn connect(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         Err(e) => return e,
     };
 
+    // P2-C3 part 2: AF_UNIX dispatch — connect is a one-liner over
+    // tokio::net::UnixStream::connect.
+    if let SockAddr::Unix { path } = &addr {
+        // Pre-check: this is an AF_UNIX socket and not already connected.
+        let is_unix_stream = {
+            let fds = &caller.data().fds;
+            match fds.get(fd) {
+                Ok(Resource::Socket(s)) => {
+                    let gs = s.lock();
+                    if !gs.family_unix {
+                        return -EOPNOTSUPP;
+                    }
+                    if gs.stream_unix.is_some() {
+                        return -crate::errno::EISCONN;
+                    }
+                    true
+                }
+                Ok(_) => return -EBADF,
+                Err(e) => return e,
+            }
+        };
+        let _ = is_unix_stream;
+        let stream = match tokio::net::UnixStream::connect(path).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return -crate::errno::ECONNREFUSED;
+            }
+            Err(_) => return -crate::errno::EIO,
+        };
+        let fds = &mut caller.data_mut().fds;
+        match fds.get_mut(fd) {
+            Ok(Resource::Socket(s)) => {
+                let mut gs = s.lock();
+                gs.bound = Some(addr.clone());
+                gs.stream_unix = Some(stream);
+                // Mark the bound side so getsockname returns the peer's path.
+                if let Ok(sa) = std::os::unix::net::SocketAddr::from_pathname(path) {
+                    gs.peer_addr_unix = Some(sa);
+                }
+                0
+            }
+            Ok(_) => -EBADF,
+            Err(e) => e,
+        }
+    } else {
+        connect_v4(caller, fd, addr).await
+    }
+}
+
+/// P2-C3 part 2: IPv4 connect path. Split out so the AF_UNIX branch above
+/// stays compact.
+async fn connect_v4(caller: &mut Caller<'_, Kernel>, fd: u32, addr: SockAddr) -> i64 {
     let target = match &addr {
         SockAddr::V4 { port, addr: bytes } => std::net::SocketAddr::V4(
             std::net::SocketAddrV4::new(std::net::Ipv4Addr::from(*bytes), *port),
         ),
         SockAddr::V6 { .. } => return -EOPNOTSUPP,
+        SockAddr::Unix { .. } => return -EOPNOTSUPP,
     };
 
     // Pre-check: is this a Socket? Does it already have a stream?
@@ -530,6 +806,63 @@ pub async fn connect(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     }
 }
 
+/// `socketpair(family, type_and_flags, protocol, sv[2])` — create a pair
+/// of connected AF_UNIX sockets. The two halves are written into `sv` as
+/// two u32 fds.
+///
+/// P2-C3 part 2: only `AF_UNIX + SOCK_STREAM` is supported. Other
+/// families → `-EAFNOSUPPORT`; `SOCK_DGRAM` accepted but modeled as
+/// stream (a documented v1 simplification).
+pub async fn socketpair(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let family = a[0] as i32;
+    let type_and_flags = a[1] as i32;
+    let _protocol = a[2]; // ignored
+    let sv_ptr = a[3];
+
+    if family != AF_UNIX {
+        return -EAFNOSUPPORT;
+    }
+    let sock_type = type_and_flags & 0xf;
+    if sock_type != SOCK_STREAM && sock_type != SOCK_DGRAM {
+        return -EPROTONOSUPPORT;
+    }
+    if sv_ptr == 0 {
+        return -crate::errno::EFAULT;
+    }
+    if let Err(e) = mem::guest_slice_mut(caller, sv_ptr, 8) {
+        return e;
+    }
+
+    let (a_stream, b_stream) = match tokio::net::UnixStream::pair() {
+        Ok(pair) => pair,
+        Err(_) => return -crate::errno::EIO,
+    };
+
+    // Insert both into the fd table as AF_UNIX stream sockets. We don't
+    // pre-bind them to a path (socketpair sockets are unnamed).
+    let kind = if sock_type == SOCK_DGRAM {
+        SocketKind::Datagram
+    } else {
+        SocketKind::Stream
+    };
+    let mut a_inner = SocketInner::new_unix(kind, false);
+    a_inner.stream_unix = Some(a_stream);
+    let mut b_inner = SocketInner::new_unix(kind, false);
+    b_inner.stream_unix = Some(b_stream);
+    let a_fd = caller.data_mut().fds.insert(Resource::Socket(std::sync::Arc::new(
+        parking_lot::Mutex::new(a_inner),
+    )));
+    let b_fd = caller.data_mut().fds.insert(Resource::Socket(std::sync::Arc::new(
+        parking_lot::Mutex::new(b_inner),
+    )));
+
+    if let Ok(buf) = mem::guest_slice_mut(caller, sv_ptr, 8) {
+        buf[0..4].copy_from_slice(&a_fd.to_le_bytes());
+        buf[4..8].copy_from_slice(&b_fd.to_le_bytes());
+    }
+    0
+}
+
 /// `sendto(fd, buf, len, flags, addr, addrlen)` — write `len` bytes from
 /// the guest's `buf` to the connected TcpStream. `addr` and `addrlen`
 /// are accepted but ignored for TCP (the connection's peer is fixed).
@@ -552,6 +885,19 @@ pub async fn sendto(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let _flags = a[3] as i32; // ignored in P1-5
     let _addr_ptr = a[4];    // ignored for TCP
     let _addrlen = a[5];
+
+    // P2-C3 part 2: AF_UNIX dispatch.
+    let is_unix = {
+        let fds = &caller.data().fds;
+        match fds.get(fd) {
+            Ok(Resource::Socket(s)) => s.lock().family_unix,
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    };
+    if is_unix {
+        return sendto_unix(caller, fd, buf_ptr, buf_len_raw).await;
+    }
 
     let len = match usize::try_from(buf_len_raw) {
         Ok(n) => n,
@@ -636,6 +982,22 @@ pub async fn recvfrom(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let _flags = a[3] as i32;
     let addr_ptr = a[4];
     let addrlen_ptr = a[5];
+
+    // P2-C3 part 2: AF_UNIX dispatch. We ignore the addr write-back for
+    // AF_UNIX (peer is unnamed for connect-accepted or named only for
+    // bound peers; the C conformance tests don't exercise it).
+    let is_unix = {
+        let fds = &caller.data().fds;
+        match fds.get(fd) {
+            Ok(Resource::Socket(s)) => s.lock().family_unix,
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    };
+    if is_unix {
+        return recvfrom_unix(caller, fd, buf_ptr, buf_len_raw).await;
+    }
+    let _ = (addr_ptr, addrlen_ptr); // unused on the unix branch
 
     let len = match usize::try_from(buf_len_raw) {
         Ok(n) => n,
@@ -920,6 +1282,65 @@ pub async fn getsockname(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     if addr_ptr == 0 {
         return -crate::errno::EFAULT;
     }
+
+    // P2-C3 part 2: branch on family.
+    let is_unix = {
+        let fds = &caller.data().fds;
+        match fds.get(fd) {
+            Ok(Resource::Socket(s)) => s.lock().family_unix,
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    };
+
+    if is_unix {
+        if let Err(e) = mem::guest_slice_mut(caller, addr_ptr, SOCKADDR_UN_SIZE as i64) {
+            return e;
+        }
+        if addrlen_ptr != 0 {
+            if let Err(e) = mem::guest_slice_mut(caller, addrlen_ptr, 4) {
+                return e;
+            }
+        }
+        let bound_path: Option<std::path::PathBuf> = {
+            let fds = &caller.data().fds;
+            match fds.get(fd) {
+                Ok(Resource::Socket(s)) => {
+                    let gs = s.lock();
+                    match &gs.bound {
+                        Some(crate::fd::SockAddr::Unix { path }) => Some(path.clone()),
+                        _ => None,
+                    }
+                }
+                Ok(_) => return -EBADF,
+                Err(e) => return e,
+            }
+        };
+        if let Ok(buf) = mem::guest_slice_mut(caller, addr_ptr, SOCKADDR_UN_SIZE as i64) {
+            buf[0..2].copy_from_slice(&(AF_UNIX as u16).to_le_bytes());
+            for b in &mut buf[2..SOCKADDR_UN_SIZE] {
+                *b = 0;
+            }
+            if let Some(path) = bound_path.as_ref().and_then(|p| p.to_str()) {
+                let bytes = path.as_bytes();
+                let n = bytes.len().min(108);
+                buf[2..2 + n].copy_from_slice(&bytes[..n]);
+                buf[2 + n] = 0;
+            }
+        }
+        if addrlen_ptr != 0 {
+            let len = bound_path
+                .as_ref()
+                .and_then(|p| p.to_str())
+                .map(|s| (2 + s.len() + 1) as u32)
+                .unwrap_or(2);
+            if let Ok(buf) = mem::guest_slice_mut(caller, addrlen_ptr, 4) {
+                buf[0..4].copy_from_slice(&len.to_le_bytes());
+            }
+        }
+        return 0;
+    }
+
     // Pre-validate pointers.
     if let Err(e) = mem::guest_slice_mut(caller, addr_ptr, SOCKADDR_IN_SIZE as i64) {
         return e;
@@ -947,6 +1368,7 @@ pub async fn getsockname(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                         // IPv6 support is P2; report EINVAL for now.
                         return -EINVAL;
                     }
+                    Some(crate::fd::SockAddr::Unix { .. }) => return -EINVAL,
                     None => match &gs.peer_addr {
                         // No bind yet — fall back to the peer's family so
                         // getpeername callers can still read the response.
@@ -1002,6 +1424,62 @@ pub async fn getpeername(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     if addr_ptr == 0 {
         return -crate::errno::EFAULT;
     }
+
+    // P2-C3 part 2: branch on family.
+    let is_unix = {
+        let fds = &caller.data().fds;
+        match fds.get(fd) {
+            Ok(Resource::Socket(s)) => s.lock().family_unix,
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    };
+
+    if is_unix {
+        if let Err(e) = mem::guest_slice_mut(caller, addr_ptr, SOCKADDR_UN_SIZE as i64) {
+            return e;
+        }
+        if addrlen_ptr != 0 {
+            if let Err(e) = mem::guest_slice_mut(caller, addrlen_ptr, 4) {
+                return e;
+            }
+        }
+        let peer: std::os::unix::net::SocketAddr = {
+            let fds = &caller.data().fds;
+            match fds.get(fd) {
+                Ok(Resource::Socket(s)) => match s.lock().peer_addr_unix.clone() {
+                    Some(p) => p,
+                    None => return -crate::errno::ENOTCONN,
+                },
+                Ok(_) => return -EBADF,
+                Err(e) => return e,
+            }
+        };
+        if let Ok(buf) = mem::guest_slice_mut(caller, addr_ptr, SOCKADDR_UN_SIZE as i64) {
+            buf[0..2].copy_from_slice(&(AF_UNIX as u16).to_le_bytes());
+            for b in &mut buf[2..SOCKADDR_UN_SIZE] {
+                *b = 0;
+            }
+            if let Some(path) = peer.as_pathname().and_then(|p| p.to_str()) {
+                let bytes = path.as_bytes();
+                let n = bytes.len().min(108);
+                buf[2..2 + n].copy_from_slice(&bytes[..n]);
+                buf[2 + n] = 0;
+            }
+        }
+        if addrlen_ptr != 0 {
+            let len = peer
+                .as_pathname()
+                .and_then(|p| p.to_str())
+                .map(|s| (2 + s.len() + 1) as u32)
+                .unwrap_or(2);
+            if let Ok(buf) = mem::guest_slice_mut(caller, addrlen_ptr, 4) {
+                buf[0..4].copy_from_slice(&len.to_le_bytes());
+            }
+        }
+        return 0;
+    }
+
     if let Err(e) = mem::guest_slice_mut(caller, addr_ptr, SOCKADDR_IN_SIZE as i64) {
         return e;
     }
@@ -1609,4 +2087,140 @@ mod p2_c3_part1_tests {
         // 8 × u32 = 32 bytes.
         assert_eq!(MSGHDR_SIZE, 32);
     }
+}
+
+// --- P2-C3 part 2: AF_UNIX sendto/recvfrom helpers ---
+
+/// AF_UNIX sendto: write `buf_len` bytes to the connected UnixStream (or
+/// via UnixDatagram if the socket is dgram). Honors the SHUT_WR EPIPE
+/// rule. Mirrors the IPv4 sendto's lock discipline — never hold a
+/// `parking_lot::Mutex` guard across `.await`.
+async fn sendto_unix(
+    caller: &mut Caller<'_, Kernel>,
+    fd: u32,
+    buf_ptr: i64,
+    buf_len_raw: i64,
+) -> i64 {
+    let _ = match usize::try_from(buf_len_raw) {
+        Ok(_) => {}
+        Err(_) => return -crate::errno::EFAULT,
+    };
+    let bytes = match mem::guest_slice(caller, buf_ptr, buf_len_raw) {
+        Ok(b) => b.to_vec(),
+        Err(e) => return e,
+    };
+
+    // Pull the stream out under a short-lived lock; never hold the
+    // Mutex guard across `.await`.
+    let mut stream = {
+        let fds = &mut caller.data_mut().fds;
+        match fds.get_mut(fd) {
+            Ok(Resource::Socket(s)) => {
+                let mut gs = s.lock();
+                if gs.shutdown_flags & 0b10 != 0 {
+                    return -crate::errno::EPIPE;
+                }
+                match gs.stream_unix.take() {
+                    Some(st) => st,
+                    None => return -crate::errno::ENOTCONN,
+                }
+            }
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    };
+
+    use tokio::io::AsyncWriteExt;
+    let res = stream.write(&bytes).await;
+
+    // Put the stream back.
+    {
+        let fds = &mut caller.data_mut().fds;
+        if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
+            let mut gs = s.lock();
+            if gs.stream_unix.is_none() {
+                gs.stream_unix = Some(stream);
+            }
+        }
+    }
+    match res {
+        Ok(n) => n as i64,
+        Err(_) => -crate::errno::EIO,
+    }
+}
+
+/// AF_UNIX recvfrom: read from the connected UnixStream. Honors the
+/// SHUT_RD EOF rule.
+async fn recvfrom_unix(
+    caller: &mut Caller<'_, Kernel>,
+    fd: u32,
+    buf_ptr: i64,
+    buf_len_raw: i64,
+) -> i64 {
+    let len = match usize::try_from(buf_len_raw) {
+        Ok(n) => n,
+        Err(_) => return -EFAULT,
+    };
+    if len == 0 {
+        return -EINVAL;
+    }
+    if let Err(e) = mem::guest_slice_mut(caller, buf_ptr, buf_len_raw) {
+        return e;
+    }
+
+    let mut stream = {
+        let fds = &mut caller.data_mut().fds;
+        match fds.get_mut(fd) {
+            Ok(Resource::Socket(s)) => {
+                let mut gs = s.lock();
+                if gs.shutdown_flags & 0b01 != 0 {
+                    return 0; // EOF
+                }
+                match gs.stream_unix.take() {
+                    Some(st) => st,
+                    None => return -crate::errno::ENOTCONN,
+                }
+            }
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    };
+
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; len];
+    let res = stream.read(&mut buf).await;
+    let n = match res {
+        Ok(0) => 0, // EOF
+        Ok(n) => n,
+        Err(_) => {
+            let fds = &mut caller.data_mut().fds;
+            if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
+                let mut gs = s.lock();
+                if gs.stream_unix.is_none() {
+                    gs.stream_unix = Some(stream);
+                }
+            }
+            return -crate::errno::EIO;
+        }
+    };
+
+    // Put the stream back.
+    {
+        let fds = &mut caller.data_mut().fds;
+        if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
+            let mut gs = s.lock();
+            if gs.stream_unix.is_none() {
+                gs.stream_unix = Some(stream);
+            }
+        }
+    }
+
+    if n > 0 {
+        let dst = match mem::guest_slice_mut(caller, buf_ptr, n as i64) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        dst[..n].copy_from_slice(&buf[..n]);
+    }
+    n as i64
 }

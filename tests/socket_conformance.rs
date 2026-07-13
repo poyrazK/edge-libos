@@ -196,9 +196,10 @@ fn socket_unknown_family_returns_eafnosupport() -> Result<()> {
     Ok(())
 }
 
-/// `socket(AF_UNIX, SOCK_STREAM, 0)` returns -EAFNOSUPPORT (AF_UNIX is P2).
+/// `socket(AF_UNIX, SOCK_STREAM, 0)` returns a valid fd (P2-C3 part 2:
+/// AF_UNIX is now modeled for stream sockets).
 #[test]
-fn socket_unix_returns_eafnosupport() -> Result<()> {
+fn socket_unix_stream_returns_valid_fd() -> Result<()> {
     let _d = TmpDir::new();
     let (engine, linker) = common::engine_and_linker()?;
     let module = common::compile_wat(&engine, SOCKET_WAT)?;
@@ -207,8 +208,22 @@ fn socket_unix_returns_eafnosupport() -> Result<()> {
         let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
         call_socket(&linker, &mut store, &module, 1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/).await
     })?;
-    assert_eq!(ret, -edge_libos::errno::EAFNOSUPPORT,
-        "AF_UNIX is P2; should return -EAFNOSUPPORT");
+    assert!(ret >= 3, "AF_UNIX stream should return a valid fd, got {}", ret);
+    Ok(())
+}
+
+/// `socket(AF_UNIX, SOCK_DGRAM, 0)` returns a valid fd.
+#[test]
+fn socket_unix_dgram_returns_valid_fd() -> Result<()> {
+    let _d = TmpDir::new();
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, SOCKET_WAT)?;
+
+    let ret = block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        call_socket(&linker, &mut store, &module, 1 /*AF_UNIX*/, 2 /*SOCK_DGRAM*/).await
+    })?;
+    assert!(ret >= 3, "AF_UNIX dgram should return a valid fd, got {}", ret);
     Ok(())
 }
 

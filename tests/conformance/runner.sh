@@ -139,6 +139,9 @@ expected_syscall() {
         epoll_pwait)       echo "epoll_pwait" ;;
         select)            echo "select" ;;
         eventfd_legacy)    echo "eventfd" ;;
+        socketpair)        echo "socketpair" ;;
+        af_unix_abstract_returns_eopnotsupp) echo "bind" ;;
+        af_unix_bind_connect) echo "connect" ;;
         *) echo "UNREGISTERED: $1" >&2; return 1 ;;
     esac
 }

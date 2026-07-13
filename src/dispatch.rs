@@ -205,6 +205,8 @@ pub async fn dispatch(
         sys::socket::NR_GETSOCKNAME => sys::socket::getsockname(&mut caller, a).await,
         sys::socket::NR_GETPEERNAME => sys::socket::getpeername(&mut caller, a).await,
         sys::socket::NR_SHUTDOWN => sys::socket::shutdown(&mut caller, a).await,
+        // P2-C3 part 2: socketpair (AF_UNIX pair).
+        sys::socket::NR_SOCKETPAIR => sys::socket::socketpair(&mut caller, a).await,
 
         // poll(2) — P1-6 synchronous readiness scan.
         sys::poll::NR_POLL => sys::poll::poll(&mut caller, a).await,
@@ -362,6 +364,7 @@ pub fn syscall_name(nr: u32) -> &'static str {
         sys::socket::NR_GETSOCKNAME => "getsockname",
         sys::socket::NR_GETPEERNAME => "getpeername",
         sys::socket::NR_SHUTDOWN => "shutdown",
+        sys::socket::NR_SOCKETPAIR => "socketpair",
 
         sys::poll::NR_POLL => "poll",
         sys::poll::NR_PPOLL => "ppoll",
