@@ -101,6 +101,55 @@ jobs:
           wat2wasm --version
           strace --version 2>&1 | head -1
 
+      - name: 5. actionlint (GitHub Actions syntax check)
+        # Pure Go static analysis of .github/workflows/*.yml — catches
+        # syntax errors, missing needs, malformed ${{ }} expressions.
+        # GitHub release tarball (~2 s install vs ~60 s for cargo install).
+        run: |
+          set -euo pipefail
+          VER="1.7.7"
+          URL="https://github.com/rhysd/actionlint/releases/download/v${VER}/actionlint_${VER}_linux_amd64.tar.gz"
+          curl -fSL --retry 3 -o /tmp/actionlint.tar.gz "$URL"
+          sudo tar -xzf /tmp/actionlint.tar.gz -C /usr/local/bin actionlint
+          rm -f /tmp/actionlint.tar.gz
+          actionlint -version
+          actionlint
+
+      - name: 6. shellcheck (lint all shell scripts)
+        # Reads .shellcheckrc automatically from the repo root to
+        # silence intentional patterns (SC2317 / SC2154).
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq shellcheck
+          shellcheck --version
+          shellcheck scripts/*.sh tests/*.sh tests/conformance/runner.sh \
+                     tests/strace_baselines/*.sh guest/build.sh
+
+      - name: 7. gitleaks (secret-leak scan)
+        # Uses .gitleaks.toml with an empty allowlist (no real secrets
+        # in the repo today). The `detect` subcommand (vs `protect`)
+        # doesn't write a baseline file.
+        run: |
+          set -euo pipefail
+          VER="8.18.4"
+          URL="https://github.com/gitleaks/gitleaks/releases/download/v${VER}/gitleaks_${VER}_linux_x64.tar.gz"
+          curl -fSL --retry 3 -o /tmp/gitleaks.tar.gz "$URL"
+          sudo tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
+          rm -f /tmp/gitleaks.tar.gz
+          gitleaks version
+          gitleaks detect --source . --config .gitleaks.toml --no-banner --redact
+
+      - name: 8. wat2wasm validation (WAT syntax check)
+        # Loop survives future WAT additions; today there's exactly
+        # one (tests/guests/serve_one_request.wat). wabt is already
+        # installed by step 4.
+        run: |
+          set -euo pipefail
+          for wat in $(find tests guests -name '*.wat' -not -path '*/target/*' 2>/dev/null); do
+            echo "==> $wat"
+            wat2wasm "$wat" -o /tmp/check.wasm
+          done
+
   # ─── The ONLY job that runs cargo ──────────────────────────────────
   # Compiles once under the `ci` profile, runs the full Rust suite, and
   # uploads the two binaries the fan-out children need. `cargo test`
