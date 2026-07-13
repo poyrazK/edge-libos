@@ -27,6 +27,13 @@
 #
 # Required checks (branch protection): tools, build, c-conformance, reproduce.
 # Local mirror: scripts/preflight.sh.
+#
+# This file is layered with 10 static-analysis linters (fmt, clippy, doc,
+# deny, machete, NR-consistency, actionlint, shellcheck, gitleaks, wat2wasm
+# validation) wired as additional steps inside the existing `tools` and
+# `build` jobs — see the "Why linters live inside build / tools" section
+# in docs/branch-protection.md for the rationale (fan-out jobs must NOT
+# invoke cargo because they have no warm `target/ci/` cache).
 
 name: verify
 
@@ -55,7 +62,9 @@ jobs:
   tools:
     name: toolchain + version pins
     runs-on: ubuntu-22.04
-    timeout-minutes: 6
+    # Bumped 6 -> 8 to absorb the four new static-analysis steps added in
+    # commit 8 (actionlint, shellcheck, gitleaks, wat2wasm validation).
+    timeout-minutes: 8
 
     steps:
       - name: 1. Checkout
@@ -101,7 +110,11 @@ jobs:
   build:
     name: cargo build + test (single ci-profile compile)
     runs-on: ubuntu-22.04
-    timeout-minutes: 12
+    # Bumped 12 -> 18 to absorb the cargo-side linters added in
+    # commits 4-7 (NR-consistency, fmt, clippy, doc, deny, machete).
+    # They all share `build`'s warm `target/ci/` cache; marginal cost is
+    # ~30-60 s on warm cache, ~3-6 min on cold.
+    timeout-minutes: 18
 
     steps:
       - name: 1. Checkout
