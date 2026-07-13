@@ -44,6 +44,16 @@ int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
 #define NR_GETDENTS64 217
 #define NR_PIPE2 293
 #define NR_FCNTL 72
+#define NR_DUP 32
+#define NR_DUP2 33
+#define NR_DUP3 292
+#define O_CLOEXEC 02000000
+#define F_DUPFD 0
+#define F_DUPFD_CLOEXEC (1024 + 6)
+#define F_GETFD 1
+#define F_SETFD 2
+#define F_GETFL 3
+#define F_SETFL 4
 #define NR_BRK 12
 #define NR_MMAP 9
 #define NR_MUNMAP 11
@@ -65,6 +75,7 @@ int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
 #define NR_RT_SIGPROCMASK 14
 #define NR_ARCH_PRCTL 158
 #define NR_RSEQ 334
+#define NR_STATX 332
 #define NR_SOCKET 41
 #define NR_BIND 49
 #define NR_LISTEN 50
@@ -81,6 +92,9 @@ int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
 #define NR_EPOLL_CTL 233
 #define NR_EPOLL_WAIT 232
 #define NR_EVENTFD2 290
+
+// Standard *at() dirfd values. AT_FDCWD = -100 means "use cwd".
+#define AT_FDCWD (-100)
 
 // Pass/fail markers. Placed at offset 4096 in linear memory. The runner
 // reads back the bytes at 4096 after the run.

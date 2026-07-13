@@ -112,7 +112,7 @@ pub async fn poll(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
             match fds_table.get(fd_u) {
                 Ok(Resource::PipeRead(p)) => wakes.push(p.notify.clone()),
                 Ok(Resource::PipeWrite(p)) => wakes.push(p.notify.clone()),
-                Ok(Resource::Socket(s)) => wakes.push(s.notify_read.clone()),
+                Ok(Resource::Socket(s)) => wakes.push(s.lock().notify_read.clone()),
                 _ => {}
             }
         }
@@ -249,16 +249,21 @@ fn ready_pipe_read(events: i16, has_data_or_eof: bool) -> i16 {
     r
 }
 
-fn ready_socket(events: i16, s: &crate::fd::SocketInner) -> i16 {
+fn ready_socket(
+    events: i16,
+    s: &crate::fd::SharedSocket,
+) -> i16 {
     let mut r: i16 = 0;
     // Stream sockets: connected ⇒ always POLLIN-ready (the recvfrom will
     // await real data via the lazy TcpStream). For a listener, no socket
     // data is available — that's poll(POLLOUT)'s domain.
-    let is_listener = s.is_listening();
-    let has_stream = s.stream.is_some();
-    let has_bound = s.bound.is_some();
-    let is_v4 = matches!(s.bound, Some(SockAddr::V4 { .. }) | None);
+    let gs = s.lock();
+    let is_listener = gs.is_listening();
+    let has_stream = gs.stream.is_some();
+    let has_bound = gs.bound.is_some();
+    let is_v4 = matches!(gs.bound, Some(SockAddr::V4 { .. }) | None);
     let _ = is_v4; // silence unused warning on V6 builds
+    drop(gs);
 
     if (events & POLLIN) != 0 {
         if has_stream {
@@ -303,15 +308,17 @@ mod tests {
     fn poll_listener_socket_pollin_returns_pollnval() {
         let fds = FdTable::empty();
         let mut fds = fds;
-        let fd = fds.insert(Resource::Socket({
-            let mut s = crate::fd::SocketInner::new(crate::fd::SocketKind::Stream, false);
-            s.bound = Some(crate::fd::SockAddr::V4 {
-                port: 8080,
-                addr: [127, 0, 0, 1],
-            });
-            s.listen_backlog = Some(5);
-            s
-        }));
+        let fd = fds.insert(Resource::Socket(std::sync::Arc::new(
+            parking_lot::Mutex::new({
+                let mut s = crate::fd::SocketInner::new(crate::fd::SocketKind::Stream, false);
+                s.bound = Some(crate::fd::SockAddr::V4 {
+                    port: 8080,
+                    addr: [127, 0, 0, 1],
+                });
+                s.listen_backlog = Some(5);
+                s
+            }),
+        )));
         let r = poll_one(&fds, fd as i32, POLLIN);
         assert_eq!(r, POLLNVAL, "listening socket POLLIN should be POLLNVAL");
     }
