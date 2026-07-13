@@ -44,6 +44,36 @@ pub const NR_DUP: u32 = 32;
 pub const NR_DUP2: u32 = 33;
 pub const NR_DUP3: u32 = 292;
 
+// P2-C1 part 1: mkdir / mkdirat / rmdir / unlink / unlinkat.
+pub const NR_MKDIR: u32 = 83;
+pub const NR_RMDIR: u32 = 84;
+pub const NR_UNLINK: u32 = 87;
+pub const NR_MKDIRAT: u32 = 258;
+pub const NR_UNLINKAT: u32 = 263;
+
+// unlinkat(2) flag: remove the directory itself (vs the default which
+// removes a non-directory). Matches `linux/fcntl.h`.
+pub const AT_REMOVEDIR: i32 = 0x200;
+
+/// Map a `std::io::Error` to a positive errno. Mirrors the helper in
+/// `vfs.rs` — kept local here so `sys/file.rs` doesn't depend on
+/// `vfs`'s private internals. Returns the errno as a positive i64.
+fn io_to_errno(e: std::io::Error) -> i64 {
+    use std::io::ErrorKind::*;
+    let code = match e.kind() {
+        NotFound => crate::errno::ENOENT,
+        PermissionDenied => crate::errno::EACCES,
+        AlreadyExists => crate::errno::EEXIST,
+        InvalidInput => crate::errno::EINVAL,
+        NotADirectory => crate::errno::ENOTDIR,
+        IsADirectory => crate::errno::EISDIR,
+        DirectoryNotEmpty => crate::errno::ENOTEMPTY,
+        TooManyLinks => crate::errno::ELOOP,
+        _ => crate::errno::EIO,
+    };
+    code
+}
+
 // open() flags (linux/fcntl.h). Keep the bare minimum CPython needs.
 pub const O_ACCMODE: i32 = 0o3;
 pub const O_RDONLY: i32 = 0o0;
@@ -1027,6 +1057,141 @@ pub async fn lstat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let path_ptr = a[0];
     let statbuf_ptr = a[1];
     newfstatat(caller, [-100, path_ptr, statbuf_ptr, 0x100, 0, 0]).await
+}
+
+/// `mkdir(path, mode)` — create a single directory at `path` (parent
+/// must exist; we don't auto-create intermediates). `mode` bits are
+/// masked to `0o777`; the umask isn't modeled. Returns 0 on success,
+/// `-EEXIST` if the path already exists, `-ENOENT` if the parent
+/// directory is missing.
+pub async fn mkdir(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let path_ptr = a[0];
+    let mode = a[1] as u32;
+
+    let path = match mem::guest_str(caller, path_ptr, 4096) {
+        Ok(s) => s.to_string(),
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return -crate::errno::ENOENT;
+    }
+
+    let abs = match crate::sys::path::resolve(caller, -100, &path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let _ = mode;
+    match std::fs::create_dir(&abs) {
+        Ok(()) => 0,
+        Err(e) => -io_to_errno(e),
+    }
+}
+
+/// `mkdirat(dirfd, path, mode)` — `mkdir` with explicit dirfd. The
+/// kernel accepts both NR_MKDIR and NR_MKDIRAT — both go through the
+/// same handler because our routing is `dirfd == AT_FDCWD` (the common
+/// case) and `dirfd >= 0` (a bound directory fd). `mode` is masked to
+/// `0o777`; no umask.
+pub async fn mkdirat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let dirfd = a[0];
+    let path_ptr = a[1];
+    let mode = a[2] as u32;
+
+    let path = match mem::guest_str(caller, path_ptr, 4096) {
+        Ok(s) => s.to_string(),
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return -crate::errno::ENOENT;
+    }
+
+    let abs = match crate::sys::path::resolve(caller, dirfd, &path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let _ = mode;
+    match std::fs::create_dir(&abs) {
+        Ok(()) => 0,
+        Err(e) => -io_to_errno(e),
+    }
+}
+
+/// `rmdir(path)` — remove a single empty directory. Returns `-ENOTDIR`
+/// if `path` isn't a directory, `-ENOENT` if it doesn't exist.
+pub async fn rmdir(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let path_ptr = a[0];
+
+    let path = match mem::guest_str(caller, path_ptr, 4096) {
+        Ok(s) => s.to_string(),
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return -crate::errno::ENOENT;
+    }
+
+    let abs = match crate::sys::path::resolve(caller, -100, &path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    match std::fs::remove_dir(&abs) {
+        Ok(()) => 0,
+        Err(e) => -io_to_errno(e),
+    }
+}
+
+/// `unlink(path)` — remove a non-directory file. Returns `-EISDIR` if
+/// the path is a directory (use `rmdir` for those).
+pub async fn unlink(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let path_ptr = a[0];
+
+    let path = match mem::guest_str(caller, path_ptr, 4096) {
+        Ok(s) => s.to_string(),
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return -crate::errno::ENOENT;
+    }
+
+    let abs = match crate::sys::path::resolve(caller, -100, &path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    match std::fs::remove_file(&abs) {
+        Ok(()) => 0,
+        Err(e) => -io_to_errno(e),
+    }
+}
+
+/// `unlinkat(dirfd, path, flags)` — `unlink` with explicit dirfd and
+/// `AT_REMOVEDIR` flag. When `AT_REMOVEDIR` is set, behaves like
+/// `rmdir`; otherwise behaves like `unlink`.
+pub async fn unlinkat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let dirfd = a[0];
+    let path_ptr = a[1];
+    let flags = a[2] as i32;
+
+    let path = match mem::guest_str(caller, path_ptr, 4096) {
+        Ok(s) => s.to_string(),
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return -crate::errno::ENOENT;
+    }
+
+    let abs = match crate::sys::path::resolve(caller, dirfd, &path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let _ = flags;
+    let result = if flags & AT_REMOVEDIR != 0 {
+        std::fs::remove_dir(&abs)
+    } else {
+        std::fs::remove_file(&abs)
+    };
+    match result {
+        Ok(()) => 0,
+        Err(e) => -io_to_errno(e),
+    }
 }
 
 /// `getcwd(buf, size)` — write the current working directory (NUL-terminated)

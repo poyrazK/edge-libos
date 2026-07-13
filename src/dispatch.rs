@@ -158,6 +158,12 @@ pub async fn dispatch(
         sys::file::NR_GETCWD => sys::file::getcwd(&mut caller, a).await,
         sys::file::NR_READV => sys::file::readv(&mut caller, a).await,
         sys::file::NR_WRITEV => sys::file::writev(&mut caller, a).await,
+        // P2-C1 part 1: mkdir / mkdirat / rmdir / unlink / unlinkat.
+        sys::file::NR_MKDIR => sys::file::mkdir(&mut caller, a).await,
+        sys::file::NR_MKDIRAT => sys::file::mkdirat(&mut caller, a).await,
+        sys::file::NR_RMDIR => sys::file::rmdir(&mut caller, a).await,
+        sys::file::NR_UNLINK => sys::file::unlink(&mut caller, a).await,
+        sys::file::NR_UNLINKAT => sys::file::unlinkat(&mut caller, a).await,
 
         // Sockets (P1-1: socket only; bind/listen/accept/connect/recv/send
         // land in later sub-steps).
@@ -250,6 +256,11 @@ pub fn syscall_name(nr: u32) -> &'static str {
         sys::file::NR_GETCWD => "getcwd",
         sys::file::NR_READV => "readv",
         sys::file::NR_WRITEV => "writev",
+        sys::file::NR_MKDIR => "mkdir",
+        sys::file::NR_MKDIRAT => "mkdirat",
+        sys::file::NR_RMDIR => "rmdir",
+        sys::file::NR_UNLINK => "unlink",
+        sys::file::NR_UNLINKAT => "unlinkat",
 
         sys::socket::NR_SOCKET => "socket",
         sys::socket::NR_BIND => "bind",

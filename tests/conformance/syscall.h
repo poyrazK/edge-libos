@@ -93,6 +93,13 @@ int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
 #define NR_EPOLL_WAIT 232
 #define NR_EVENTFD2 290
 
+// P2-C1 part 1: mkdir / mkdirat / rmdir / unlink / unlinkat.
+#define NR_MKDIR 83
+#define NR_RMDIR 84
+#define NR_UNLINK 87
+#define NR_MKDIRAT 258
+#define NR_UNLINKAT 263
+
 // Standard *at() dirfd values. AT_FDCWD = -100 means "use cwd".
 #define AT_FDCWD (-100)
 

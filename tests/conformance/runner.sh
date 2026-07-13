@@ -84,6 +84,11 @@ expected_syscall() {
         dup3)              echo "dup3" ;;
         f_dupfd_min)       echo "fcntl" ;;
         f_dupfd_min_below_next) echo "fcntl" ;;
+        mkdir)             echo "mkdir" ;;
+        mkdirat)           echo "mkdirat" ;;
+        rmdir)             echo "rmdir" ;;
+        unlink)            echo "unlink" ;;
+        unlinkat)          echo "unlinkat" ;;
         lstat)             echo "lstat" ;;
         getcwd)            echo "getcwd" ;;
         readv)             echo "readv" ;;
