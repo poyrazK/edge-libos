@@ -31,6 +31,7 @@ pub const NR_LSTAT: u32 = 6;
 pub const NR_LSEEK: u32 = 8;
 pub const NR_FSTAT: u32 = 5;
 pub const NR_NEWFSTATAT: u32 = 262;
+pub const NR_STATX: u32 = 332;
 pub const NR_GETDENTS64: u32 = 217;
 pub const NR_PIPE: u32 = 22;
 pub const NR_PIPE2: u32 = 293;
@@ -445,6 +446,15 @@ pub async fn newfstatat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         return e;
     }
     0
+}
+
+/// `statx(dirfd, pathname, flags, mask, buf)` — extended stat.
+///
+/// P2-B4 stub: returns -ENOSYS until the encoder + handler land in
+/// commits 3 + 4 of the B4 series.
+pub async fn statx(caller: &mut Caller<'_, Kernel>, _a: [i64; 6]) -> i64 {
+    let _ = caller;
+    -crate::errno::ENOSYS
 }
 
 /// `getdents64(fd, buf, len)`.

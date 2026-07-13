@@ -65,6 +65,7 @@ int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
 #define NR_RT_SIGPROCMASK 14
 #define NR_ARCH_PRCTL 158
 #define NR_RSEQ 334
+#define NR_STATX 332
 #define NR_SOCKET 41
 #define NR_BIND 49
 #define NR_LISTEN 50
