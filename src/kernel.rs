@@ -23,7 +23,7 @@ use crate::mm::LinearAllocator;
 use crate::sys::signal::SignalState;
 use crate::vfs::Vfs;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ClockState {
     pub boot_monotonic_ns: u64,
 }

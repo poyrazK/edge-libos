@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use wasmtime::Caller;
 
 use crate::errno::EINVAL;
@@ -34,7 +35,10 @@ const SIG_SETMASK: i64 = 2;
 
 /// Recorded signal disposition. Just the shape CPython's libc pokes at us;
 /// we never actually deliver in v1 (spec §4.8).
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// P2-D1: derives `Serialize`/`Deserialize` so `SignalState` can be
+/// captured in `KernelSnapshot` without a custom impl.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct SigAction {
     pub handler: u64,
@@ -51,7 +55,8 @@ const SIG_FLAGS_REAL_OFF: usize = 4;
 const SIG_MASK_REAL_OFF: usize = 8;
 const SIG_RESTORER_REAL_OFF: usize = 24;
 
-#[derive(Debug, Default)]
+/// P2-D1: derives `Serialize`/`Deserialize` for snapshot.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SignalState {
     pub actions: HashMap<i32, SigAction>,
     pub mask: u64,

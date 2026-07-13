@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UnixDatagram, UnixListener, UnixStream};
 
@@ -121,7 +122,9 @@ pub fn make_pipe() -> (PipeRead, PipeWrite) {
 
 /// What kind of socket this is. P1-1 only allocates the resource; the
 /// stream-vs-datagram distinction matters once `connect`/`sendto` land.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// P2-D1: derives `Serialize`/`Deserialize` for snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SocketKind {
     Stream,
     Datagram,
@@ -134,7 +137,9 @@ pub enum SocketKind {
 ///
 /// P2-C3 part 2: `Unix` variant for AF_UNIX filesystem-path sockets.
 /// Abstract namespace (`sun_path[0] == 0`) → `-EOPNOTSUPP`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// P2-D1: derives `Serialize`/`Deserialize` for snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SockAddr {
     V4 { port: u16, addr: [u8; 4] },
     V6 { port: u16, addr: [u8; 16] },

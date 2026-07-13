@@ -14,12 +14,18 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use crate::errno::{EACCES, EFAULT, EIO, ELOOP, ENOENT, ENOTDIR};
 
 /// Result alias — `Ok(T)` or `Err(-errno)`.
 pub type VfsResult<T> = Result<T, i64>;
 
 /// Per-process VFS state.
+///
+/// P2-D1: derives `Serialize`/`Deserialize` so `KernelSnapshot` can
+/// record cwd/root without a custom impl.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Vfs {
     /// Preopen root. All paths resolve under this. Cannot escape via `..`.
     pub root: PathBuf,
