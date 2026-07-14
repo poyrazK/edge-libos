@@ -132,12 +132,7 @@ fn stderr_bytes(store: &wasmtime::Store<Kernel>) -> Vec<u8> {
 #[test]
 fn write_to_stdout_captures_bytes() -> Result<()> {
     let (engine, linker) = common::engine_and_linker()?;
-    let (ret, store) = block_on(run_and_get_store(
-        &engine,
-        &linker,
-        WRITE_HELLO_WAT,
-        "go",
-    ))?;
+    let (ret, store) = block_on(run_and_get_store(&engine, &linker, WRITE_HELLO_WAT, "go"))?;
     assert_eq!(ret, 14, "write should report all 14 bytes written");
     let bytes = stdout_bytes(&store);
     assert_eq!(bytes.len(), 14, "should capture exactly 14 bytes");
@@ -151,12 +146,7 @@ fn write_to_stdout_captures_bytes() -> Result<()> {
 #[test]
 fn write_to_stderr_captures_bytes() -> Result<()> {
     let (engine, linker) = common::engine_and_linker()?;
-    let (ret, store) = block_on(run_and_get_store(
-        &engine,
-        &linker,
-        WRITE_STDERR_WAT,
-        "go",
-    ))?;
+    let (ret, store) = block_on(run_and_get_store(&engine, &linker, WRITE_STDERR_WAT, "go"))?;
     assert_eq!(ret, 8);
     let bytes = stderr_bytes(&store);
     assert_eq!(&bytes[..4], b"ES!\n");
@@ -166,12 +156,7 @@ fn write_to_stderr_captures_bytes() -> Result<()> {
 #[test]
 fn read_with_no_data_returns_eagain() -> Result<()> {
     let (engine, linker) = common::engine_and_linker()?;
-    let (ret, _store) = block_on(run_and_get_store(
-        &engine,
-        &linker,
-        READ_BUF_WAT,
-        "go",
-    ))?;
+    let (ret, _store) = block_on(run_and_get_store(&engine, &linker, READ_BUF_WAT, "go"))?;
     assert_eq!(ret, -edge_libos::errno::EAGAIN);
     Ok(())
 }
@@ -211,12 +196,7 @@ fn read_with_closed_pipe_returns_zero() -> Result<()> {
 #[test]
 fn read_unknown_fd_returns_ebadf() -> Result<()> {
     let (engine, linker) = common::engine_and_linker()?;
-    let (ret, _store) = block_on(run_and_get_store(
-        &engine,
-        &linker,
-        READ_BAD_FD_WAT,
-        "go",
-    ))?;
+    let (ret, _store) = block_on(run_and_get_store(&engine, &linker, READ_BAD_FD_WAT, "go"))?;
     assert_eq!(ret, -edge_libos::errno::EBADF);
     Ok(())
 }

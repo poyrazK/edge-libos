@@ -514,7 +514,11 @@ mod statx_offset_tests {
     #[test]
     fn filled_mask_excludes_btime() {
         let m = Statx::filled_mask();
-        assert_eq!(m & STATX_BTIME, 0, "BTIME must be excluded from filled_mask");
+        assert_eq!(
+            m & STATX_BTIME,
+            0,
+            "BTIME must be excluded from filled_mask"
+        );
         assert_ne!(m & STATX_TYPE, 0);
         assert_ne!(m & STATX_MODE, 0);
         assert_ne!(m & STATX_INO, 0);
@@ -624,11 +628,7 @@ pub async fn read(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                 // and honors SHUT_RD EOF semantics.
                 drop(tmp);
                 drop(eof);
-                return socket::recvfrom(
-                    caller,
-                    [a[0], a[1], a[2], 0, 0, 0],
-                )
-                .await;
+                return socket::recvfrom(caller, [a[0], a[1], a[2], 0, 0, 0]).await;
             }
             _ => return -EBADF,
         }
@@ -714,11 +714,7 @@ pub async fn write(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                 // path. sendto already covers both V4 and AF_UNIX streams
                 // and honors SHUT_WR EPIPE semantics.
                 drop(bytes);
-                return socket::sendto(
-                    caller,
-                    [a[0], a[1], a[2], 0, 0, 0],
-                )
-                .await;
+                return socket::sendto(caller, [a[0], a[1], a[2], 0, 0, 0]).await;
             }
             _ => return -EBADF,
         }
@@ -744,7 +740,10 @@ pub async fn openat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     };
     let vfs = {
         let kern = caller.data();
-        Vfs { root: kern.vfs.root.clone(), cwd: kern.vfs.cwd.clone() }
+        Vfs {
+            root: kern.vfs.root.clone(),
+            cwd: kern.vfs.cwd.clone(),
+        }
     };
     let _ = mode;
     let file = match vfs.open(&abs, flags, mode) {
@@ -756,9 +755,12 @@ pub async fn openat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let is_dir = std::fs::metadata(&abs).map(|m| m.is_dir()).unwrap_or(false);
     let mut fp = FilePos::with_path(file, abs);
     fp.is_dir = is_dir;
-    let fd = caller.data_mut()
+    let fd = caller
+        .data_mut()
         .fds
-        .insert(Resource::File(std::sync::Arc::new(parking_lot::Mutex::new(fp))));
+        .insert(Resource::File(std::sync::Arc::new(
+            parking_lot::Mutex::new(fp),
+        )));
     fd as i64
 }
 
@@ -878,7 +880,10 @@ pub async fn newfstatat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     };
     let vfs = {
         let kern = caller.data();
-        Vfs { root: kern.vfs.root.clone(), cwd: kern.vfs.cwd.clone() }
+        Vfs {
+            root: kern.vfs.root.clone(),
+            cwd: kern.vfs.cwd.clone(),
+        }
     };
     let stat = match vfs.stat(&abs) {
         Ok(s) => s,
@@ -944,7 +949,10 @@ pub async fn statx(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         };
         let vfs = {
             let kern = caller.data();
-            crate::vfs::Vfs { root: kern.vfs.root.clone(), cwd: kern.vfs.cwd.clone() }
+            crate::vfs::Vfs {
+                root: kern.vfs.root.clone(),
+                cwd: kern.vfs.cwd.clone(),
+            }
         };
         // AT_SYMLINK_NOFOLLOW is accepted; we don't differentiate here
         // because the host std always follows symlinks. If we ever need
@@ -1050,7 +1058,8 @@ pub async fn getdents64(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         let mut fp = match fds.get_mut(fd) {
             Ok(Resource::File(fp)) => fp,
             _ => return -crate::errno::EBADF,
-        }.lock();
+        }
+        .lock();
         let cache = fp.dir_cache.as_ref().expect("dir_cache just populated");
         let start = fp.pos as usize;
         if start >= cache.len() {
@@ -1101,8 +1110,10 @@ pub async fn pipe2(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     // Honour O_NONBLOCK at creation time. fcntl(F_SETFL) can flip this
     // later; see `fn fcntl`.
     if flags & O_NONBLOCK != 0 {
-        rd.nonblock.store(true, std::sync::atomic::Ordering::Relaxed);
-        wr.nonblock.store(true, std::sync::atomic::Ordering::Relaxed);
+        rd.nonblock
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        wr.nonblock
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     let (rd_fd, wr_fd) = {
@@ -1845,10 +1856,7 @@ async fn internal_dup(
         }
         None => caller.data_mut().fds.insert_at_least(oldfd + 1, cloned),
     };
-    caller
-        .data_mut()
-        .fds
-        .set_cloexec(new_fd, want_cloexec);
+    caller.data_mut().fds.set_cloexec(new_fd, want_cloexec);
     new_fd as i64
 }
 

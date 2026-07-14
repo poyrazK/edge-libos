@@ -44,7 +44,10 @@ impl Arena {
     /// offset (i.e. `base + intra_arena_offset`) on success, or `None` if the
     /// arena is full.
     pub fn alloc(&mut self, len: usize, align: usize) -> Option<u32> {
-        debug_assert!(align > 0 && (align & (align - 1)) == 0, "align must be power of two");
+        debug_assert!(
+            align > 0 && (align & (align - 1)) == 0,
+            "align must be power of two"
+        );
         debug_assert!(len <= ARENA_SIZE, "single allocation must fit in one arena");
 
         // Best-fit free-list search: smallest hole that fits.

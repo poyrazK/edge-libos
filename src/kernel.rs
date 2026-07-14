@@ -53,7 +53,11 @@ pub struct Kernel {
 
 impl Kernel {
     pub fn new(args: Vec<String>, env: Vec<(String, String)>) -> Self {
-        Self::new_with_preopen(args, env, std::env::current_dir().unwrap_or_else(|_| "/".into()))
+        Self::new_with_preopen(
+            args,
+            env,
+            std::env::current_dir().unwrap_or_else(|_| "/".into()),
+        )
     }
 
     /// Build a Kernel with a specific preopen directory. The current working
@@ -80,11 +84,7 @@ impl Kernel {
         Self::new_inner(args, env, vfs)
     }
 
-    fn new_inner(
-        args: Vec<String>,
-        env: Vec<(String, String)>,
-        vfs: Vfs,
-    ) -> Self {
+    fn new_inner(args: Vec<String>, env: Vec<(String, String)>, vfs: Vfs) -> Self {
         let now = Instant::now();
         // P2-D1: capture the 32-byte seed used to construct the RNG.
         // Restoring from a snapshot feeds the same seed back through
@@ -130,7 +130,9 @@ impl Kernel {
 
     /// Clone the stdout buffer Arc (for draining after the guest exits).
     /// Returns None if fd=1 has been closed or replaced.
-    pub fn stdout_buf(&self) -> Option<std::sync::Arc<parking_lot::Mutex<std::collections::VecDeque<u8>>>> {
+    pub fn stdout_buf(
+        &self,
+    ) -> Option<std::sync::Arc<parking_lot::Mutex<std::collections::VecDeque<u8>>>> {
         match self.fds.get(crate::fd::STDOUT) {
             Ok(crate::fd::Resource::Stdout(w)) => Some(w.buf.clone()),
             _ => None,
@@ -138,7 +140,9 @@ impl Kernel {
     }
 
     /// Clone the stderr buffer Arc (for draining after the guest exits).
-    pub fn stderr_buf(&self) -> Option<std::sync::Arc<parking_lot::Mutex<std::collections::VecDeque<u8>>>> {
+    pub fn stderr_buf(
+        &self,
+    ) -> Option<std::sync::Arc<parking_lot::Mutex<std::collections::VecDeque<u8>>>> {
         match self.fds.get(crate::fd::STDERR) {
             Ok(crate::fd::Resource::Stderr(w)) => Some(w.buf.clone()),
             _ => None,

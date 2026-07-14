@@ -34,13 +34,23 @@ const UTSNAME_FIELDS: usize = 6;
 /// `struct rlimit64` (the same 16-byte shape).
 const RLIMIT64_SIZE: i64 = 16;
 
-pub fn getuid() -> i64 { UID }
-pub fn geteuid() -> i64 { UID }
-pub fn getgid() -> i64 { UID }
-pub fn getegid() -> i64 { UID }
+pub fn getuid() -> i64 {
+    UID
+}
+pub fn geteuid() -> i64 {
+    UID
+}
+pub fn getgid() -> i64 {
+    UID
+}
+pub fn getegid() -> i64 {
+    UID
+}
 
 /// `getppid()` → 1 (single-process v1; parent is also us).
-pub fn getppid() -> i64 { 1 }
+pub fn getppid() -> i64 {
+    1
+}
 
 /// `uname(buf)` — fill a `struct utsname` (6×65 bytes) with our
 /// fixed values. Matches `linux/utsname.h` field order: sysname, nodename,

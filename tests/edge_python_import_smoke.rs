@@ -49,7 +49,9 @@ fn edge_python_handles_realistic_import_mix() -> Result<()> {
     std::fs::write(&wasm_path, &bytes)?;
 
     let bin = env!("CARGO_BIN_EXE_edge-python");
-    let output = Command::new(bin).arg(wasm_path.to_str().unwrap()).output()?;
+    let output = Command::new(bin)
+        .arg(wasm_path.to_str().unwrap())
+        .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -59,7 +61,10 @@ fn edge_python_handles_realistic_import_mix() -> Result<()> {
         "expected exit 0, got {:?}; stderr={stderr}",
         output.status.code()
     );
-    assert!(stdout.contains("ok"), "expected 'ok' on stdout, got: {stdout:?}");
+    assert!(
+        stdout.contains("ok"),
+        "expected 'ok' on stdout, got: {stdout:?}"
+    );
     Ok(())
 }
 
@@ -96,7 +101,9 @@ fn edge_python_drains_both_streams_then_exits() -> Result<()> {
     std::fs::write(&wasm_path, &bytes)?;
 
     let bin = env!("CARGO_BIN_EXE_edge-python");
-    let output = Command::new(bin).arg(wasm_path.to_str().unwrap()).output()?;
+    let output = Command::new(bin)
+        .arg(wasm_path.to_str().unwrap())
+        .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 

@@ -118,7 +118,10 @@ fn kernel_new_constructs_with_default_state() {
     );
     assert_eq!(k.args.len(), 2);
     assert_eq!(k.env.len(), 1);
-    assert!(k.memory.is_none(), "memory should not be attached at construction");
+    assert!(
+        k.memory.is_none(),
+        "memory should not be attached at construction"
+    );
     assert!(k.fds.contains(STDIN), "fd 0 (stdin) must be preloaded");
     assert!(k.fds.contains(STDOUT), "fd 1 (stdout) must be preloaded");
     assert!(k.fds.contains(STDERR), "fd 2 (stderr) must be preloaded");
