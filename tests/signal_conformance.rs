@@ -133,7 +133,12 @@ async fn run_sigaction(
     let module = common::compile_wat(engine, wat)?;
     let (mut store, instance) = common::instantiate_async(engine, linker, &module).await?;
     let f = instance.get_typed_func::<(i64, i64, i64, i64), i64>(&mut store, fn_name)?;
-    let ret = f.call_async(&mut store, (signum as i64, handler as i64, flags as i64, mask as i64)).await?;
+    let ret = f
+        .call_async(
+            &mut store,
+            (signum as i64, handler as i64, flags as i64, mask as i64),
+        )
+        .await?;
     let recorded = store.data().signals.actions.get(&signum).copied();
     Ok((ret, recorded))
 }
@@ -146,7 +151,10 @@ fn sigaction_install_records_handler() -> Result<()> {
         &linker,
         SIGACTION_WAT,
         "install",
-        13, 0xdead_beef, 0x42, 0x1234,
+        13,
+        0xdead_beef,
+        0x42,
+        0x1234,
     ))?;
     assert_eq!(ret, 0, "rt_sigaction should return 0");
     let sa = recorded.expect("handler should be recorded for signum 13");
@@ -162,11 +170,17 @@ fn sigaction_query_returns_installed() -> Result<()> {
     let module = common::compile_wat(&engine, SIGACTION_QUERY_WAT)?;
     let handler = block_on(async {
         let (mut store, instance) = common::instantiate_async(&engine, &linker, &module).await?;
-        let f = instance.get_typed_func::<(i64, i64, i64, i64), i64>(&mut store, "install_then_query")?;
-        let h = f.call_async(&mut store, (9_i64, 0xCAFE_BABE, 0, 0xFFFF)).await?;
+        let f = instance
+            .get_typed_func::<(i64, i64, i64, i64), i64>(&mut store, "install_then_query")?;
+        let h = f
+            .call_async(&mut store, (9_i64, 0xCAFE_BABE, 0, 0xFFFF))
+            .await?;
         Ok::<_, anyhow::Error>(h)
     })?;
-    assert_eq!(handler, 0xCAFE_BABE, "oldact should reflect the installed handler");
+    assert_eq!(
+        handler, 0xCAFE_BABE,
+        "oldact should reflect the installed handler"
+    );
     Ok(())
 }
 

@@ -14,10 +14,14 @@
 //!   expects fresh allocations to be zero (so we never reuse dirty memory
 //!   unless the caller explicitly chose to via realloc)
 
+use serde::{Deserialize, Serialize};
+
 pub const ARENA_SIZE: usize = 256 * 1024; // MUST match CPython's obmalloc
 
 /// A 256 KiB arena tracked by offset ranges.
-#[derive(Debug, Clone)]
+///
+/// P2-D1: derives `Serialize`/`Deserialize` for snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Arena {
     /// Offset in linear memory where this arena starts.
     pub base: u32,
@@ -40,7 +44,10 @@ impl Arena {
     /// offset (i.e. `base + intra_arena_offset`) on success, or `None` if the
     /// arena is full.
     pub fn alloc(&mut self, len: usize, align: usize) -> Option<u32> {
-        debug_assert!(align > 0 && (align & (align - 1)) == 0, "align must be power of two");
+        debug_assert!(
+            align > 0 && (align & (align - 1)) == 0,
+            "align must be power of two"
+        );
         debug_assert!(len <= ARENA_SIZE, "single allocation must fit in one arena");
 
         // Best-fit free-list search: smallest hole that fits.

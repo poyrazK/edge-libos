@@ -51,9 +51,8 @@ async fn dispatch_argv(
     a: [i64; 6],
 ) -> Result<i64> {
     let (mut store, instance) = common::instantiate_async(engine, linker, module).await?;
-    let f = instance.get_typed_func::<(i64, i64, i64, i64, i64, i64, i64), i64>(
-        &mut store, "call",
-    )?;
+    let f =
+        instance.get_typed_func::<(i64, i64, i64, i64, i64, i64, i64), i64>(&mut store, "call")?;
     let ret = f
         .call_async(&mut store, (nr, a[0], a[1], a[2], a[3], a[4], a[5]))
         .await?;
@@ -72,10 +71,17 @@ fn dispatch_survives_negative_pointer_on_write() -> Result<()> {
     let (engine, linker) = common::engine_and_linker()?;
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     let ret = block_on(dispatch_argv(
-        &engine, &linker, &module, NR_WRITE as i64,
+        &engine,
+        &linker,
+        &module,
+        NR_WRITE as i64,
         [1, -1, 10, 0, 0, 0],
     ))?;
-    assert_eq!(ret, -edge_libos::errno::EFAULT, "negative pointer must yield -EFAULT, got {ret}");
+    assert_eq!(
+        ret,
+        -edge_libos::errno::EFAULT,
+        "negative pointer must yield -EFAULT, got {ret}"
+    );
     Ok(())
 }
 
@@ -86,10 +92,17 @@ fn dispatch_survives_pointer_past_end_of_memory() -> Result<()> {
     let (engine, linker) = common::engine_and_linker()?;
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     let ret = block_on(dispatch_argv(
-        &engine, &linker, &module, NR_WRITE as i64,
+        &engine,
+        &linker,
+        &module,
+        NR_WRITE as i64,
         [1, 100_000, 10, 0, 0, 0],
     ))?;
-    assert_eq!(ret, -edge_libos::errno::EFAULT, "pointer past end of memory must yield -EFAULT, got {ret}");
+    assert_eq!(
+        ret,
+        -edge_libos::errno::EFAULT,
+        "pointer past end of memory must yield -EFAULT, got {ret}"
+    );
     Ok(())
 }
 
@@ -98,10 +111,17 @@ fn dispatch_survives_negative_len_on_write() -> Result<()> {
     let (engine, linker) = common::engine_and_linker()?;
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     let ret = block_on(dispatch_argv(
-        &engine, &linker, &module, NR_WRITE as i64,
+        &engine,
+        &linker,
+        &module,
+        NR_WRITE as i64,
         [1, 0, -1, 0, 0, 0],
     ))?;
-    assert_eq!(ret, -edge_libos::errno::EFAULT, "negative length must yield -EFAULT, got {ret}");
+    assert_eq!(
+        ret,
+        -edge_libos::errno::EFAULT,
+        "negative length must yield -EFAULT, got {ret}"
+    );
     Ok(())
 }
 
@@ -113,10 +133,17 @@ fn dispatch_survives_overflowing_ptr_plus_len() -> Result<()> {
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     let huge = i64::MAX / 2;
     let ret = block_on(dispatch_argv(
-        &engine, &linker, &module, NR_WRITE as i64,
+        &engine,
+        &linker,
+        &module,
+        NR_WRITE as i64,
         [1, huge, huge, 0, 0, 0],
     ))?;
-    assert_eq!(ret, -edge_libos::errno::EFAULT, "ptr+len overflow must yield -EFAULT, got {ret}");
+    assert_eq!(
+        ret,
+        -edge_libos::errno::EFAULT,
+        "ptr+len overflow must yield -EFAULT, got {ret}"
+    );
     Ok(())
 }
 

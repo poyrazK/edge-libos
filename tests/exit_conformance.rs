@@ -66,9 +66,7 @@ async fn run_with_code(
 #[test]
 fn exit_records_code_in_kernel() -> Result<()> {
     let (engine, linker) = common::engine_and_linker()?;
-    let (ret, exit_code) = block_on(run_with_code(
-        &engine, &linker, EXIT_WAT, "go", 42,
-    ))?;
+    let (ret, exit_code) = block_on(run_with_code(&engine, &linker, EXIT_WAT, "go", 42))?;
     assert_eq!(ret, 42, "exit should return 0; code is for the kernel");
     assert_eq!(exit_code, Some(42), "kernel must record exit code");
     Ok(())
@@ -77,9 +75,7 @@ fn exit_records_code_in_kernel() -> Result<()> {
 #[test]
 fn exit_group_records_code_in_kernel() -> Result<()> {
     let (engine, linker) = common::engine_and_linker()?;
-    let (ret, exit_code) = block_on(run_with_code(
-        &engine, &linker, EXIT_GROUP_WAT, "go", 7,
-    ))?;
+    let (ret, exit_code) = block_on(run_with_code(&engine, &linker, EXIT_GROUP_WAT, "go", 7))?;
     assert_eq!(ret, 7);
     assert_eq!(exit_code, Some(7), "kernel must record exit_group code");
     Ok(())
@@ -89,9 +85,7 @@ fn exit_group_records_code_in_kernel() -> Result<()> {
 fn exit_with_negative_code_truncates() -> Result<()> {
     // Linux exit code is `int` (32-bit). -1 → 0xFFFFFFFF as i32.
     let (engine, linker) = common::engine_and_linker()?;
-    let (_ret, exit_code) = block_on(run_with_code(
-        &engine, &linker, EXIT_WAT, "go", -1,
-    ))?;
+    let (_ret, exit_code) = block_on(run_with_code(&engine, &linker, EXIT_WAT, "go", -1))?;
     assert_eq!(exit_code, Some(-1), "negative exit code is passed through");
     Ok(())
 }

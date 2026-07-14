@@ -104,7 +104,10 @@ async fn run_noargs(
 fn getrandom_fills_32_bytes() -> Result<()> {
     let (engine, linker) = common::engine_and_linker()?;
     let xor_sig = block_on(run_noargs(&engine, &linker, GETRANDOM_WAT, "fill_and_xor"))?;
-    assert_ne!(xor_sig, 0, "getrandom returned all-zero buffer (impossibly unlikely)");
+    assert_ne!(
+        xor_sig, 0,
+        "getrandom returned all-zero buffer (impossibly unlikely)"
+    );
     Ok(())
 }
 
