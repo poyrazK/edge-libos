@@ -688,7 +688,7 @@ fn accept4_after_host_connect_returns_valid_fd() -> Result<()> {
     // Custom BIND_WAT that takes a port (16-bit) in addition to fd:
     // builds sockaddr_in at offset 4096 with the guest-supplied port.
     // Family = AF_INET(2), addr = 127.0.0.1.
-    let bind_param_wat = format!(
+    let bind_param_wat = String::from(
         r#"
         (module
           (import "kernel" "syscall"
@@ -709,7 +709,7 @@ fn accept4_after_host_connect_returns_valid_fd() -> Result<()> {
               (i64.const 4096)
               (i64.const 16)
               (i64.const 0) (i64.const 0) (i64.const 0))))
-    "#
+    "#,
     );
     let port_be = port.to_be_bytes();
     let bind_param_wat = bind_param_wat.replace(
@@ -1006,7 +1006,7 @@ fn sendto_then_recvfrom_roundtrips_over_loopback() -> Result<()> {
 
     // Build a bind WAT for the specific port.
     let port_be = port.to_be_bytes();
-    let bind_wat = format!(
+    let bind_wat = String::from(
         r#"
         (module
           (import "kernel" "syscall"
@@ -1022,7 +1022,7 @@ fn sendto_then_recvfrom_roundtrips_over_loopback() -> Result<()> {
               (i64.const 4096)
               (i64.const 16)
               (i64.const 0) (i64.const 0) (i64.const 0))))
-    "#
+    "#,
     );
     let bind_wat = bind_wat.replace(
         "PATCH_PORT",
@@ -1402,7 +1402,7 @@ fn getsockopt_so_error_records_connect_failure() -> Result<()> {
     let conn = common::compile_wat(&engine, CONNECT_WAT)?;
 
     // Patch CONNECT_WAT to use port 1 (almost certainly closed).
-    let conn_p1 = format!(
+    let conn_p1 = String::from(
         r#"
         (module
           (import "kernel" "syscall"
@@ -1420,7 +1420,7 @@ fn getsockopt_so_error_records_connect_failure() -> Result<()> {
               (i64.const 4096)
               (i64.const 16)
               (i64.const 0) (i64.const 0) (i64.const 0))))
-    "#
+    "#,
     );
     let conn_p1 = common::compile_wat(&engine, &conn_p1)?;
 
@@ -1551,7 +1551,7 @@ fn shutdown_rd_then_recvfrom_returns_eof() -> Result<()> {
 
     // Patch BIND_WAT for the dynamic port.
     let port_be = port.to_be_bytes();
-    let bind_wat = format!(
+    let bind_wat = String::from(
         r#"
         (module
           (import "kernel" "syscall"
@@ -1567,7 +1567,7 @@ fn shutdown_rd_then_recvfrom_returns_eof() -> Result<()> {
               (i64.const 4096)
               (i64.const 16)
               (i64.const 0) (i64.const 0) (i64.const 0))))
-    "#
+    "#,
     );
     let bind_wat = bind_wat.replace(
         "PATCH_PORT",
@@ -1642,7 +1642,7 @@ fn shutdown_wr_then_sendto_returns_epipe() -> Result<()> {
     let close = common::compile_wat(&engine, CLOSE_WAT)?;
 
     let port_be = port.to_be_bytes();
-    let bind_wat = format!(
+    let bind_wat = String::from(
         r#"
         (module
           (import "kernel" "syscall"
@@ -1658,7 +1658,7 @@ fn shutdown_wr_then_sendto_returns_epipe() -> Result<()> {
               (i64.const 4096)
               (i64.const 16)
               (i64.const 0) (i64.const 0) (i64.const 0))))
-    "#
+    "#,
     );
     let bind_wat = bind_wat.replace(
         "PATCH_PORT",
@@ -2179,7 +2179,7 @@ fn epoll_wait_wakes_on_accept4() -> Result<()> {
 
     // Patch BIND for the dynamic port.
     let port_be = port.to_be_bytes();
-    let bind_wat = format!(
+    let bind_wat = String::from(
         r#"
         (module
           (import "kernel" "syscall"
@@ -2195,7 +2195,7 @@ fn epoll_wait_wakes_on_accept4() -> Result<()> {
               (i64.const 4096)
               (i64.const 16)
               (i64.const 0) (i64.const 0) (i64.const 0))))
-    "#
+    "#,
     );
     let bind_wat = bind_wat.replace(
         "PATCH_PORT",

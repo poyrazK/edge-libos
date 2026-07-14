@@ -266,7 +266,7 @@ impl Stat {
         Self {
             st_dev: 0,
             st_ino: meta.ino(),
-            st_nlink: meta.nlink() as u64,
+            st_nlink: meta.nlink(),
             st_mode: mode,
             st_uid: 1000,
             st_gid: 1000,
@@ -416,7 +416,7 @@ fn io_to_errno(e: io::Error) -> i64 {
         TooManyLinks => ELOOP,
         _ => EIO,
     };
-    -(code as i64)
+    -code
 }
 
 #[cfg(test)]

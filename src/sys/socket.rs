@@ -229,7 +229,7 @@ fn parse_sockaddr(
 
     match family {
         AF_INET => {
-            if (len as usize) < SOCKADDR_IN_SIZE {
+            if len < SOCKADDR_IN_SIZE {
                 return Err(-EINVAL);
             }
             let bytes = match mem::guest_slice(caller, addr_ptr, SOCKADDR_IN_SIZE as i64) {
@@ -243,7 +243,7 @@ fn parse_sockaddr(
             Ok(SockAddr::V4 { port, addr })
         }
         AF_INET6 => {
-            if (len as usize) < SOCKADDR_IN6_SIZE {
+            if len < SOCKADDR_IN6_SIZE {
                 return Err(-EINVAL);
             }
             let bytes = match mem::guest_slice(caller, addr_ptr, SOCKADDR_IN6_SIZE as i64) {
@@ -259,7 +259,7 @@ fn parse_sockaddr(
         AF_UNIX => {
             // P2-C3 part 2: parse `struct sockaddr_un` (110 bytes).
             // `sun_family` (u16 LE) at offset 0, `sun_path` (108 bytes) at offset 2.
-            if (len as usize) < 3 {
+            if len < 3 {
                 // At least family + 1 byte of path (or NUL) required.
                 return Err(-EINVAL);
             }
