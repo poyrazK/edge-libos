@@ -358,10 +358,10 @@ impl SocketInner {
             return 1; // AF_UNIX
         }
         match self.bound {
-            Some(SockAddr::V4 { .. }) => 2,    // AF_INET
-            Some(SockAddr::V6 { .. }) => 10,   // AF_INET6
-            Some(SockAddr::Unix { .. }) => 1,  // AF_UNIX (defensive — family_unix catches first)
-            None => 2,                          // default AF_INET for unbound
+            Some(SockAddr::V4 { .. }) => 2,   // AF_INET
+            Some(SockAddr::V6 { .. }) => 10,  // AF_INET6
+            Some(SockAddr::Unix { .. }) => 1, // AF_UNIX (defensive — family_unix catches first)
+            None => 2,                        // default AF_INET for unbound
         }
     }
 }
@@ -456,10 +456,7 @@ impl EpollInner {
             v
         };
         EpollSnapshot {
-            entries: entries
-                .into_iter()
-                .map(|(_, e)| e)
-                .collect::<Vec<_>>(),
+            entries: entries.into_iter().map(|(_, e)| e).collect::<Vec<_>>(),
             self_event_fd: self.self_event_fd,
         }
     }
@@ -663,6 +660,13 @@ impl FdTable {
     /// P2-D1: expose `next_fd` for snapshot without making it pub.
     pub fn next_fd_for_snapshot(&self) -> u32 {
         self.next_fd
+    }
+
+    /// P2-D1: restore `next_fd` from a snapshot. The freeze CLI calls
+    /// this after rebuilding the table from `apply_snapshot` so the
+    /// next allocation honors the snapshot's idea of "next available".
+    pub fn set_next_fd_for_snapshot(&mut self, fd: u32) {
+        self.next_fd = fd;
     }
 }
 
