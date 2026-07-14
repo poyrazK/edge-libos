@@ -18,6 +18,17 @@ use wasmtime::Memory;
 /// postcard-encoded `KernelSnapshot::rng_seed` directly.
 pub type RngSeed = [u8; 32];
 
+/// P2-D3.4: the C conformance tests (`tests/conformance/syscall.h`)
+/// write their `PASS`/`FAIL:<reason>` marker at offset 4096 in linear
+/// memory, and `edge-cli trace` reads it back. See also
+/// `tests/conformance/syscall.h:228` (parallel literal in C — kept
+/// in sync manually).
+pub const MARKER_ADDR: usize = 4096;
+
+/// Length of the marker region the conformance tests may write into.
+/// Bumped from 64 if the C side ever grows past it.
+pub const MARKER_LEN: usize = 64;
+
 use crate::fd::FdTable;
 use crate::mm::LinearAllocator;
 use crate::sys::futex::FutexTable;
