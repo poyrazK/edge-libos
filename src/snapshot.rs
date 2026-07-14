@@ -174,6 +174,16 @@ pub struct KernelSnapshot {
     pub signals: SignalStateSnapshot,
     pub exit_code: Option<LeI32>,
     pub comm: [u8; 16],
+    /// ADR 0001 §2 + ADR 0002 §5 — futex address table.
+    ///
+    /// Sorted by `addr` for deterministic postcard output; the
+    /// in-memory `FutexTable` uses `HashMap` (ADR 0001 §2 — keyed
+    /// lookup), so the wire form is a `Vec` of `(addr, waiters)`
+    /// pairs, not a serde HashMap. `Arc<tokio::sync::Notify>` is NOT
+    /// persisted — see `FutexTable::rebuild_from_snapshot` for the
+    /// rebuild-on-restore contract. Append-only field: snapshot
+    /// format version stays at `SNAPSHOT_FORMAT_VERSION = 1`.
+    pub futex_table: Vec<crate::sys::futex::FutexAddrSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -580,6 +590,14 @@ fn build_kernel_snapshot(kernel: &Kernel, pages: Vec<MemoryPageSnapshot>) -> Ker
         signals: crate::snapshot::SignalStateSnapshot::from(&kernel.signals),
         exit_code: kernel.exit_code.map(LeI32),
         comm: kernel.comm,
+        futex_table: {
+            // Lock-held for the snapshot walk + sort; no `.await`
+            // involved, so the lock-doesn't-cross-await rule from
+            // ADR 0001 §2 is preserved. The resulting `Vec` moves
+            // into the struct literal by ownership.
+            let table = kernel.futex_table.lock();
+            table.snapshot()
+        },
     }
 }
 
@@ -686,6 +704,17 @@ pub fn apply_snapshot_kernel_state(
         alt_stack: snap.signals.alt_stack.clone(),
     };
     kernel.mm.replace_from_snapshot(snap.mm.clone());
+
+    // ADR 0002 §5: rebuild the futex table from sorted (addr, waiters).
+    // The `Arc<Notify>` is fresh-allocated by `rebuild_from_snapshot`
+    // — in-flight waiters are dropped (the guest re-registers on its
+    // next syscall) per ADR 0001 §2's "shared per-address Notify"
+    // model. Lock is held only for the duration of the rebuild — no
+    // `.await` involved, matching the rest of this function.
+    {
+        let mut table = kernel.futex_table.lock();
+        table.rebuild_from_snapshot(&snap.futex_table);
+    }
 
     // ---- fd table ---------------------------------------------------------
     use crate::fd::{EpollInner, EventFdInner, PipeRead, PipeWrite, Resource, SharedFilePos};
@@ -953,6 +982,7 @@ mod tests {
             signals: SignalStateSnapshot::default(),
             exit_code: None,
             comm: [0u8; 16],
+            futex_table: vec![],
         };
         let bytes = postcard::to_stdvec(&snap).expect("encode");
         let back: KernelSnapshot = postcard::from_bytes(&bytes).expect("decode");
@@ -1385,6 +1415,7 @@ mod tests {
             signals: SignalStateSnapshot::default(),
             exit_code: None,
             comm: [0u8; 16],
+            futex_table: vec![],
         }
     }
 

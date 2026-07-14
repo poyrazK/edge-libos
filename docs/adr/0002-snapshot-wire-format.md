@@ -1,6 +1,12 @@
 # ADR 0002 — snapshot wire format
 
-- **Status.** Proposed, 2026-07-13.
+- **Status.** Accepted, 2026-07-14. P3 Tier-2 realized §5 by adding
+  the `futex_table: Vec<FutexAddrSnapshot>` field to `KernelSnapshot`
+  and threading it through `build_kernel_snapshot` /
+  `apply_snapshot_kernel_state` (PR on branch `p3-t2-futex-snapshot`).
+  The `Arc<Notify>` rebuild-on-restore contract from §5 is
+  implemented in `FutexTable::rebuild_from_snapshot`
+  (`src/sys/futex.rs`).
 - **Phase.** P2-D (snapshot/restore) implements; P3 (fork via CoW,
   live x86→ARM migration) consumes.
 - **Scope.** The on-disk / on-wire format that
