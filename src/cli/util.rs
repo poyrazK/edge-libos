@@ -20,9 +20,17 @@ use crate::kernel::Kernel;
 /// and emscripten builds (used by some third-party wasm).
 pub async fn call_start(instance: &Instance, store: &mut Store<Kernel>) -> CliResult<()> {
     if let Ok(start) = instance.get_typed_func::<(), ()>(&mut *store, "_start") {
-        start.call_async(&mut *store, ()).await.map_err(CliError::from).map(|_| ())
+        start
+            .call_async(&mut *store, ())
+            .await
+            .map_err(CliError::from)
+            .map(|_| ())
     } else if let Ok(start) = instance.get_typed_func::<(), i32>(&mut *store, "_start") {
-        start.call_async(&mut *store, ()).await.map_err(CliError::from).map(|_| ())
+        start
+            .call_async(&mut *store, ())
+            .await
+            .map_err(CliError::from)
+            .map(|_| ())
     } else {
         Err(CliError::Args(
             "no _start export (expected () -> () or () -> i32)".to_string(),

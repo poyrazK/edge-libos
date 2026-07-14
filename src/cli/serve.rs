@@ -46,9 +46,9 @@ pub async fn run_main(args: &[String]) -> CliResult<i32> {
             let raw = it.next().ok_or_else(|| {
                 CliError::Args("serve: --port requires a number argument".to_string())
             })?;
-            let p: u16 = raw
-                .parse()
-                .map_err(|e: std::num::ParseIntError| CliError::Args(format!("serve: --port: {e}")))?;
+            let p: u16 = raw.parse().map_err(|e: std::num::ParseIntError| {
+                CliError::Args(format!("serve: --port: {e}"))
+            })?;
             if p == 0 {
                 return Err(CliError::Args(
                     "serve: --port 0 is reserved (kernel ephemeral)".to_string(),
@@ -142,8 +142,7 @@ mod tests {
     use super::*;
     use crate::snapshot::{
         endian::{LeI32, LeU32, LeU64},
-        FdEntrySnapshot, FdSnapshot, ResourceBody, ResourceKind, ResourceSnapshot,
-        SocketSnapshot,
+        FdEntrySnapshot, FdSnapshot, ResourceBody, ResourceKind, ResourceSnapshot, SocketSnapshot,
     };
 
     fn rt() -> tokio::runtime::Runtime {

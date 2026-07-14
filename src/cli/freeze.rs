@@ -47,9 +47,7 @@ pub async fn run_main(args: &[String]) -> CliResult<i32> {
         }
     }
     let out = out.ok_or_else(|| {
-        CliError::Args(
-            "usage: edge-cli freeze <wasm> [--] [args...] --out <path>".to_string(),
-        )
+        CliError::Args("usage: edge-cli freeze <wasm> [--] [args...] --out <path>".to_string())
     })?;
     if positional.is_empty() {
         return Err(CliError::Args(
