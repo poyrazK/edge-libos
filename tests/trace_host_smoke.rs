@@ -38,23 +38,24 @@ fn trace_host_emits_json_per_syscall() -> Result<()> {
         std::fs::write(&wasm_path, &bytes)?;
     }
 
-    // Invoke trace-host. `--no-marker` suppresses the trailing
-    // `{"marker":""}` line that the C conformance runner reads but that
-    // would otherwise pollute a zero-syscall stdout.
-    let bin = env!("CARGO_BIN_EXE_trace-host");
+    // Invoke edge-cli's trace subcommand. `--no-marker` suppresses the
+    // trailing `{"marker":""}` line that the C conformance runner reads
+    // but that would otherwise pollute a zero-syscall stdout.
+    let bin = env!("CARGO_BIN_EXE_edge-cli");
     let output = Command::new(bin)
+        .arg("trace")
         .arg("--no-marker")
         .arg(wasm_path.to_str().unwrap())
         .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // The wasm has no `_start` export so trace-host will silently skip the
-    // call, leaving 0 captured syscalls. That's still a valid pass.
+    // The wasm has no `_start` export so the tracer will silently skip
+    // the call, leaving 0 captured syscalls. That's still a valid pass.
     // Verify the binary exits 0 and emits the expected footer line.
     assert!(
         output.status.success(),
-        "trace-host exited non-zero: stderr={stderr}"
+        "edge-cli trace exited non-zero: stderr={stderr}"
     );
     assert!(
         stderr.contains("0 syscalls captured"),
@@ -84,8 +85,9 @@ fn trace_host_diff_baseline_success() -> Result<()> {
         std::fs::write(&baseline, "# no syscalls expected\n")?;
     }
 
-    let bin = env!("CARGO_BIN_EXE_trace-host");
+    let bin = env!("CARGO_BIN_EXE_edge-cli");
     let output = Command::new(bin)
+        .arg("trace")
         .arg(wasm_path.to_str().unwrap())
         .arg("--diff")
         .arg(baseline.to_str().unwrap())
@@ -93,7 +95,7 @@ fn trace_host_diff_baseline_success() -> Result<()> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "trace-host --diff exited non-zero: stderr={stderr}"
+        "edge-cli trace --diff exited non-zero: stderr={stderr}"
     );
     assert!(
         stderr.contains("--diff OK"),
@@ -123,10 +125,11 @@ fn trace_host_emits_well_formed_json_for_getpid() -> Result<()> {
     let bytes = wat::parse_str(wat).expect("compile wat");
     std::fs::write(&wasm_path, &bytes)?;
 
-    let bin = env!("CARGO_BIN_EXE_trace-host");
+    let bin = env!("CARGO_BIN_EXE_edge-cli");
     // `--no-marker` keeps the marker line out of stdout so lines[0] is the
     // first syscall JSON entry, not a marker line.
     let output = Command::new(bin)
+        .arg("trace")
         .arg("--no-marker")
         .arg(wasm_path.to_str().unwrap())
         .output()?;
@@ -135,7 +138,7 @@ fn trace_host_emits_well_formed_json_for_getpid() -> Result<()> {
 
     assert!(
         output.status.success(),
-        "trace-host exited non-zero: stderr={stderr}"
+        "edge-cli trace exited non-zero: stderr={stderr}"
     );
     let lines: Vec<&str> = stdout.lines().collect();
     // The wasm above has no `_start`, so the driver can't auto-call it.

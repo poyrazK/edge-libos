@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Conformance runner: compile each `tests/conformance/*.c` with `zig cc`,
-# drive the resulting .wasm through `trace-host`, and verify the JSON
+# drive the resulting .wasm through `edge-cli trace`, and verify the JSON
 # trace contains the expected syscall name.
 #
 # This is the C-side equivalent of `tests/*_conformance.rs`. Each test
@@ -11,7 +11,7 @@
 #
 # Pre-reqs:
 #   - zig 0.13+ (tested with 0.16.0)
-#   - cargo build --release --bin trace-host
+#   - cargo build --release --bin edge-cli
 #
 # Usage:
 #   bash tests/conformance/runner.sh
@@ -21,22 +21,22 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 ZIG=${ZIG:-zig}
 CC="$ZIG cc -target wasm32-freestanding -O2"
-TRACE_HOST="$ROOT/target/release/trace-host"
+EDGE_CLI="$ROOT/target/release/edge-cli"
 
 if ! command -v "$ZIG" >/dev/null 2>&1; then
     echo "FAIL: zig not found in PATH"
     exit 1
 fi
 
-if [[ ! -x "$TRACE_HOST" ]]; then
-    echo "Building trace-host (release)..."
-    (cd "$ROOT" && cargo build --release --bin trace-host >/dev/null)
+if [[ ! -x "$EDGE_CLI" ]]; then
+    echo "Building edge-cli (release)..."
+    (cd "$ROOT" && cargo build --release --bin edge-cli >/dev/null)
 fi
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-# Per-test name → expected syscall name to observe in trace-host JSON.
+# Per-test name → expected syscall name to observe in edge-cli trace JSON.
 # Implemented as a function (bash 3.2 on macOS doesn't have associative arrays).
 # The default arm fails loudly for unregistered names — it used to silently
 # fall back to "exit", which masked forgotten registrations.
@@ -164,7 +164,7 @@ STRICT="${STRICT:-0}"
 
 # Pre-create the directory used by getdents64_stream_position.c.
 # P2-B2: this test asserts the kernel tracks dir-stream position across
-# multiple getdents64 calls. We create the dir under $ROOT (the trace-host
+# multiple getdents64 calls. We create the dir under $ROOT (the edge-cli
 # process's cwd, which becomes the kernel's cwd) and clean it up at exit.
 GD_DIR="$ROOT/getdents64_dir"
 mkdir -p "$GD_DIR"
@@ -189,18 +189,18 @@ for c in "$ROOT"/tests/conformance/*.c; do
     fi
 
     # Note: removed `|| true` — a guest trap is a real failure now.
-    trace_json=$("$TRACE_HOST" "$wasm" 2>/dev/null)
+    trace_json=$("$EDGE_CLI" trace "$wasm" 2>/dev/null)
     trace_rc=$?
 
     if [[ $trace_rc -ne 0 ]]; then
         FAIL=$((FAIL + 1))
         FAIL_NAMES+=("$name")
-        echo "FAIL  $name (trace-host exited $trace_rc; guest likely trapped)"
+        echo "FAIL  $name (edge-cli trace exited $trace_rc; guest likely trapped)"
         echo "$trace_json" | tail -3 | sed 's/^/    /'
         continue
     fi
 
-    # Extract marker from the trailing JSON line emitted by trace-host.
+    # Extract marker from the trailing JSON line emitted by edge-cli trace.
     marker=$(echo "$trace_json" | grep -oE '\{"marker":"[^"]*"' | head -1 | sed 's/^{"marker":"//; s/"$//')
     expected=$(expected_syscall "$name") || {
         FAIL=$((FAIL + 1))

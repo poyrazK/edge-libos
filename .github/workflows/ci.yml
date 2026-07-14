@@ -20,7 +20,7 @@
 # Job graph:
 #
 #   tools           (independent — verifies version pins)
-#   build ──┬──▶ c-conformance   (zig cc + downloaded trace-host)
+#   build ──┬──▶ c-conformance   (zig cc + downloaded edge-cli)
 #           └──▶ reproduce       (integration scripts, cargo-free)
 #
 # Triggers: push to main, and pull_request against any branch.
@@ -155,10 +155,10 @@ jobs:
 
   # ─── The ONLY job that runs cargo ──────────────────────────────────
   # Compiles once under the `ci` profile, runs the full Rust suite, and
-  # uploads the two binaries the fan-out children need. `cargo test`
-  # already builds trace-host/edge-python (via CARGO_BIN_EXE), so the
-  # explicit `cargo build` step is a near-instant no-op that just makes
-  # the artifact paths obvious.
+  # uploads the binary the fan-out children need. `cargo test` already
+  # builds edge-cli (via CARGO_BIN_EXE), so the explicit `cargo build`
+  # step is a near-instant no-op that just makes the artifact paths
+  # obvious.
   build:
     name: cargo build + test (single ci-profile compile)
     runs-on: ubuntu-22.04
@@ -225,15 +225,15 @@ jobs:
           set -euo pipefail
           cargo test --profile ci
 
-      - name: 9. cargo build --profile ci binaries (reuses step 8)
+      - name: 9. cargo build --profile ci binary (reuses step 8)
         run: |
           set -euo pipefail
-          cargo build --profile ci --bin trace-host --bin edge-python
+          cargo build --profile ci --bin edge-cli
           # Publish under target/release/ so downstream scripts/artifacts
           # keep their conventional paths regardless of the CI profile dir.
           mkdir -p target/release
-          cp target/ci/trace-host target/ci/edge-python target/release/
-          ls -la target/release/trace-host target/release/edge-python
+          cp target/ci/edge-cli target/release/
+          ls -la target/release/edge-cli
 
       - name: 10. cargo-deny (advisories, licenses, sources, bans)
         # Cheap (no codegen) but needs `cargo install cargo-deny`. The
@@ -257,8 +257,7 @@ jobs:
         with:
           name: release-binaries
           path: |
-            target/release/trace-host
-            target/release/edge-python
+            target/release/edge-cli
           retention-days: 7
           if-no-files-found: error
 
@@ -299,7 +298,7 @@ jobs:
           sudo apt-get install -y -qq wabt
           wat2wasm --version
 
-      - name: 4. Download binaries (trace-host)
+      - name: 4. Download binaries (edge-cli)
         uses: actions/download-artifact@v4
         with:
           name: release-binaries
@@ -307,11 +306,11 @@ jobs:
 
       - name: 5. C conformance (marker-enforced)
         # The gating step. A single failed C test fails CI. Runs the
-        # downloaded trace-host on zig cc-compiled .wasm; no cargo.
+        # downloaded edge-cli on zig cc-compiled .wasm; no cargo.
         run: |
           set -euo pipefail
-          chmod +x target/release/trace-host
-          ls -la target/release/trace-host
+          chmod +x target/release/edge-cli
+          ls -la target/release/edge-cli
           bash tests/conformance/runner.sh
 
   # ─── reproduce_dod.sh integration (cargo-free) ─────────────────────
@@ -346,7 +345,7 @@ jobs:
           sudo apt-get install -y -qq strace
           strace --version 2>&1 | head -1
 
-      - name: 3. Download binaries (trace-host + edge-python)
+      - name: 3. Download binaries (edge-cli)
         uses: actions/download-artifact@v4
         with:
           name: release-binaries
@@ -355,6 +354,6 @@ jobs:
       - name: 4. Run scripts/reproduce_dod.sh (skips all cargo work)
         run: |
           set -uo pipefail
-          chmod +x target/release/trace-host target/release/edge-python
+          chmod +x target/release/edge-cli
           ls -la target/release/
           bash scripts/reproduce_dod.sh

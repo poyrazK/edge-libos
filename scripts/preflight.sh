@@ -115,8 +115,8 @@ run_step 0i "gitleaks (secret-leak scan)" \
 run_step 0j "wat2wasm validation (WAT syntax check)" \
     bash -c 'command -v wat2wasm >/dev/null 2>&1 || { echo "SKIP: wabt not installed (apt install wabt)"; exit 0; }; while IFS= read -r -d "" wat; do echo "==> $wat"; wat2wasm "$wat" -o /tmp/check.wasm || { echo "FAIL: $wat"; exit 1; }; done < <(find tests guests -name "*.wat" -not -path "*/target/*" -print0 2>/dev/null || true)'
 
-run_step 1 "cargo build --profile ci (trace-host + edge-python)" \
-    bash -c 'cargo build --profile ci --bin trace-host --bin edge-python'
+run_step 1 "cargo build --profile ci (edge-cli)" \
+    bash -c 'cargo build --profile ci --bin edge-cli'
 
 run_step 2 "cargo test --profile ci (full Rust suite)" \
     cargo test --profile ci

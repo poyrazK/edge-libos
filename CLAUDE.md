@@ -15,8 +15,8 @@ to any particular guest.
 CPython + FastAPI is the **reference workload** the milestones validate against
 (it's the highest-risk guest and exercises the widest syscall surface), but the
 kernel, the syscall handlers, and the conformance suite are guest-agnostic: the C
-conformance tests are plain `wasm32-musl` C programs, and `edge-python` /
-`trace-host` load any conforming module. Treat CPython as the driving example,
+conformance tests are plain `wasm32-musl` C programs, and `edge-cli` (any
+subcommand) loads any conforming module. Treat CPython as the driving example,
 not the scope.
 
 The full design spec is [`impelementationplan`](impelementationplan) (source of
@@ -51,7 +51,7 @@ runs everything on every push. The commands below use `--release` for
 completeness; substitute `--profile ci` when iterating.
 
 ```bash
-# Build host kernel (two bins: edge-python driver, trace-host tracer)
+# Build host kernel (single binary: edge-cli with subcommands)
 cargo build --release
 
 # Full Rust suite (unit + integration)
@@ -61,7 +61,7 @@ cargo test --release
 cargo test --release --test <file_stem>        # e.g. --test socket_conformance
 cargo test --release <substring>               # filters by test name
 
-# C conformance suite (needs zig; builds trace-host if missing)
+# C conformance suite (needs zig; builds edge-cli if missing)
 bash tests/conformance/runner.sh
 
 # Canonical test total (single source of truth; runner.sh must agree)
@@ -76,7 +76,7 @@ bash scripts/preflight.sh
 bash guest/build.sh
 
 # Run a guest wasm
-cargo run --release --bin edge-python -- <python.wasm> [--] [args...]
+cargo run --release --bin edge-cli -- run <python.wasm> [--] [args...]
 ```
 
 Toolchain is pinned: **Rust 1.93.0** (`rust-toolchain.toml`), `wasmtime =45.0.3`,
@@ -139,20 +139,22 @@ in different `Store`s. Future `clone(56)` / `fork(57)` handlers must
 respect this constraint (spawn a new tokio task + new thread-local `Store`
 rather than moving the existing one).
 
-### Two host binaries (both guest-agnostic)
+### One host binary, many subcommands (guest-agnostic)
 
-- `edge-python` ([`src/bin/edge_python.rs`](src/bin/edge_python.rs)) — the
-  general driver (named for the reference workload, but it loads any conforming
-  `wasm32-musl` module). Instantiates the guest, **attaches linear memory after
-  instantiation**, calls `_start`, drains buffered stdout/stderr, propagates the
-  guest exit code.
-- `trace-host` ([`src/bin/trace_host.rs`](src/bin/trace_host.rs)) — installs a
-  `SyscallObserver` (via `install_observer`) and calls `add_to_linker` like any
-  other consumer, emitting one JSON line per syscall. It does **not** re-mirror
-  the dispatch table, so new syscalls are picked up automatically. Supports
-  `--diff <baseline>` (fail if a baseline syscall is missing).
+`edge-cli` ([`src/bin/edge_cli.rs`](src/bin/edge_cli.rs)) is the single host
+binary; `src/cli/mod.rs::run_main` dispatches by subcommand:
 
-Neither binary embeds anything CPython-specific — the runtime accepts any guest
+- `run <wasm> [--] [args...]` — instantiates the guest, attaches linear memory
+  after instantiation, calls `_start`, drains buffered stdout/stderr,
+  propagates the guest exit code.
+- `trace <wasm> [--diff <baseline>] [--no-marker]` — installs a
+  `SyscallObserver` (via `install_observer`) and emits one JSON line per
+  syscall. It does **not** re-mirror the dispatch table, so new syscalls are
+  picked up automatically. Supports `--diff <baseline>` (fail if a baseline
+  syscall is missing).
+- `freeze` / `serve` / `bench` — stubs in D3.3; body lands in D3.5 / D3.7.
+
+The binary embeds nothing CPython-specific — the runtime accepts any guest
 whose imports are satisfied by `kernel.syscall` and imported memory/table.
 
 ### The reference guest (CPython)
@@ -173,7 +175,7 @@ like.
    eventfd, identity, ioctl, time, random, signal, path).
 2. Add a match arm in **`dispatch::dispatch`** ([`src/dispatch.rs`](src/dispatch.rs)).
 3. Add a match arm in **`dispatch::syscall_name`** (same file) — the conformance
-   runner and trace-host need the name, and the runner fails loudly for an
+   runner and `edge-cli trace` need the name, and the runner fails loudly for an
    unregistered name.
 4. Add tests: a Rust integration test in `tests/*_conformance.rs`, and usually a
    C test in `tests/conformance/<name>.c`. Update `expected_syscall()` in
@@ -195,7 +197,7 @@ like.
   `efault_fuzz.rs` pointer poisoner, `*_smoke.rs` driver smokes,
   `strace_baseline_diff.rs`).
 - **C conformance** — `tests/conformance/*.c`, one file per syscall, compiled
-  with `zig cc`, driven through `trace-host`, and verified by observing the
+  with `zig cc`, driven through `edge-cli trace`, and verified by observing the
   expected syscall in the JSON trace. Each test is **marker-enforced**: it calls
   `mark_pass()` / `mark_fail(reason)` from `tests/conformance/syscall.h`.
 - `tests/count_tests.sh` is the one source of truth for the total; `runner.sh`

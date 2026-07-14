@@ -143,14 +143,17 @@ fn guest_shim_runs_through_trace_host() -> Result<()> {
         .status()?;
     assert!(status.success(), "build failed");
 
-    // Run through trace-host.
-    let bin = env!("CARGO_BIN_EXE_trace-host");
-    let output = Command::new(bin).arg(wasm.to_str().unwrap()).output()?;
+    // Run through edge-cli's trace subcommand.
+    let bin = env!("CARGO_BIN_EXE_edge-cli");
+    let output = Command::new(bin)
+        .arg("trace")
+        .arg(wasm.to_str().unwrap())
+        .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    eprintln!("trace-host stdout: {stdout}");
-    eprintln!("trace-host stderr: {stderr}");
+    eprintln!("edge-cli trace stdout: {stdout}");
+    eprintln!("edge-cli trace stderr: {stderr}");
     assert!(
         stdout.contains("\"name\":\"getpid\""),
         "expected getpid in trace, got: {stdout}"

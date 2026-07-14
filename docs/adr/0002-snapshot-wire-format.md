@@ -10,7 +10,7 @@
 - **Phase.** P2-D (snapshot/restore) implements; P3 (fork via CoW,
   live x86→ARM migration) consumes.
 - **Scope.** The on-disk / on-wire format that
-  `edge-python freeze` (P2-D1) writes and `edge-python serve`
+  `edge-cli freeze` (P2-D1) writes and `edge-cli serve`
   (P2-D2) reads. P3 fork and P3 live migration MUST read the same
   format.
 
