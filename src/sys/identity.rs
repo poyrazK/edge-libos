@@ -23,9 +23,6 @@ pub const NR_SETSID: u32 = 112;
 pub const NR_GETSID: u32 = 124;
 pub const NR_GETGROUPS: u32 = 115;
 
-/// `struct rlimit` on wasm32-musl: 16 bytes (rlim_cur i64, rlim_max i64).
-const RLIMIT_SIZE: i64 = 16;
-
 /// `struct utsname` (Linux): 6 × 65 bytes = 390 bytes total.
 const UTSNAME_SIZE: i64 = 390;
 const UTSNAME_FIELD: usize = 65;
@@ -148,8 +145,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rlimit_and_utsname_layouts() {
-        assert_eq!(RLIMIT_SIZE, 16);
+    fn utsname_layout() {
         assert_eq!(UTSNAME_SIZE, 390);
         assert_eq!(UTSNAME_FIELD * UTSNAME_FIELDS, 390);
     }

@@ -132,22 +132,6 @@ const GETDENTS_WAT: &str = r#"
     )
 "#;
 
-/// write(fd, buf@4096, len) → bytes written
-const WRITE_WAT: &str = r#"
-    (module
-      (import "kernel" "syscall"
-        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
-      (memory (export "memory") 1)
-      (func (export "go") (param $fd i64) (param $len i64) (result i64)
-        (call $syscall
-          (i64.const 1)              ;; NR_WRITE
-          (local.get $fd)
-          (i64.const 4096)
-          (local.get $len)
-          (i64.const 0) (i64.const 0) (i64.const 0)))
-    )
-"#;
-
 /// pipe2(fdarray@4096, flags) → 0. Writes [rd_fd, wr_fd] as i32 little-endian.
 const PIPE2_WAT: &str = r#"
     (module

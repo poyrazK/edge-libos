@@ -23,9 +23,7 @@ pub const SS_DISABLE: i32 = 2;
 
 // `struct sigaltstack` on wasm32-musl: ss_sp(8) + ss_flags(4) + pad(4) + ss_size(8) = 24
 pub const SIGALTSTACK_SIZE: i64 = 24;
-const SS_SP_OFF: usize = 0;
 const SS_FLAGS_OFF: usize = 8;
-const SS_SIZE_OFF: usize = 16;
 
 /// `rt_sigaction`'s `how` argument values.
 const SIG_BLOCK: i64 = 0;

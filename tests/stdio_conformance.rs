@@ -81,19 +81,6 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
     rt.block_on(f)
 }
 
-async fn run_noargs(
-    engine: &wasmtime::Engine,
-    linker: &wasmtime::Linker<Kernel>,
-    wat: &str,
-    fn_name: &str,
-) -> Result<(i64, Kernel)> {
-    let module = common::compile_wat(engine, wat)?;
-    let (mut store, instance) = common::instantiate_async(engine, linker, &module).await?;
-    let f = instance.get_typed_func::<(), i64>(&mut store, fn_name)?;
-    let ret = f.call_async(&mut store, ()).await?;
-    Ok((ret, Kernel::new(vec![], vec![]))) // dummy kernel just for type compat
-}
-
 /// Helper that runs a no-arg wasm fn and returns (ret, store) so tests can
 /// inspect the kernel state.
 async fn run_and_get_store(
