@@ -10,7 +10,7 @@
 #   5. cargo test --release --test strace_baseline_diff
 #   6. guest/build.sh                                — CPython → python.wasm (skipped if no submodule)
 #   7. DoD #1 + DoD #2 with the real python.wasm     — print(2+2), import fastapi
-#   8. DoD #3: edge-python serve_one_request.py      — real uvicorn+FastAPI HTTP serve
+#   8. DoD #3: edge-cli run serve_one_request.py   — real uvicorn+FastAPI HTTP serve
 #   9. bash tests/count_tests.sh                     — print the canonical test totals
 #
 # Steps that require tools not available on the host (no zig, no
@@ -104,10 +104,10 @@ say "7/8 DoD #1 + DoD #2 (print(2+2) and import fastapi)"
 if [[ "$SKIP_DOD_SMOKE" == "1" ]]; then
     skip "7 dod smoke (SKIP_DOD_SMOKE=1)"; mark_env_skipped "dod-smoke"
 elif [[ -n "$PY_WASM" && -f "$PY_WASM" ]]; then
-    if cargo run --release --bin edge-python -- \
+    if cargo run --release --bin edge-cli -- run \
         "$PY_WASM" examples/print_2_plus_2.py; then mark_ran "dod-1"; \
     else mark_skip "dod-1"; fi
-    if cargo run --release --bin edge-python -- \
+    if cargo run --release --bin edge-cli -- run \
         "$PY_WASM" examples/import_fastapi.py; then mark_ran "dod-2"; \
     else
         warn "DoD #2 real-import failed"
@@ -124,24 +124,24 @@ say "8/8 DoD #3: serve_one_request.py (real uvicorn+FastAPI)"
 if [[ "$SKIP_DOD_SMOKE" == "1" ]]; then
     skip "8 dod-3 (SKIP_DOD_SMOKE=1)"; mark_env_skipped "dod-3"
 elif [[ -n "$PY_WASM" && -f "$PY_WASM" ]] && have curl; then
-    rm -f /tmp/edge-python.serve /tmp/edge-python.curl.out
+    rm -f /tmp/edge-cli.serve /tmp/edge-cli.curl.out
     # Start the server in background, wait for it to bind, curl, then kill.
-    cargo run --release --bin edge-python -- \
+    cargo run --release --bin edge-cli -- run \
         "$PY_WASM" examples/serve_one_request.py \
-        &>/tmp/edge-python.serve &
+        &>/tmp/edge-cli.serve &
     serve_pid=$!
     # Give the server up to 5s to come up.
     for _ in 1 2 3 4 5; do
         sleep 1
-        if curl -fsS http://127.0.0.1:18080/ >/tmp/edge-python.curl.out 2>&1; then
-            echo "    curl response: $(cat /tmp/edge-python.curl.out)"
+        if curl -fsS http://127.0.0.1:18080/ >/tmp/edge-cli.curl.out 2>&1; then
+            echo "    curl response: $(cat /tmp/edge-cli.curl.out)"
             mark_ran "dod-3"
             break
         fi
     done
     kill "$serve_pid" 2>/dev/null || true
     wait "$serve_pid" 2>/dev/null || true
-    if ! grep -q "200 OK" /tmp/edge-python.curl.out 2>/dev/null; then
+    if ! grep -q "200 OK" /tmp/edge-cli.curl.out 2>/dev/null; then
         mark_skip "dod-3"
     fi
 else

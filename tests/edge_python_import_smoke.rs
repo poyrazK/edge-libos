@@ -48,8 +48,9 @@ fn edge_python_handles_realistic_import_mix() -> Result<()> {
     let wasm_path = tmp.path().join("guest.wasm");
     std::fs::write(&wasm_path, &bytes)?;
 
-    let bin = env!("CARGO_BIN_EXE_edge-python");
+    let bin = env!("CARGO_BIN_EXE_edge-cli");
     let output = Command::new(bin)
+        .arg("run")
         .arg(wasm_path.to_str().unwrap())
         .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -100,8 +101,9 @@ fn edge_python_drains_both_streams_then_exits() -> Result<()> {
     let wasm_path = tmp.path().join("guest.wasm");
     std::fs::write(&wasm_path, &bytes)?;
 
-    let bin = env!("CARGO_BIN_EXE_edge-python");
+    let bin = env!("CARGO_BIN_EXE_edge-cli");
     let output = Command::new(bin)
+        .arg("run")
         .arg(wasm_path.to_str().unwrap())
         .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);

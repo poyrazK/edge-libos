@@ -30,9 +30,9 @@ the same job.
 | Job | What it runs | Cargo? | Catches |
 |-----|--------------|--------|---------|
 | `tools` | Checkout, rust-toolchain (1.93.0), cargo + wasm32 caches, zig 0.16.0 (tarball), wabt, strace | no | Rust toolchain drift, cache-key errors, zig install breakage |
-| `build` | `cargo build --release` (trace-host + edge-python) + `cargo test --release` + `cargo test --release --test strace_baseline_diff`; uploads binaries as a 7-day workflow artifact | **yes — once** | **Everything cargo can catch.** Compilation errors, all 197 Rust tests, strace baseline subset |
-| `c-conformance` | Downloads trace-host artifact, reinstalls zig, runs `bash tests/conformance/runner.sh` (marker-enforced) | no | The actual C correctness gate — **this is the P1 false-pass root-cause patch's home** |
-| `reproduce` | Downloads trace-host + edge-python artifacts, runs `reproduce_dod.sh` with `SKIP_*` env hooks to avoid duplicating build's work | minimal — only targeted smoke tests | Integration smoke: dev_setup / guest build / DoD smokes / count totals |
+| `build` | `cargo build --release` (edge-cli) + `cargo test --release` + `cargo test --release --test strace_baseline_diff`; uploads binaries as a 7-day workflow artifact | **yes — once** | **Everything cargo can catch.** Compilation errors, all 197 Rust tests, strace baseline subset |
+| `c-conformance` | Downloads edge-cli artifact, reinstalls zig, runs `bash tests/conformance/runner.sh` (marker-enforced) | no | The actual C correctness gate — **this is the P1 false-pass root-cause patch's home** |
+| `reproduce` | Downloads edge-cli artifact, runs `reproduce_dod.sh` with `SKIP_*` env hooks to avoid duplicating build's work | minimal — only targeted smoke tests | Integration smoke: dev_setup / guest build / DoD smokes / count totals |
 
 ## Steps (one-time setup in the GitHub UI)
 

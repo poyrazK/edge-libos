@@ -94,14 +94,14 @@ Concretely P2 lands (in order):
    file-op batch, identity/process/signal batch, sockets/poll/eventfd
    completion with **AF_UNIX** support.
 3. **Snapshot/restore** (D1-D3) — `postcard` + serde snapshot of kernel
-   state + linear memory; `edge-python freeze`/`serve` subcommands;
+   state + linear memory; `edge-cli freeze`/`serve` subcommands;
    50-iteration cold-start benchmark under 5 ms p50.
 4. **DNS + egress** (E1-E2) — default-deny egress policy, host-backed
    resolver via `hickory-resolver`, new `NR_RESOLVE` syscall.
 5. **Metering** (F1-F2) — epoch-based interruption, 100 ms default
    budget per request, `cpu_ms_used` accounting.
 6. **Literal CPython DoD** (A6) — `guest/cpython` submodule cross-compile
-   via `zig cc`, real `edge-python serve_one_request.py` produces
+   via `zig cc`, real `edge-cli run serve_one_request.py` produces
    `200 OK` from a real CPython+uvicorn+FastAPI wasm module.
 7. **CI** (G3 / CI-1) — `.github/workflows/ci.yml` running all 8 steps of
    `reproduce_dod.sh` on Linux. ✅ CI-1 landed; a local mirror lives
@@ -133,12 +133,12 @@ bash guest/build.sh
 
 ```bash
 # P0 DoD #1
-cargo run --release --bin edge-python -- \
+cargo run --release --bin edge-cli -- run \
     target/wasm32-unknown-linux-musl/release/python.wasm \
     examples/print_2_plus_2.py
 
 # P0 DoD #2
-cargo run --release --bin edge-python -- \
+cargo run --release --bin edge-cli -- run \
     target/wasm32-unknown-linux-musl/release/python.wasm \
     examples/import_fastapi.py
 ```
@@ -183,7 +183,8 @@ DoD #3 (real uvicorn+FastAPI serve), and the canonical test totals.
   - `kernel.rs`, `dispatch.rs` — Kernel state + `kernel.syscall` dispatcher
   - `sys/*.rs` — per-syscall handlers (process, memory, file, socket, …)
   - `vfs.rs`, `fd.rs`, `mm/` — VFS, fd table, memory arena
-  - `bin/` — `edge-python` driver, `trace-host` tracer
+  - `bin/` — `edge-cli` binary (subcommands: `run`, `freeze`, `serve`, `bench`, `trace`)
+  - `cli/` — subcommand implementations + `run_main` dispatcher
 - `tests/` — Rust integration tests + C conformance suite
 - `tests/conformance/` — C conformance (.c files + zig-built .wasm + runner.sh)
 - `guest/` — CPython cross-compile pipeline + syscall shim

@@ -11,12 +11,8 @@ name = "edge_libos"
 path = "src/lib.rs"
 
 [[bin]]
-name = "edge-python"
-path = "src/bin/edge_python.rs"
-
-[[bin]]
-name = "trace-host"
-path = "src/bin/trace_host.rs"
+name = "edge-cli"
+path = "src/bin/edge_cli.rs"
 
 [dependencies]
 wasmtime             = { version = "=45.0.3", features = ["component-model", "async", "anyhow", "threads"] }

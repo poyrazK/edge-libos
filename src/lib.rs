@@ -11,6 +11,7 @@
 
 #![allow(clippy::result_large_err)] // our i64 "errors" are kernel-style errnos
 
+pub mod cli;
 pub mod dispatch;
 pub mod errno;
 pub mod fd;
