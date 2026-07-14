@@ -97,7 +97,10 @@ async fn fresh_store_with_fixture() -> Result<(wasmtime::Store<Kernel>, wasmtime
     Ok((store, instance))
 }
 
-async fn call_start(store: &mut wasmtime::Store<Kernel>, instance: &wasmtime::Instance) -> Result<i64> {
+async fn call_start(
+    store: &mut wasmtime::Store<Kernel>,
+    instance: &wasmtime::Instance,
+) -> Result<i64> {
     let start = instance
         .get_typed_func::<(), i64>(&mut *store, "_start")
         .expect("_start export");

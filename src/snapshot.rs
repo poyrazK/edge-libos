@@ -632,91 +632,13 @@ pub fn apply_snapshot(
     apply_snapshot_linear_memory(&snap, kernel, store)
 }
 
-/// Step 2 of `apply_snapshot`: grow the attached linear memory to
-/// fit the highest `page_index` in `snap.pages` (or stay at its
-/// current size if `pages` is empty) and chunk-copy each saved page's
-/// bytes into the right slot. Idempotent: if the snapshot carries no
-/// pages, this is a no-op (the memory remains at whatever size the
-/// target store was born with — sufficient for the roundtrip test
-/// fixture, which builds a 32-page module ahead of time).
-fn apply_snapshot_linear_memory(
-    snap: &KernelSnapshot,
-    kernel: &mut Kernel,
-    store: &mut impl wasmtime::AsContextMut<Data = Kernel>,
-) -> Result<(), SnapshotError> {
-    if snap.pages.is_empty() {
-        return Ok(());
-    }
-    // Clone the `Memory` handle out of kernel (it's `Copy` per
-    // `src/mem.rs:28`). Drop the kernel borrow immediately so we can
-    // re-borrow mutably through `store`.
-    let mem = kernel
-        .memory()
-        .map_err(|e| {
-            SnapshotError::IoError(
-                std::io::Error::other(format!("memory not attached: errno={e}")),
-                "kernel.memory()".into(),
-            )
-        })?
-        .clone();
-    apply_snapshot_linear_memory_via(snap, mem, store)
-}
-
-/// Memory-only restore driver. Takes the cloned `Memory` handle
-/// instead of a `&mut Kernel` — disjoint borrow of `store`, no kernel
-/// reference. Use this directly from tests to avoid the
-/// `&mut kernel + &mut store` overlap that Rust's NLL rejects on
-/// inline expressions.
-fn apply_snapshot_linear_memory_via(
-    snap: &KernelSnapshot,
-    mem: wasmtime::Memory,
-    store: &mut impl wasmtime::AsContextMut<Data = Kernel>,
-) -> Result<(), SnapshotError> {
-    if snap.pages.is_empty() {
-        return Ok(());
-    }
-    // How many wasm pages does this snapshot need?
-    let target_pages = snap
-        .pages
-        .iter()
-        .map(|p| p.page_index.0 as usize)
-        .max()
-        .unwrap()
-        + 1;
-    let cur_pages: usize = mem.data_size(&store.as_context()) / PAGE_SIZE_BYTES;
-    if target_pages > cur_pages {
-        let delta: u64 = (target_pages - cur_pages) as u64;
-        mem.grow(store.as_context_mut(), delta).map_err(|e| {
-            SnapshotError::IoError(
-                std::io::Error::other(format!("memory.grow failed: {e:?}")),
-                "mem.grow".into(),
-            )
-        })?;
-    }
-
-    // chunk-copy each page's bytes into the right slot.
-    let bytes = mem.data_mut(store.as_context_mut());
-    for page in &snap.pages {
-        let start = page.page_index.0 as usize * PAGE_SIZE_BYTES;
-        let end = start + page.bytes.len();
-        if end > bytes.len() {
-            return Err(SnapshotError::IoError(
-                std::io::Error::other(format!(
-                    "page {} out of bounds: {end} > {}",
-                    page.page_index.0,
-                    bytes.len()
-                )),
-                "page chunk-copy".into(),
-            ));
-        }
-        bytes[start..end].copy_from_slice(&page.bytes);
-    }
-    Ok(())
-}
-
-/// Step 1 of `apply_snapshot`: write the kernel's non-memory state
-/// fields. Independent of `Store`; takes only `&mut Kernel`.
-fn apply_snapshot_kernel_state(
+/// Step 1 of `apply_snapshot`: replace kernel-resident state (args,
+/// env, brk, fd-table, signals, vfs, clock, mm, rng). Takes only
+/// `&mut Kernel` — does NOT touch `Store<Kernel>`. Public for callers
+/// that want to drive the apply by hand (specifically: tests that
+/// hit Rust's borrow checker when holding both `&mut Kernel` (via
+/// `Store::data_mut`) and `&mut Store<Kernel>` at the same time).
+pub fn apply_snapshot_kernel_state(
     snap: &KernelSnapshot,
     kernel: &mut Kernel,
 ) -> Result<(), SnapshotError> {
@@ -842,21 +764,12 @@ fn apply_snapshot_kernel_state(
                 Resource::File(SharedFilePos::new(parking_lot::Mutex::new(fp)))
             }
             ResourceKind::Socket => {
-                // D1 deliberately does not rebuild Sockets: a snapshot
-                // captured mid-request may include accepted streams
-                // whose peer we cannot recreate, and AF_UNIX abstract
-                // namespace binds are not reproducible. D3 (the freeze
-                // CLI) either avoids freezing in those states or accepts
-                // the lost fd.
                 return Err(SnapshotError::Unsupported(
                     "Resource::Socket reopen on apply_snapshot (D3 freeze CLI decides policy)",
                 ));
             }
             ResourceKind::Epoll => {
                 let esnap = body.epoll.clone().ok_or(SnapshotError::UnknownResource)?;
-                // Build a fresh EpollInner. The `self_event_fd` slot is
-                // recreated lazily by the next epoll_wait if the guest
-                // asks for it; we don't pre-create it here.
                 let entries_map: HashMap<u32, crate::fd::EpollEntry> = esnap
                     .entries
                     .iter()
@@ -895,15 +808,96 @@ fn apply_snapshot_kernel_state(
         })?;
     }
 
-    // Re-bind cloexec bits.
     for fd in &snap.fds.cloexec {
         kernel.fds.set_cloexec(fd.0, true);
     }
-
-    // Restore the "next available" pointer so subsequent allocations
-    // honor the snapshot's idea of fd space.
     kernel.fds.set_next_fd_for_snapshot(snap.fds.next_fd.0);
+    Ok(())
+}
 
+/// Step 2 of `apply_snapshot`: grow the attached linear memory to
+/// fit the highest `page_index` in `snap.pages` (or stay at its
+/// current size if `pages` is empty) and chunk-copy each saved page's
+/// bytes into the right slot. Idempotent: if the snapshot carries no
+/// pages, this is a no-op (the memory remains at whatever size the
+/// target store was born with — sufficient for the roundtrip test
+/// fixture, which builds a 32-page module ahead of time).
+fn apply_snapshot_linear_memory(
+    snap: &KernelSnapshot,
+    kernel: &mut Kernel,
+    store: &mut impl wasmtime::AsContextMut<Data = Kernel>,
+) -> Result<(), SnapshotError> {
+    if snap.pages.is_empty() {
+        return Ok(());
+    }
+    // Clone the `Memory` handle out of kernel (it's `Copy` per
+    // `src/mem.rs:28`). Drop the kernel borrow immediately so we can
+    // re-borrow mutably through `store`.
+    let mem = kernel
+        .memory()
+        .map_err(|e| {
+            SnapshotError::IoError(
+                std::io::Error::other(format!("memory not attached: errno={e}")),
+                "kernel.memory()".into(),
+            )
+        })?
+        .clone();
+    apply_snapshot_linear_memory_via(snap, mem, store)
+}
+
+/// Memory-only restore driver. Takes the cloned `Memory` handle
+/// instead of a `&mut Kernel` — disjoint borrow of `store`, no kernel
+/// reference. Use this directly from tests to avoid the
+/// `&mut kernel + &mut store` overlap that Rust's NLL rejects on
+/// inline expressions.
+///
+/// **Public** so integration tests can drive the apply by hand
+/// (also see [`apply_snapshot_kernel_state`] for the kernel-only
+/// half of the same operation).
+pub fn apply_snapshot_linear_memory_via(
+    snap: &KernelSnapshot,
+    mem: wasmtime::Memory,
+    store: &mut impl wasmtime::AsContextMut<Data = Kernel>,
+) -> Result<(), SnapshotError> {
+    if snap.pages.is_empty() {
+        return Ok(());
+    }
+    // How many wasm pages does this snapshot need?
+    let target_pages = snap
+        .pages
+        .iter()
+        .map(|p| p.page_index.0 as usize)
+        .max()
+        .unwrap()
+        + 1;
+    let cur_pages: usize = mem.data_size(&store.as_context()) / PAGE_SIZE_BYTES;
+    if target_pages > cur_pages {
+        let delta: u64 = (target_pages - cur_pages) as u64;
+        mem.grow(store.as_context_mut(), delta).map_err(|e| {
+            SnapshotError::IoError(
+                std::io::Error::other(format!("memory.grow failed: {e:?}")),
+                "mem.grow".into(),
+            )
+        })?;
+    }
+
+    // chunk-copy each page's bytes into the right slot.
+    let bytes = mem.data_mut(store.as_context_mut());
+    for page in &snap.pages {
+        let start = page.page_index.0 as usize * PAGE_SIZE_BYTES;
+        let end = start + page.bytes.len();
+        if end > bytes.len() {
+            return Err(SnapshotError::IoError(
+                std::io::Error::other(format!(
+                    "page {} out of bounds: {end} > {}",
+                    page.page_index.0,
+                    bytes.len()
+                )),
+                "page chunk-copy".into(),
+            ));
+        }
+        bytes[start..end].copy_from_slice(&page.bytes);
+    }
     Ok(())
 }
 
@@ -1241,9 +1235,8 @@ mod tests {
             },
             ..make_test_snapshot()
         };
-        let err = apply_with_store(snap, |_target, _store| ()).expect_err(
-            "apply_snapshot should reject Socket variant",
-        );
+        let err = apply_with_store(snap, |_target, _store| ())
+            .expect_err("apply_snapshot should reject Socket variant");
         assert!(matches!(err, SnapshotError::Unsupported(_)), "got {err:?}");
     }
 
