@@ -679,7 +679,7 @@ fn accept4_after_host_connect_returns_valid_fd() -> Result<()> {
               (i64.const 4096)
               (i64.const 16)
               (i64.const 0) (i64.const 0) (i64.const 0))))
-    "#
+    "#,
     );
     let port_be = port.to_be_bytes();
     let bind_param_wat = bind_param_wat.replace(
@@ -960,7 +960,7 @@ fn sendto_then_recvfrom_roundtrips_over_loopback() -> Result<()> {
               (i64.const 4096)
               (i64.const 16)
               (i64.const 0) (i64.const 0) (i64.const 0))))
-    "#
+    "#,
     );
     let bind_wat = bind_wat.replace(
         "PATCH_PORT",
@@ -1457,7 +1457,7 @@ fn shutdown_rd_then_recvfrom_returns_eof() -> Result<()> {
               (i64.const 4096)
               (i64.const 16)
               (i64.const 0) (i64.const 0) (i64.const 0))))
-    "#
+    "#,
     );
     let bind_wat = bind_wat.replace(
         "PATCH_PORT",
@@ -1548,7 +1548,7 @@ fn shutdown_wr_then_sendto_returns_epipe() -> Result<()> {
               (i64.const 4096)
               (i64.const 16)
               (i64.const 0) (i64.const 0) (i64.const 0))))
-    "#
+    "#,
     );
     let bind_wat = bind_wat.replace(
         "PATCH_PORT",
@@ -2083,7 +2083,7 @@ fn epoll_wait_wakes_on_accept4() -> Result<()> {
               (i64.const 4096)
               (i64.const 16)
               (i64.const 0) (i64.const 0) (i64.const 0))))
-    "#
+    "#,
     );
     let bind_wat = bind_wat.replace(
         "PATCH_PORT",
