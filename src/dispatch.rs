@@ -262,7 +262,7 @@ pub async fn dispatch(mut caller: wasmtime::Caller<'_, Kernel>, nr: u32, a: [i64
         // wait4(61) land in PR 4 and PR 3 respectively.
         sys::process::NR_CLONE => sys::process::clone_syscall(&mut caller, a).await,
         sys::process::NR_FORK => to_ret(crate::errno::ENOSYS),
-        sys::process::NR_WAIT4 => to_ret(crate::errno::ENOSYS),
+        sys::process::NR_WAIT4 => sys::process::wait4_syscall(&mut caller, a).await,
         sys::futex::NR_FUTEX => sys::futex::futex(&mut caller, a).await,
 
         // P2-C2: memory

@@ -10,6 +10,11 @@
 use std::sync::atomic::AtomicI32;
 use std::time::Instant;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use tokio::sync::Notify;
+
 use rand::rngs::SmallRng;
 use rand::{RngCore, SeedableRng};
 use wasmtime::Memory;
@@ -59,6 +64,31 @@ pub struct Kernel {
     /// (`getpid()` returns 1, matching Linux convention). Allocations
     /// are `Ordering::Relaxed` — no other field is gated on PID order.
     pub next_pid: AtomicI32,
+    /// P3 Tier-6: children table for `wait4`. Keyed by child PID.
+    /// `ChildExitStatus::exited == true` once the child has called
+    /// `exit()` / `exit_group()`; `wait4` returns the cached exit
+    /// code and removes the entry. Locked briefly — never held
+    /// across `.await` (project lock discipline, see CLAUDE.md).
+    pub children: parking_lot::Mutex<HashMap<i32, ChildExitStatus>>,
+    /// P3 Tier-6: per-kernel notifier for any-child wakeups. Used
+    /// by `wait4` to wait on `pid == -1` / `pid == 0` (any child)
+    /// when the calling child hasn't exited yet. Reserved for the
+    /// full parked-wait path (PR 3 ships WNOHANG-only semantics; a
+    /// follow-up lands the blocking variant once PR 4's child
+    /// fiber can actually call `exit`).
+    pub child_event: Arc<Notify>,
+}
+
+/// P3 Tier-6: per-child exit status recorded in `Kernel.children`.
+///
+/// In v1 only `exited` and `exit_code` are populated; a future PR
+/// adds `waker` registration for blocking `wait4` (PR 3 ships
+/// WNOHANG-only — the plan explicitly defers blocking wait4 until
+/// PR 4's child fiber can actually trigger an exit).
+#[derive(Debug, Clone)]
+pub struct ChildExitStatus {
+    pub exit_code: i32,
+    pub exited: bool,
 }
 
 impl Kernel {
@@ -120,6 +150,8 @@ impl Kernel {
             comm: [0; 16],
             futex_table: parking_lot::Mutex::new(FutexTable::default()),
             next_pid: AtomicI32::new(2),
+            children: parking_lot::Mutex::new(HashMap::new()),
+            child_event: Arc::new(Notify::new()),
         }
     }
 

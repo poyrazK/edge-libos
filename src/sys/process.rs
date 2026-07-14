@@ -3,8 +3,25 @@
 use wasmtime::Caller;
 
 use crate::errno::{EINVAL, EPERM, ESRCH};
-use crate::kernel::Kernel;
+use crate::kernel::{ChildExitStatus, Kernel};
 use crate::mem;
+
+// Linux x86-64 `wait4(2)` options (`linux/wait.h`).
+//
+// v1 honors only `WNOHANG`. The full parked-wait path
+// (a fiber blocked on `wait4` until a child calls `exit`) lands
+// behind PR 4's child fiber — until then there is no execution
+// context that can ever trigger an exit on a non-self PID, so a
+// non-WNOHANG wait4 has no consumer. We still parse `WNOHANG` and
+// return -EINVAL on every other bit so guests see the correct
+// failure mode.
+pub const WNOHANG: i32 = 0x40;
+pub const WUNTRACED: i32 = 0x02;
+pub const WCONTINUED: i32 = 0x08;
+pub const WNOWAIT: i32 = 0x0100_0000;
+pub const WALL: i32 = 0x4000_0000;
+/// Mask of v1-supported wait4 options.
+pub const WAIT4_SUPPORTED_V1: i32 = WNOHANG;
 
 // Linux x86-64 `clone(2)` flag bits (`linux/sched.h`).
 //
@@ -154,6 +171,117 @@ pub async fn clone_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 
 pub async fn sched_yield() -> i64 {
     tokio::task::yield_now().await;
     0
+}
+
+/// `wait4(pid, wstatus, options, rusage)` — P3 Tier-6 v1.
+///
+/// v1 honors only `WNOHANG`:
+/// - `pid == -1` or `pid == 0`: any child of the calling process.
+///   In v1 the only process is PID 1, so the table always reflects
+///   that single parent's children.
+/// - `pid > 0`: specific child PID.
+/// - `pid < -1`: process group (rejected with -EINVAL in v1).
+///
+/// Return contract:
+/// - `0` (with `WNOHANG`) when no child is ready to be reaped.
+/// - `-ECHILD` when there are no children matching `pid` AT ALL
+///   (also returned for non-WNOHANG waits, since v1 has no parked
+///   child-exit path — a future PR adds the blocking variant).
+/// - `-EINVAL` for unsupported option bits or invalid pid range.
+///
+/// On success (a reaped child): returns the reaped child's PID and,
+/// if `wstatus` is non-NULL, writes the wait status (low 16 bits =
+/// `(code << 8) | 0` for normal exit). The child entry is removed
+/// from `Kernel.children`.
+pub async fn wait4_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    use crate::errno::ECHILD;
+    let pid = a[0];
+    let wstatus_ptr = a[1];
+    let options = a[2] as i32;
+
+    // Reject any flag outside the v1-supported set. Even `WALL` /
+    // `WUNTRACED` / `WCONTINUED` are EINVAL — v1 has no signal
+    // delivery story and no job control.
+    if options & !WAIT4_SUPPORTED_V1 != 0 {
+        return -EINVAL;
+    }
+
+    // pid < -1 is a process-group selector — not supported in v1.
+    if pid < -1 {
+        return -EINVAL;
+    }
+
+    let kernel = caller.data();
+    let mut children = kernel.children.lock();
+    if children.is_empty() {
+        // No children at all → -ECHILD (matches Linux semantics:
+        // ECHILD when the calling process has no unwaited-for
+        // children). WNOHANG is irrelevant here because there is
+        // nothing to wait for.
+        return -ECHILD;
+    }
+
+    // Find the first (or specific) reaped child.
+    let target_pid: Option<i32> = if pid > 0 { Some(pid as i32) } else { None };
+
+    let picked: Option<i32> = match target_pid {
+        Some(p) => {
+            if children.get(&p).map(|c| c.exited).unwrap_or(false) {
+                Some(p)
+            } else if children.contains_key(&p) {
+                // Child exists but hasn't exited yet.
+                if options & WNOHANG != 0 {
+                    return 0;
+                }
+                // v1 has no parked wait path; treat as "no consumer".
+                return -ECHILD;
+            } else {
+                return -ECHILD;
+            }
+        }
+        None => {
+            // Any-child scan.
+            let ready = children.iter().find(|(_, c)| c.exited).map(|(p, _)| *p);
+            match ready {
+                Some(p) => Some(p),
+                None => {
+                    if options & WNOHANG != 0 {
+                        return 0;
+                    }
+                    return -ECHILD;
+                }
+            }
+        }
+    };
+
+    let picked = match picked {
+        Some(p) => p,
+        None => return -ECHILD,
+    };
+
+    // Drain the entry — capture exit_code + remove from the map.
+    let exit_code = match children.remove(&picked) {
+        Some(ChildExitStatus { exit_code, .. }) => exit_code,
+        None => return -ECHILD,
+    };
+    drop(children);
+
+    // Encode wait status: WIFEXITED=true, WEXITSTATUS=code (lower 8 bits).
+    let wstatus: i32 = (exit_code & 0xff) << 8;
+
+    if wstatus_ptr != 0 {
+        let mem_handle = match caller.data().memory() {
+            Ok(m) => *m,
+            Err(e) => return e,
+        };
+        let bytes = match mem::guest_slice_mut_via(&mem_handle, caller, wstatus_ptr, 4) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        bytes.copy_from_slice(&wstatus.to_ne_bytes());
+    }
+
+    picked as i64
 }
 
 /// `sched_getaffinity(pid, len, mask_ptr)` — fill the cpu mask with
