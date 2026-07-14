@@ -1,6 +1,10 @@
 # ADR 0001 — P3 futex semantics
 
-- **Status.** Proposed, 2026-07-13.
+- **Status.** Accepted, 2026-07-14 (realized by P3 Tier-3: `wasm_threads` +
+  `shared_memory` + `wasm_shared_everything_threads` flip in
+  `src/host.rs::build_engine`, with `"threads"` added to the wasmtime
+  feature list in `Cargo.toml:22`). The Tier-1 handler landed via PR #10
+  on the same date.
 - **Phase.** P3 (per `impelementationplan` §7).
 - **Scope.** `futex(2)` (NR 202) integration contract with the existing
   per-fd `tokio::sync::Notify` scheme established in P1-7.

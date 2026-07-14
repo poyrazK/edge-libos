@@ -123,9 +123,21 @@ description. These use **`parking_lot::Mutex` (sync) — never hold a lock acros
 `.await`**.
 
 **Async pivot:** handlers are `async fn` even when synchronous (sync ones just
-return immediately). The socket/epoll/poll path is genuinely async (tokio
-current-thread runtime, single-threaded — `wasm_threads` is off). epoll_wait
-uses `tokio::select!` over a timeout + per-fd `Notify` + cancel.
+return immediately). The socket/epoll/poll path is genuinely async on a
+tokio current-thread runtime, one `Store` per fiber (see Multi-fiber below).
+epoll_wait uses `tokio::select!` over a timeout + per-fd `Notify` + cancel.
+
+**Multi-fiber (P3 Tier-3, ADR 0001 §2):** `wasm_threads(true)` +
+`shared_memory(true)` + `wasm_shared_everything_threads(true)` are all
+enabled in `src/host.rs::build_engine` (and `Cargo.toml:22` adds `"threads"`
+to the wasmtime feature list). `Store` is still `!Send`/`!Sync` — each
+fiber pins to its host thread — so cross-fiber wakeups go through
+shared-memory atomics (`memory.atomic.notify` / `memory.atomic.wait32`) on
+a `wasmtime::SharedMemory`, not by moving a `Store` between threads. The
+kernel's `Arc<Notify>` machinery is now reachable from guest fibers hosted
+in different `Store`s. Future `clone(56)` / `fork(57)` handlers must
+respect this constraint (spawn a new tokio task + new thread-local `Store`
+rather than moving the existing one).
 
 ### Two host binaries (both guest-agnostic)
 
