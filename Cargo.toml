@@ -40,56 +40,32 @@ default = []
 wasi-delegate = []
 
 [lints.clippy]
-# P2-CI-2 clippy gate runs `cargo clippy --all-targets -- -D warnings`.
-# This table downgrades a small set of stylistic / mechanical lints
-# from `warn` to `allow` so the gate can pass without papering over
-# the whole codebase with `#[allow(...)]` attributes.
+# Strict lint policy (P2-CI-2): every clippy warning is a CI failure.
+# `cargo clippy --all-targets -- -D warnings` runs the default group
+# (correctness / suspicious / style / complexity / perf) at warn level,
+# and `-D warnings` promotes each to deny.
 #
-# Re-evaluate after one release cycle; these should ideally be removed
-# once the underlying code is fixed or the lint noise is understood.
-#
-# The selection follows two principles:
-#   1. Stylistic / cosmetic lints that are noise vs signal (markdown
-#      formatting in doc comments, redundant closures that don't improve
-#      readability, etc.).
-#   2. Lints that surface code we'd rather triage in a dedicated PR
-#      (dead-code sweeps, unused-imports sweeps) than block CI on.
-doc_overindented_list_items = "allow"
-empty_line_after_doc_comments = "allow"
-doc_lazy_continuation = "allow"
-needless_range_loop = "allow"
-clone_on_copy = "allow"
-manual_div_ceil = "allow"
-items_after_test_module = "allow"
-redundant_closure = "allow"
-let_and_return = "allow"
-let_unit_value = "allow"
-single_match = "allow"
-question_mark = "allow"
-new_without_default = "allow"
-useless_conversion = "allow"
-useless_format = "allow"
-identity_op = "allow"
-too_many_arguments = "allow"
-unnecessary_wraps = "allow"
+# The four lints below are the ONLY allow-listed exceptions. They are
+# API-surface suggestions, not correctness checks; silencing them
+# upstream avoids `#[allow(...)]` attribute noise on every `pub fn` /
+# `pub struct`. They have **zero** violations in the current tree
+# (verified 2026-07-14 — see `memory/edge-libos-lint-inventory.md`).
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
 module_name_repetitions = "allow"
-unnecessary_cast = "allow"
-manual_range_contains = "allow"
-drop_non_drop = "allow"
-manual_clamp = "allow"
-assertions_on_constants = "allow"
 
 [lints.rust]
-# Drive-down the same dead-code / unused-stuff lints as rustc, not
-# clippy. These are workspace-wide: a future "tidy unused" PR can
-# remove this table once the noise is fixed.
-unused_imports = "allow"
-unused_variables = "allow"
-dead_code = "allow"
-unused_mut = "allow"
+# Drop this table entirely: cargo's defaults for `unused_imports`,
+# `unused_variables`, `dead_code`, and `unused_mut` are all `warn`,
+# which is what we want. Promoting them to deny would fail the gate
+# on stylistic, non-functional code (we want CI to catch real typos,
+# not block on dead code we haven't cleaned up yet). The strict
+# promotion to deny lives in `cargo clippy -- -D warnings` for the
+# clippy equivalents.
+#
+# If/when we want rustc-side deny-on-warn too, the four entries to
+# add here are exactly the lines deleted below.
 
 [profile.release]
 opt-level = 3
