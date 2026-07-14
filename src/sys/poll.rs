@@ -317,7 +317,7 @@ pub async fn ppoll(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         };
         let sec = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
         let nsec = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+        if sec < 0 || nsec < 0 || !(0..1_000_000_000).contains(&nsec) {
             return -EINVAL;
         }
         let total_ms = (sec as i64).saturating_mul(1000) + (nsec as i64) / 1_000_000;

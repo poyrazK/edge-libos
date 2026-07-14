@@ -92,7 +92,7 @@ pub fn rt_sigaction(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 
     if oldact != 0 {
         let mem = match caller.data().memory() {
-            Ok(m) => m.clone(),
+            Ok(m) => *m,
             Err(e) => return e,
         };
         let bytes = match mem::guest_slice_mut_via(&mem, caller, oldact, SIGACTION_SIZE) {
@@ -160,7 +160,7 @@ pub fn rt_sigprocmask(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 
     if oldset != 0 {
         let mem = match caller.data().memory() {
-            Ok(m) => m.clone(),
+            Ok(m) => *m,
             Err(e) => return e,
         };
         let bytes = match mem::guest_slice_mut_via(&mem, caller, oldset, 8) {

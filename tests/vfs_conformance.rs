@@ -344,7 +344,7 @@ fn wat_with_payload(payload: &[u8]) -> String {
 
 /// Place a NUL-terminated copy of `s` at offset 4096, return the ptr (4096).
 fn write_cstr(store: &mut wasmtime::Store<Kernel>, s: &str) -> i64 {
-    let mem = store.data().memory().unwrap().clone();
+    let mem = *store.data().memory().unwrap();
     let bytes = s.as_bytes();
     {
         let mut data = mem.data_mut(store);
@@ -463,7 +463,7 @@ fn fstat_writes_sensible_size() -> Result<()> {
         let _ = ff.call_async(&mut store, (fd,)).await?;
 
         // Read back the bytes at offset 4096.
-        let mem = store.data().memory().unwrap().clone();
+        let mem = *store.data().memory().unwrap();
         let data = mem.data(&store);
         let bytes: Vec<u8> = data[4096..4096 + 120].to_vec();
         Ok::<_, anyhow::Error>(bytes)
@@ -538,7 +538,7 @@ fn openat_read_lseek_roundtrip() -> Result<()> {
         let rf = read_inst.get_typed_func::<(i64,), i64>(&mut store, "go")?;
         let _ = rf.call_async(&mut store, (fd,)).await?;
 
-        let mem = store.data().memory().unwrap().clone();
+        let mem = *store.data().memory().unwrap();
         let data = mem.data(&store);
         Ok::<_, anyhow::Error>(data[4096..4096 + 7].to_vec())
     })?;
@@ -572,7 +572,7 @@ fn getdents64_returns_at_least_one_entry() -> Result<()> {
         let gf = gd_inst.get_typed_func::<(i64,), i64>(&mut store, "go")?;
         let _ = gf.call_async(&mut store, (fd,)).await?;
 
-        let mem = store.data().memory().unwrap().clone();
+        let mem = *store.data().memory().unwrap();
         let data = mem.data(&store);
         Ok::<_, anyhow::Error>(data[4096..4096 + 1024].to_vec())
     })?;
@@ -707,7 +707,7 @@ fn pipe2_writes_pair_into_guest_array() -> Result<()> {
         let f = inst.get_typed_func::<(), i64>(&mut store, "go")?;
         let r = f.call_async(&mut store, ()).await?;
 
-        let mem = store.data().memory().unwrap().clone();
+        let mem = *store.data().memory().unwrap();
         let data = mem.data(&store);
         let rd = u32::from_le_bytes(data[4096..4100].try_into().unwrap());
         let wr = u32::from_le_bytes(data[4100..4104].try_into().unwrap());
@@ -743,7 +743,7 @@ fn pipe_writes_pair_into_guest_array() -> Result<()> {
         }
         let f = inst.get_typed_func::<(), i64>(&mut store, "go")?;
         let r = f.call_async(&mut store, ()).await?;
-        let mem = store.data().memory().unwrap().clone();
+        let mem = *store.data().memory().unwrap();
         let data = mem.data(&store);
         let rd = u32::from_le_bytes(data[4096..4100].try_into().unwrap());
         let wr = u32::from_le_bytes(data[4100..4104].try_into().unwrap());
@@ -845,7 +845,7 @@ fn getcwd_returns_root_path() -> Result<()> {
         }
         let f = inst.get_typed_func::<i64, i64>(&mut store, "go")?;
         let r = f.call_async(&mut store, 4096_i64).await?;
-        let mem = store.data().memory().unwrap().clone();
+        let mem = *store.data().memory().unwrap();
         let data = mem.data(&store);
         // The kernel writes N path bytes then NUL at offset N. Walk forward
         // from 8192 looking for the NUL terminator to find the path end.
@@ -919,7 +919,7 @@ fn readv_into_two_buffers() -> Result<()> {
         let f = readv_inst.get_typed_func::<i64, i64>(&mut store, "go")?;
         let r = f.call_async(&mut store, fd).await?;
 
-        let mem = store.data().memory().unwrap().clone();
+        let mem = *store.data().memory().unwrap();
         let data = mem.data(&store);
         let b1 = data[12288..12291].to_vec();
         let b2 = data[16384..16387].to_vec();

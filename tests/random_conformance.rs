@@ -121,7 +121,7 @@ fn getrandom_two_draws_differ() -> Result<()> {
         "two_draws_differ",
     ))?;
     assert!(
-        diff_idx >= 0 && diff_idx < 4,
+        (0..4).contains(&diff_idx),
         "two consecutive getrandom calls must differ in at least one qword (got {diff_idx})"
     );
     Ok(())

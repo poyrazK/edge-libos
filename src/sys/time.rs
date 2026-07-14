@@ -162,7 +162,7 @@ pub async fn clock_nanosleep(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i6
     };
     let sec = i64::from_le_bytes(req_bytes[0..8].try_into().unwrap());
     let nsec = i64::from_le_bytes(req_bytes[8..16].try_into().unwrap());
-    if nsec < 0 || nsec >= 1_000_000_000 || sec < 0 {
+    if nsec < 0 || !(0..1_000_000_000).contains(&nsec) || sec < 0 {
         return -EINVAL;
     }
 
@@ -230,7 +230,7 @@ pub async fn nanosleep(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     };
     let sec = i64::from_le_bytes(req_bytes[0..8].try_into().unwrap());
     let nsec = i64::from_le_bytes(req_bytes[8..16].try_into().unwrap());
-    if nsec < 0 || nsec >= 1_000_000_000 || sec < 0 {
+    if nsec < 0 || !(0..1_000_000_000).contains(&nsec) || sec < 0 {
         return -EINVAL;
     }
     let dur = Duration::from_nanos((sec as u64).saturating_mul(1_000_000_000) + nsec as u64);
