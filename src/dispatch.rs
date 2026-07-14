@@ -257,7 +257,10 @@ pub async fn dispatch(mut caller: wasmtime::Caller<'_, Kernel>, nr: u32, a: [i64
         // impls land in P3 after P2-D snapshot machinery and wasm_threads
         // support are in place. See ADR 0002 for the fork snapshot story.
         // P3 Tier-1: futex(2) FUTEX_WAIT/FUTEX_WAKE shipped — see ADR 0001.
-        sys::process::NR_CLONE => to_ret(crate::errno::ENOSYS),
+        // P3 Tier-4: clone(56) v1 supports CLONE_CHILD_SETTID |
+        // CLONE_PARENT_SETTID only; other flags → -EINVAL. fork(57) and
+        // wait4(61) land in PR 4 and PR 3 respectively.
+        sys::process::NR_CLONE => sys::process::clone_syscall(&mut caller, a).await,
         sys::process::NR_FORK => to_ret(crate::errno::ENOSYS),
         sys::process::NR_WAIT4 => to_ret(crate::errno::ENOSYS),
         sys::futex::NR_FUTEX => sys::futex::futex(&mut caller, a).await,

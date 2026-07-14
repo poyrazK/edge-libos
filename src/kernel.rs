@@ -7,6 +7,7 @@
 //! Step 4 of the P0 build order fleshes this out; the skeleton here is what
 //! the dispatch table needs to compile.
 
+use std::sync::atomic::AtomicI32;
 use std::time::Instant;
 
 use rand::rngs::SmallRng;
@@ -53,6 +54,11 @@ pub struct Kernel {
     /// P3 — ADR 0001 §2: wait/wake storage keyed by guest-address.
     /// See `docs/adr/0001-p3-futex-semantics.md`.
     pub futex_table: parking_lot::Mutex<FutexTable>,
+    /// P3 Tier-4: monotonic PID counter for `clone()` and `fork()`.
+    /// Starts at 2 because PID 1 is reserved for the init kernel
+    /// (`getpid()` returns 1, matching Linux convention). Allocations
+    /// are `Ordering::Relaxed` — no other field is gated on PID order.
+    pub next_pid: AtomicI32,
 }
 
 impl Kernel {
@@ -113,6 +119,7 @@ impl Kernel {
             exit_code: None,
             comm: [0; 16],
             futex_table: parking_lot::Mutex::new(FutexTable::default()),
+            next_pid: AtomicI32::new(2),
         }
     }
 

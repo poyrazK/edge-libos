@@ -6,6 +6,18 @@ use crate::errno::{EINVAL, EPERM, ESRCH};
 use crate::kernel::Kernel;
 use crate::mem;
 
+// Linux x86-64 `clone(2)` flag bits (`linux/sched.h`).
+//
+// v1 supports ONLY the two TID-writeback flags. Every other bit
+// (including `CLONE_VM`, `CLONE_THREAD`, `CLONE_FILES`, `CLONE_SIGHAND`,
+// `CLONE_FS`, `CLONE_IO`, `CLONE_VFORK`) is rejected with -EINVAL.
+// Justification is in `docs/adr/0001-p3-futex-semantics.md` (ADR
+// 0001) and the implementation plan §P3 Tier-4.
+pub const CLONE_CHILD_SETTID: i64 = 0x0100_0000;
+pub const CLONE_PARENT_SETTID: i64 = 0x0800_0000;
+/// Mask of v1-supported clone flags. Any bits outside this set → -EINVAL.
+pub const CLONE_SUPPORTED_V1: i64 = CLONE_CHILD_SETTID | CLONE_PARENT_SETTID;
+
 // Linux x86-64 syscall numbers (`unistd_64.h`).
 pub const NR_EXIT: u32 = 60;
 pub const NR_EXIT_GROUP: u32 = 231;
@@ -66,6 +78,75 @@ pub fn set_tid_address(_caller: &mut Caller<'_, Kernel>, _a: [i64; 6]) -> i64 {
 
 pub fn set_robust_list() -> i64 {
     0
+}
+
+/// `clone(flags, child_stack, ptid, ctid, tls) -> child_tid` — P3 Tier-4 v1.
+///
+/// v1 supports only the two TID-writeback flags (`CLONE_CHILD_SETTID` and
+/// `CLONE_PARENT_SETTID`). The child is **not actually executed** in v1 —
+/// v1 allocates a new PID and writes it to the requested `*_tidptr`
+/// locations; the child fiber's resumption is deferred to a follow-up
+/// PR (per the implementation plan §P3 Tier-4: "child enters `_start`
+/// on resume (deferred to PR 5+ when we wire the child fiber)").
+///
+/// Supported flags (only):
+/// - `CLONE_CHILD_SETTID` (0x01000000): write the new TID to `ctid_ptr`.
+/// - `CLONE_PARENT_SETTID` (0x08000000): write the new TID to `ptid_ptr`.
+///
+/// Any other flag bit → `-EINVAL`. Rejected flags include `CLONE_VM`,
+/// `CLONE_THREAD`, `CLONE_FILES`, `CLONE_SIGHAND`, `CLONE_FS`, `CLONE_IO`,
+/// `CLONE_VFORK` (they imply shared state the v1 kernel can't safely
+/// model — CoW pages, shared fd tables, etc.; see ADR 0001).
+///
+/// Allocation: `Kernel.next_pid` is a monotonically-increasing `AtomicI32`,
+/// starting at 2 (PID 1 is reserved for the init kernel — `getpid()` returns
+/// 1). Ordering is `Relaxed`; no other field is gated on PID order.
+pub async fn clone_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    let flags = a[0];
+    // a[1] = child_stack (unused — guest passes 0; v1 has no stack model).
+    let ptid_ptr = a[2];
+    let ctid_ptr = a[3];
+
+    // Reject any flag outside the v1-supported set.
+    if flags & !CLONE_SUPPORTED_V1 != 0 {
+        return -EINVAL;
+    }
+    // At least one TID-writeback flag must be requested; otherwise the
+    // guest is asking us to spawn a child without observing the result.
+    // This matches the conformance expectation that `clone(0) == -EINVAL`.
+    if flags & CLONE_SUPPORTED_V1 == 0 {
+        return -EINVAL;
+    }
+
+    let child_tid = caller
+        .data()
+        .next_pid
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Write the new TID to the requested pointers. We snapshot the
+    // Memory handle first (it is `Copy`) so we can release the `&Kernel`
+    // borrow before re-borrowing `caller` mutably.
+    let mem_handle = match caller.data().memory() {
+        Ok(m) => *m,
+        Err(e) => return e,
+    };
+
+    if flags & CLONE_PARENT_SETTID != 0 {
+        let bytes = match mem::guest_slice_mut_via(&mem_handle, caller, ptid_ptr, 4) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        bytes.copy_from_slice(&child_tid.to_ne_bytes());
+    }
+    if flags & CLONE_CHILD_SETTID != 0 {
+        let bytes = match mem::guest_slice_mut_via(&mem_handle, caller, ctid_ptr, 4) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        bytes.copy_from_slice(&child_tid.to_ne_bytes());
+    }
+
+    child_tid as i64
 }
 
 /// `sched_yield()` → 0. CPython sometimes calls this in poll loops; we
