@@ -470,13 +470,33 @@ impl std::error::Error for SnapshotError {
 /// Walk `Kernel` and assemble a `KernelSnapshot`.
 ///
 /// Locks briefly per resource, drops the guard, copies out the snapshot
-/// form. Runtime handles (`Arc<Notify>`, `Memory`, raw fds) are dropped
-/// from the snapshot — they will be rebuilt in `apply_snapshot` (D1.7)
-/// and the linear-memory in `apply_snapshot` (D2).
+/// form. Runtime handles (`Arc<Notify>`, raw fds) are dropped — they
+/// are rebuilt on `apply_snapshot`. The Wasmtime `Memory` handle is
+/// retained on the kernel but the bytes are read out into the snapshot's
+/// `pages` overlay here; `apply_snapshot` grows + chunk-copies them on
+/// restore.
 pub fn try_to_snapshot(
     kernel: &Kernel,
-    _mem_bytes: &[u8],
+    store: &impl wasmtime::AsContext,
 ) -> Result<KernelSnapshot, SnapshotError> {
+    // Read linear memory (sparse, only non-zero pages).
+    let pages = if let Ok(mem) = kernel.memory() {
+        let data = mem.data(store.as_context());
+        collect_pages(data)
+    } else {
+        // No memory attached yet — emit an empty pages list. `apply_snapshot`
+        // will refuse to restore an empty-pages snapshot onto a no-memory
+        // target; this is a host-construction error caught by the freeze CLI.
+        Vec::new()
+    };
+
+    Ok(build_kernel_snapshot(kernel, pages))
+}
+
+/// Build a `KernelSnapshot` *without* reading linear memory. Used by
+/// unit tests that don't have a `Store<Kernel>` to pass in. D2.4:
+/// `try_to_snapshot` calls this after collecting `pages` from memory.
+fn build_kernel_snapshot(kernel: &Kernel, pages: Vec<MemoryPageSnapshot>) -> KernelSnapshot {
     use crate::fd::Resource;
     use crate::snapshot::{FdEntrySnapshot, ResourceSnapshot};
 
@@ -529,10 +549,9 @@ pub fn try_to_snapshot(
         v
     };
 
-    Ok(KernelSnapshot {
+    KernelSnapshot {
         format_version: LeU32(SNAPSHOT_FORMAT_VERSION),
-        // D2.4 lands here: read linear memory, collect non-zero pages.
-        pages: vec![],
+        pages,
         fds: crate::snapshot::FdSnapshot {
             entries,
             next_fd: LeU32(kernel.fds.next_fd_for_snapshot()),
@@ -548,7 +567,42 @@ pub fn try_to_snapshot(
         signals: crate::snapshot::SignalStateSnapshot::from(&kernel.signals),
         exit_code: kernel.exit_code.map(LeI32),
         comm: kernel.comm,
-    })
+    }
+}
+
+/// P2-D2 / ADR 0002 §3: scan a linear-memory blob in 64 KiB page
+/// chunks and return a sparse `Vec<MemoryPageSnapshot>` containing
+/// only the pages whose bytes are not all zero. Untouched pages are
+/// restored on `apply_snapshot` by `Memory::grow` (which zero-fills
+/// new pages) and then optionally chunk-copied with the pages in
+/// the snapshot — the result is byte-identical to the pre-snapshot
+/// memory.
+pub fn collect_pages(data: &[u8]) -> Vec<MemoryPageSnapshot> {
+    let mut pages = Vec::new();
+    let mut chunks = data.chunks_exact(PAGE_SIZE_BYTES);
+    let mut page_index: u32 = 0;
+    for chunk in &mut chunks {
+        if !is_zero_page(chunk) {
+            pages.push(MemoryPageSnapshot {
+                page_index: LeU32(page_index),
+                bytes: chunk.to_vec(),
+            });
+        }
+        page_index += 1;
+    }
+    let remainder = chunks.remainder();
+    if !remainder.is_empty() && !is_zero_page(remainder) {
+        pages.push(MemoryPageSnapshot {
+            page_index: LeU32(page_index),
+            bytes: remainder.to_vec(),
+        });
+    }
+    pages
+}
+
+fn is_zero_page(page: &[u8]) -> bool {
+    // `iter().any(|b| *b != 0)` is faster than full equality for sparse non-zero pages.
+    !page.iter().any(|b| *b != 0)
 }
 
 /// Apply a `KernelSnapshot` to a target `Kernel`. The target kernel is
@@ -870,7 +924,7 @@ mod tests {
         assert_eq!(efd_fd, 3);
 
         // Capture the snapshot.
-        let snap = try_to_snapshot(&kernel, &[]).expect("snapshot succeeds");
+        let snap = build_kernel_snapshot(&kernel, vec![]);
 
         // Header.
         assert_eq!(snap.format_version, LeU32(SNAPSHOT_FORMAT_VERSION));
@@ -947,7 +1001,7 @@ mod tests {
         }));
         assert_eq!(efd_fd, 3);
 
-        let snap = try_to_snapshot(&kernel, &[]).expect("snapshot");
+        let snap = build_kernel_snapshot(&kernel, vec![]);
 
         // Build a fresh target kernel.
         let mut target = Kernel::new_without_stdio(vec![], vec![]);
@@ -1025,6 +1079,32 @@ mod tests {
         let err = apply_snapshot(snap, &mut target, &mut mem_buf)
             .expect_err("apply_snapshot should reject Socket variant");
         assert!(matches!(err, SnapshotError::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn collect_pages_skips_zero_pages() {
+        // Build a 128 KiB buffer: page 0 all-zero, page 1 has bytes
+        // [b'x', 0, 0, ...]. collect_pages must return exactly one entry
+        // at LeU32(1). The remainder branch is exercised by the partial-
+        // page case below.
+        let mut data = vec![0u8; 2 * PAGE_SIZE_BYTES];
+        // Page 1: byte 0 = b'x'; the rest stays zero.
+        data[PAGE_SIZE_BYTES] = b'x';
+        let pages = collect_pages(&data);
+        assert_eq!(pages.len(), 1, "page 0 (zero) must be omitted");
+        assert_eq!(pages[0].page_index, LeU32(1));
+        assert_eq!(pages[0].bytes[0], b'x');
+
+        // Partial tail (e.g. 70 KiB) — the first 64 KiB are zero,
+        // the remaining 6144 bytes are non-zero.
+        let mut data2 = vec![0u8; 64 * 1024 + 6144];
+        for i in (64 * 1024)..data2.len() {
+            data2[i] = ((i & 0xFF) as u8).wrapping_add(1);
+        }
+        let pages2 = collect_pages(&data2);
+        assert_eq!(pages2.len(), 1, "partial-tail non-zero must be one entry");
+        assert_eq!(pages2[0].page_index, LeU32(1));
+        assert_eq!(pages2[0].bytes.len(), 6144);
     }
 
     #[test]
