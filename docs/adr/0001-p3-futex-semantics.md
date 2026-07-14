@@ -4,7 +4,13 @@
   `shared_memory` + `wasm_shared_everything_threads` flip in
   `src/host.rs::build_engine`, with `"threads"` added to the wasmtime
   feature list in `Cargo.toml:22`). The Tier-1 handler landed via PR #10
-  on the same date.
+  on the same date. **§Consequences "What this ADR enables"** — the
+  snapshot wire form `(u32 addr, u32 waiter_count)` per pair with
+  `Notify` rebuilt on restore — was realized by P3 Tier-2 on branch
+  `p3-t2-futex-snapshot`: `FutexTable::snapshot()` /
+  `FutexTable::rebuild_from_snapshot()` in `src/sys/futex.rs`, plus
+  a new last-of-struct `futex_table` field on `KernelSnapshot` in
+  `src/snapshot.rs`.
 - **Phase.** P3 (per `impelementationplan` §7).
 - **Scope.** `futex(2)` (NR 202) integration contract with the existing
   per-fd `tokio::sync::Notify` scheme established in P1-7.
