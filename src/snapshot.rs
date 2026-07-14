@@ -62,6 +62,22 @@ use rand::SeedableRng;
 
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 
+/// ADR 0002 §3: snapshot linear memory in 64 KiB pages, sparse-encoded
+/// (`Vec<MemoryPageSnapshot>`). Untouched (all-zero) pages are omitted.
+pub const PAGE_SIZE_BYTES: usize = 64 * 1024;
+
+/// P2-D2 / ADR 0002 §3: one 64 KiB page of linear memory. Missing from
+/// the snapshot ⇒ that page is the wasmtime-grown zero-fill at restore
+/// time. Wire order per page: `LeU32 page_index, LeU32 page_len, Vec<u8>
+/// page_bytes`. We omit the redundant `page_len` (always
+/// `PAGE_SIZE_BYTES` when present) — see the §3 example header for the
+/// optional third field; we keep `Vec<u8>` always at PAGE_SIZE_BYTES.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryPageSnapshot {
+    pub page_index: LeU32,
+    pub bytes: Vec<u8>,
+}
+
 /// All snapshot types live in this module. They are independent of the
 /// runtime `Kernel` so the snapshot shape can evolve without disturbing
 /// live handler code.
@@ -136,6 +152,10 @@ pub struct KernelSnapshot {
     /// ADR 0002 §3 + §4: first wire word is `LeU32(1)` (or
     /// equivalent `u8` per §4 — LeU32 form subsumes it).
     pub format_version: LeU32,
+    /// ADR 0002 §3: sparse per-page linear-memory overlay. Pages
+    /// untouched by the guest (all-zero) are omitted from the snapshot
+    /// and re-instated by wasmtime's grow on restore.
+    pub pages: Vec<MemoryPageSnapshot>,
     pub fds: FdSnapshot,
     pub mm: LinearAllocatorSnapshot,
     pub vfs: VfsSnapshot,
@@ -511,6 +531,8 @@ pub fn try_to_snapshot(
 
     Ok(KernelSnapshot {
         format_version: LeU32(SNAPSHOT_FORMAT_VERSION),
+        // D2.4 lands here: read linear memory, collect non-zero pages.
+        pages: vec![],
         fds: crate::snapshot::FdSnapshot {
             entries,
             next_fd: LeU32(kernel.fds.next_fd_for_snapshot()),
@@ -757,6 +779,7 @@ mod tests {
         // Encode a minimal snapshot via postcard and decode it back.
         let snap = KernelSnapshot {
             format_version: LeU32(SNAPSHOT_FORMAT_VERSION),
+            pages: vec![],
             fds: FdSnapshot::default(),
             mm: LinearAllocatorSnapshot::default(),
             vfs: VfsSnapshot {
@@ -776,6 +799,7 @@ mod tests {
         let back: KernelSnapshot = postcard::from_bytes(&bytes).expect("decode");
         // Field-by-field; KernelSnapshot doesn't derive PartialEq.
         assert_eq!(back.format_version, LeU32(1));
+        assert!(back.pages.is_empty());
     }
 
     #[test]
@@ -1003,9 +1027,44 @@ mod tests {
         assert!(matches!(err, SnapshotError::Unsupported(_)), "got {err:?}");
     }
 
+    #[test]
+    fn memory_page_snapshot_roundtrip() {
+        // Build a Vec<MemoryPageSnapshot> with 2 entries, encode/decode,
+        // verify page_index and bytes match exactly. Confirms ADR 0002 §3
+        // wire framing: LeU32 page_index, then 64 KiB of bytes per entry.
+        let entry_a = MemoryPageSnapshot {
+            page_index: LeU32(3),
+            bytes: vec![0xAB; PAGE_SIZE_BYTES],
+        };
+        let mut bytes_b = vec![0u8; PAGE_SIZE_BYTES];
+        for (i, b) in bytes_b.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        let entry_b = MemoryPageSnapshot {
+            page_index: LeU32(17),
+            bytes: bytes_b,
+        };
+        let pages = vec![entry_a.clone(), entry_b.clone()];
+
+        let bytes = postcard::to_stdvec(&pages).expect("encode pages");
+        let back: Vec<MemoryPageSnapshot> = postcard::from_bytes(&bytes).expect("decode pages");
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].page_index, LeU32(3));
+        assert_eq!(back[0].bytes.len(), PAGE_SIZE_BYTES);
+        assert_eq!(back[0].bytes[0], 0xAB);
+        assert_eq!(back[0].bytes[PAGE_SIZE_BYTES - 1], 0xAB);
+        assert_eq!(back[1].page_index, LeU32(17));
+        assert_eq!(back[1].bytes.len(), PAGE_SIZE_BYTES);
+        assert_eq!(back[1].bytes[123], 123);
+        // Bytes match exactly (whole-buffer equality).
+        assert_eq!(back[0].bytes, entry_a.bytes);
+        assert_eq!(back[1].bytes, entry_b.bytes);
+    }
+
     fn make_test_snapshot() -> KernelSnapshot {
         KernelSnapshot {
             format_version: LeU32(SNAPSHOT_FORMAT_VERSION),
+            pages: vec![],
             fds: FdSnapshot::default(),
             mm: LinearAllocatorSnapshot::default(),
             vfs: VfsSnapshot {
