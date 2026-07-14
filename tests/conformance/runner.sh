@@ -144,6 +144,10 @@ expected_syscall() {
         af_unix_bind_connect) echo "connect" ;;
         sysinfo)             echo "sysinfo" ;;
         times)               echo "times" ;;
+        clone)               echo "clone" ;;
+        fork)                echo "fork" ;;
+        wait4)               echo "wait4" ;;
+        futex)               echo "futex" ;;
         *) echo "UNREGISTERED: $1" >&2; return 1 ;;
     esac
 }
