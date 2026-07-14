@@ -164,28 +164,14 @@ async fn futex_wait(
             Ok(()) => true,
             Err(_) => {
                 // Timed out. Decrement waiter count; prune if zero.
-                let mut table = caller.data().futex_table.lock();
-                if let Some(entry) = table.by_addr.get_mut(&uaddr) {
-                    entry.waiters = entry.waiters.saturating_sub(1);
-                    if entry.waiters == 0 {
-                        table.by_addr.remove(&uaddr);
-                    }
-                }
+                release_waiter(caller, uaddr);
                 return -crate::errno::ETIMEDOUT;
             }
         },
     };
 
     // Phase 4: wake path. Decrement waiter count; prune if zero.
-    {
-        let mut table = caller.data().futex_table.lock();
-        if let Some(entry) = table.by_addr.get_mut(&uaddr) {
-            entry.waiters = entry.waiters.saturating_sub(1);
-            if entry.waiters == 0 {
-                table.by_addr.remove(&uaddr);
-            }
-        }
-    }
+    release_waiter(caller, uaddr);
 
     if woken {
         // Spurious-wake defense — Tokio doesn't spurious-wake but musl
@@ -198,6 +184,23 @@ async fn futex_wait(
         // `woken==false` only when the timeout elapsed, which is handled
         // by the early return above. Reaching here is impossible.
         unreachable!("woken==false only on timeout, handled above")
+    }
+}
+
+/// Decrement the waiter count for `uaddr` and prune the entry if zero.
+///
+/// Single source of truth for the `waiters` bookkeeping — the timeout
+/// arm of `futex_wait` and the wake arm of `futex_wait` both go through
+/// here. Keeps the decrement logic in one place so future work (snapshot
+/// serialization in ADR 0002, fork CoW, etc.) only has to update one
+/// block.
+fn release_waiter(caller: &mut Caller<'_, Kernel>, uaddr: u32) {
+    let mut table = caller.data().futex_table.lock();
+    if let Some(entry) = table.by_addr.get_mut(&uaddr) {
+        entry.waiters = entry.waiters.saturating_sub(1);
+        if entry.waiters == 0 {
+            table.by_addr.remove(&uaddr);
+        }
     }
 }
 
