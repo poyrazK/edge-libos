@@ -108,6 +108,10 @@ pub fn run_main_from<I: IntoIterator<Item = String>>(args: I) -> i32 {
             eprintln!("edge-cli: io error: {e}");
             1
         }
+        Err(CliError::Bench(msg)) => {
+            eprintln!("edge-cli: bench: {msg}");
+            1
+        }
         Err(CliError::MissingSubcommand) | Err(CliError::Unknown(_)) => 2,
     }
 }
