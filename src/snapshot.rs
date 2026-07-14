@@ -727,9 +727,13 @@ pub fn apply_snapshot_kernel_state(
     }
 
     // ---- fd table ---------------------------------------------------------
-    use crate::fd::{EpollInner, EventFdInner, PipeRead, PipeWrite, Resource, SharedFilePos};
+    use crate::fd::{
+        EpollInner, EventFdInner, PipeRead, PipeWrite, Resource, SharedFilePos, SocketInner,
+    };
     use crate::sys::file::FilePos;
     use std::collections::HashMap;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
     use std::sync::atomic::AtomicBool;
 
     // Drain and rebuild fd table from scratch.
@@ -816,9 +820,82 @@ pub fn apply_snapshot_kernel_state(
                 Resource::File(SharedFilePos::new(parking_lot::Mutex::new(fp)))
             }
             ResourceKind::Socket => {
-                return Err(SnapshotError::Unsupported(
-                    "Resource::Socket reopen on apply_snapshot (D3 freeze CLI decides policy)",
-                ));
+                let sock = body.socket.clone().ok_or(SnapshotError::UnknownResource)?;
+
+                // Reject #3: a listener fd that somehow also has a peer
+                // recorded (defensive — accept4 creates a separate fd, so
+                // the listener itself should never see peer_addr_present).
+                if sock.is_acceptor && sock.peer_addr_present {
+                    return Err(SnapshotError::AcceptedStreamOnListener);
+                }
+
+                if sock.family_unix {
+                    // ---- AF_UNIX listener ----
+                    // Detect abstract namespace: either no path captured
+                    // or first byte is NUL (linux sun_path[0] == 0).
+                    let path = match sock.unix_inner.as_ref().and_then(|u| u.path.clone()) {
+                        Some(p) if p.as_os_str().as_bytes().first() != Some(&0) => p,
+                        _ => return Err(SnapshotError::AbstractUnixNamespace),
+                    };
+                    // Stale socket inode unlink — mirrors
+                    // `src/sys/socket.rs::bind` D3.0 fix. Tolerate races
+                    // via `let _ =`; refuse to unlink non-socket inodes.
+                    if let Ok(m) = std::fs::metadata(&path) {
+                        if m.file_type().is_socket() {
+                            let _ = std::fs::remove_file(&path);
+                        } else {
+                            return Err(SnapshotError::IoError(
+                                std::io::Error::from_raw_os_error(libc::EADDRINUSE),
+                                format!("path {path:?} exists and is not a socket"),
+                            ));
+                        }
+                    }
+                    let listener = tokio::net::UnixListener::bind(&path)
+                        .map_err(|e| SnapshotError::IoError(e, format!("bind {path:?}")))?;
+                    let inner = std::sync::Arc::new(parking_lot::Mutex::new(
+                        SocketInner::from_unix_listener(listener, path, sock.nonblock),
+                    ));
+                    Resource::Socket(inner)
+                } else {
+                    // ---- TCP listener ----
+                    if !sock.is_acceptor {
+                        return Err(SnapshotError::Unsupported(
+                            "unconnected TCP client not yet supported",
+                        ));
+                    }
+                    let bound = sock
+                        .bound
+                        .clone()
+                        .ok_or(SnapshotError::Unsupported("missing bound for TCP listener"))?;
+                    let SockAddr::V4 { port, addr } = bound else {
+                        return Err(SnapshotError::Unsupported(
+                            "only IPv4 socket reopen supported",
+                        ));
+                    };
+                    let sock_addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                        std::net::Ipv4Addr::from(addr),
+                        port,
+                    ));
+                    let std_listener = std::net::TcpListener::bind(sock_addr)
+                        .map_err(|e| SnapshotError::IoError(e, format!("bind {sock_addr}")))?;
+                    if sock.so_reuseaddr {
+                        crate::sys::socket::setsockopt_reuseaddr(&std_listener, true)
+                            .map_err(|e| SnapshotError::IoError(e, "set SO_REUSEADDR".into()))?;
+                    }
+                    let tokio_listener =
+                        tokio::net::TcpListener::from_std(std_listener).map_err(|e| {
+                            SnapshotError::IoError(e, "tokio::TcpListener::from_std".into())
+                        })?;
+                    let inner = std::sync::Arc::new(parking_lot::Mutex::new(
+                        SocketInner::from_tcp_listener(
+                            tokio_listener,
+                            SockAddr::V4 { port, addr },
+                            sock.so_reuseaddr,
+                            sock.nonblock,
+                        ),
+                    ));
+                    Resource::Socket(inner)
+                }
             }
             ResourceKind::Epoll => {
                 let esnap = body.epoll.clone().ok_or(SnapshotError::UnknownResource)?;
@@ -1266,26 +1343,187 @@ mod tests {
         .expect("apply_snapshot");
     }
 
-    #[test]
-    fn apply_snapshot_rejects_socket_variant() {
-        // Build a snapshot with a Socket variant directly (we cannot
-        // easily make a TcpListener here without binding a port). The
-        // expected outcome: apply_snapshot returns Unsupported.
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_snapshot_reopens_tcp_listener() {
+        use crate::fd::{Resource, SocketKind};
+        let sock = SocketSnapshot {
+            sock_kind: SocketKind::Stream,
+            nonblock: false,
+            bound: Some(SockAddr::V4 {
+                port: 0,
+                addr: [127, 0, 0, 1],
+            }),
+            listen_backlog: Some(LeI32(0)),
+            so_reuseaddr: true,
+            is_acceptor: true,
+            family_unix: false,
+            ..SocketSnapshot::default()
+        };
         let snap = KernelSnapshot {
-            format_version: LeU32(SNAPSHOT_FORMAT_VERSION),
             fds: FdSnapshot {
                 entries: vec![FdEntrySnapshot {
                     fd: LeU32(3),
-                    kind: ResourceSnapshot::from_socket(SocketSnapshot::default()),
+                    kind: ResourceSnapshot::from_socket(sock),
                 }],
                 next_fd: LeU32(4),
                 cloexec: vec![],
             },
             ..make_test_snapshot()
         };
-        let err = apply_with_store(snap, |_target, _store| ())
-            .expect_err("apply_snapshot should reject Socket variant");
-        assert!(matches!(err, SnapshotError::Unsupported(_)), "got {err:?}");
+        apply_with_store(snap, |target, _store| {
+            match target.fds.get(3).expect("fd 3") {
+                Resource::Socket(s) => {
+                    let gs = s.lock();
+                    assert!(gs.is_acceptor);
+                    assert!(gs.bound.is_some());
+                    assert!(gs.so_reuseaddr);
+                    assert!(gs.listener.is_some(), "listener must be materialized");
+                }
+                _ => panic!("expected Socket at fd 3"),
+            }
+        })
+        .expect("apply_snapshot reopens TCP listener");
+    }
+
+    #[test]
+    fn apply_snapshot_rejects_accepted_stream_on_listener() {
+        use crate::fd::SocketKind;
+        let sock = SocketSnapshot {
+            sock_kind: SocketKind::Stream,
+            nonblock: false,
+            bound: Some(SockAddr::V4 {
+                port: 8080,
+                addr: [127, 0, 0, 1],
+            }),
+            listen_backlog: Some(LeI32(0)),
+            is_acceptor: true,
+            peer_addr_present: true,
+            family_unix: false,
+            ..SocketSnapshot::default()
+        };
+        let snap = KernelSnapshot {
+            fds: FdSnapshot {
+                entries: vec![FdEntrySnapshot {
+                    fd: LeU32(3),
+                    kind: ResourceSnapshot::from_socket(sock),
+                }],
+                next_fd: LeU32(4),
+                cloexec: vec![],
+            },
+            ..make_test_snapshot()
+        };
+        let err = apply_with_store(snap, |_, _| ())
+            .expect_err("should reject accepted-stream-on-listener");
+        assert!(matches!(err, SnapshotError::AcceptedStreamOnListener));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_snapshot_reopens_unix_filesystem_listener() {
+        use crate::fd::{Resource, SocketKind};
+        use crate::snapshot::UnixSockSnapshot;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.sock");
+        let sock = SocketSnapshot {
+            sock_kind: SocketKind::Stream,
+            nonblock: false,
+            bound: Some(SockAddr::Unix { path: path.clone() }),
+            listen_backlog: Some(LeI32(0)),
+            is_acceptor: true,
+            family_unix: true,
+            unix_inner: Some(UnixSockSnapshot {
+                path: Some(path.clone()),
+                peer_addr_present: false,
+            }),
+            ..SocketSnapshot::default()
+        };
+        let snap = KernelSnapshot {
+            fds: FdSnapshot {
+                entries: vec![FdEntrySnapshot {
+                    fd: LeU32(3),
+                    kind: ResourceSnapshot::from_socket(sock),
+                }],
+                next_fd: LeU32(4),
+                cloexec: vec![],
+            },
+            ..make_test_snapshot()
+        };
+        apply_with_store(snap, |target, _store| {
+            match target.fds.get(3).expect("fd 3") {
+                Resource::Socket(s) => {
+                    let gs = s.lock();
+                    assert!(gs.is_acceptor);
+                    assert!(gs.family_unix);
+                    assert!(
+                        gs.unix.as_ref().and_then(|u| u.listener.as_ref()).is_some(),
+                        "unix listener must be materialized"
+                    );
+                }
+                _ => panic!("expected Socket at fd 3"),
+            }
+        })
+        .expect("apply_snapshot reopens AF_UNIX listener");
+    }
+
+    #[test]
+    fn apply_snapshot_rejects_unix_abstract_namespace() {
+        use crate::fd::SocketKind;
+        use crate::snapshot::UnixSockSnapshot;
+        let sock = SocketSnapshot {
+            sock_kind: SocketKind::Stream,
+            nonblock: false,
+            family_unix: true,
+            is_acceptor: true,
+            unix_inner: Some(UnixSockSnapshot {
+                path: None,
+                peer_addr_present: false,
+            }),
+            ..SocketSnapshot::default()
+        };
+        let snap = KernelSnapshot {
+            fds: FdSnapshot {
+                entries: vec![FdEntrySnapshot {
+                    fd: LeU32(3),
+                    kind: ResourceSnapshot::from_socket(sock),
+                }],
+                next_fd: LeU32(4),
+                cloexec: vec![],
+            },
+            ..make_test_snapshot()
+        };
+        let err = apply_with_store(snap, |_, _| ()).expect_err("should reject abstract namespace");
+        assert!(matches!(err, SnapshotError::AbstractUnixNamespace));
+    }
+
+    #[test]
+    fn apply_snapshot_rejects_unconnected_tcp_client() {
+        use crate::fd::SocketKind;
+        let sock = SocketSnapshot {
+            sock_kind: SocketKind::Stream,
+            nonblock: false,
+            bound: Some(SockAddr::V4 {
+                port: 8080,
+                addr: [127, 0, 0, 1],
+            }),
+            listen_backlog: Some(LeI32(0)),
+            is_acceptor: false,
+            peer_addr_present: false,
+            family_unix: false,
+            ..SocketSnapshot::default()
+        };
+        let snap = KernelSnapshot {
+            fds: FdSnapshot {
+                entries: vec![FdEntrySnapshot {
+                    fd: LeU32(3),
+                    kind: ResourceSnapshot::from_socket(sock),
+                }],
+                next_fd: LeU32(4),
+                cloexec: vec![],
+            },
+            ..make_test_snapshot()
+        };
+        let err =
+            apply_with_store(snap, |_, _| ()).expect_err("should reject unconnected TCP client");
+        assert!(matches!(err, SnapshotError::Unsupported(_)));
     }
 
     #[test]

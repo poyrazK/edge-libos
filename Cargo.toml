@@ -25,6 +25,7 @@ futures              = "0.3"
 anyhow               = "1"
 tracing              = "0.1"
 parking_lot          = "0.12"
+libc                 = "0.2"     # P2-D3.2: setsockopt(SO_REUSEADDR) on std::net::TcpListener
 rand                 = { version = "0.8", features = ["small_rng"] }
 chrono               = { version = "0.4", default-features = false, features = ["clock"] }
 

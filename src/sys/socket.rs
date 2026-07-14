@@ -2259,3 +2259,32 @@ async fn recvfrom_unix(
     }
     n as i64
 }
+
+/// P2-D3.2: apply `SO_REUSEADDR` on a freshly bound `std::net::TcpListener`.
+/// Called from `apply_snapshot_kernel_state` after `TcpListener::bind` to
+/// restore the option that was set on the original listener before freeze.
+pub(crate) fn setsockopt_reuseaddr(
+    listener: &std::net::TcpListener,
+    on: bool,
+) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = listener.as_raw_fd();
+    let val: libc::c_int = if on { 1 } else { 0 };
+    // SAFETY: `fd` is a live, owned `TcpListener` raw fd; `val` is a
+    // stack-local `c_int` valid for the duration of the call; `optlen`
+    // matches the size of `c_int`.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&val) as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
