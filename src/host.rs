@@ -29,6 +29,8 @@ pub fn build_engine() -> Result<Engine> {
     //     required for instantiating modules that declare
     //     `(memory ... shared)`. Without this, the parser allows
     //     `(memory ... shared)` but instantiation still fails.
+    //     `SharedMemory` is what ADR 0001 §2's cross-fiber `Arc<Notify>`
+    //     wakes traverse (atomics on the memory, not on `Store`).
     //   * `wasm_shared_everything_threads(true)` — the tier-3
     //     `thread.spawn` guest instruction. Required for the eventual
     //     `clone(56)` handler to spawn real guest fibers.
