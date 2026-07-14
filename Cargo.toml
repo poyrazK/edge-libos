@@ -19,7 +19,7 @@ name = "trace-host"
 path = "src/bin/trace_host.rs"
 
 [dependencies]
-wasmtime             = { version = "=45.0.3", features = ["component-model", "async", "anyhow"] }
+wasmtime             = { version = "=45.0.3", features = ["component-model", "async", "anyhow", "threads"] }
 tokio                = { version = "1.45", features = ["full"] }
 futures              = "0.3"
 anyhow               = "1"
