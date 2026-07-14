@@ -23,12 +23,9 @@ wasmtime             = { version = "=45.0.3", features = ["component-model", "as
 tokio                = { version = "1.45", features = ["full"] }
 futures              = "0.3"
 anyhow               = "1"
-thiserror            = "2"
 tracing              = "0.1"
-tracing-subscriber   = { version = "0.3", features = ["env-filter"] }
 parking_lot          = "0.12"
 rand                 = { version = "0.8", features = ["small_rng"] }
-once_cell            = "1"
 chrono               = { version = "0.4", default-features = false, features = ["clock"] }
 
 # P2-D1: snapshot foundation. Both already transitive in Cargo.lock;
@@ -46,6 +43,34 @@ default = []
 # Future: turn on to delegate to wasmtime-wasi instead of the hand-rolled VFS.
 # P0 deliberately leaves this OFF (see impelementationplan §0 and decision log).
 wasi-delegate = []
+
+[lints.clippy]
+# Strict lint policy (P2-CI-2): every clippy warning is a CI failure.
+# `cargo clippy --all-targets -- -D warnings` runs the default group
+# (correctness / suspicious / style / complexity / perf) at warn level,
+# and `-D warnings` promotes each to deny.
+#
+# The four lints below are the ONLY allow-listed exceptions. They are
+# API-surface suggestions, not correctness checks; silencing them
+# upstream avoids `#[allow(...)]` attribute noise on every `pub fn` /
+# `pub struct`. They have **zero** violations in the current tree
+# (verified 2026-07-14 — see `memory/edge-libos-lint-inventory.md`).
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+module_name_repetitions = "allow"
+
+[lints.rust]
+# Drop this table entirely: cargo's defaults for `unused_imports`,
+# `unused_variables`, `dead_code`, and `unused_mut` are all `warn`,
+# which is what we want. Promoting them to deny would fail the gate
+# on stylistic, non-functional code (we want CI to catch real typos,
+# not block on dead code we haven't cleaned up yet). The strict
+# promotion to deny lives in `cargo clippy -- -D warnings` for the
+# clippy equivalents.
+#
+# If/when we want rustc-side deny-on-warn too, the four entries to
+# add here are exactly the lines deleted below.
 
 [profile.release]
 opt-level = 3

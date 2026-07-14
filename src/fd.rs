@@ -153,17 +153,11 @@ pub fn make_pipe() -> (PipeRead, PipeWrite) {
 /// stream-vs-datagram distinction matters once `connect`/`sendto` land.
 ///
 /// P2-D1: derives `Serialize`/`Deserialize` for snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SocketKind {
+    #[default]
     Stream,
     Datagram,
-}
-
-impl Default for SocketKind {
-    fn default() -> Self {
-        // Default to Stream for SocketSnapshot's `Default` impl.
-        SocketKind::Stream
-    }
 }
 
 /// The bound address of a socket. Parsed from `sockaddr_in` / `sockaddr_in6`
@@ -380,6 +374,7 @@ impl SocketInner {
 /// Lock-discipline: same as everywhere else — never hold a
 /// `parking_lot::Mutex` guard across `.await`.
 #[allow(dead_code)]
+#[derive(Default)]
 pub struct UnixSockInner {
     pub path: Option<PathBuf>,
     pub listener: Option<UnixListener>,
@@ -392,13 +387,7 @@ pub struct UnixSockInner {
 
 impl UnixSockInner {
     pub fn new() -> Self {
-        Self {
-            path: None,
-            listener: None,
-            stream: None,
-            dgram: None,
-            peer_addr: None,
-        }
+        Self::default()
     }
 }
 

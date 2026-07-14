@@ -32,22 +32,22 @@
 //!     `Arc<Notify>`s are fresh allocations (ADR 0002 §5 +
 //!     ADR 0001 §Consequences).
 //!
-//! This is the D2 acceptance criterion: byte-identical linear memory
-//! + stdout survives a `try_to_snapshot` → `apply_snapshot` cycle,
-//! and the guest can keep running on the restored store.
+//! This is the D2 acceptance criterion: byte-identical linear memory,
+//! stdout, and guest re-execution survive a `try_to_snapshot` →
+//! `apply_snapshot` cycle.
 
 use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::sync::Notify;
 
-use edge_libos::{
-    apply_snapshot_kernel_state, apply_snapshot_to_memory, build_store, try_to_snapshot, Kernel,
-    KernelSnapshot, SNAPSHOT_FORMAT_VERSION,
-};
 use edge_libos::snapshot::endian::LeU32;
 use edge_libos::snapshot::{
     ClockStateSnapshot, FdSnapshot, LinearAllocatorSnapshot, SignalStateSnapshot, VfsSnapshot,
+};
+use edge_libos::{
+    apply_snapshot_kernel_state, apply_snapshot_to_memory, build_store, try_to_snapshot, Kernel,
+    KernelSnapshot, SNAPSHOT_FORMAT_VERSION,
 };
 
 mod common;
@@ -161,13 +161,12 @@ async fn snapshot_roundtrip_preserves_memory_and_stdout() -> Result<()> {
     // Fresh store B with the same fixture — attach memory first, then
     // replace the kernel with a stdio-less seed and re-attach memory.
     let (mut store_b, _instance_b) = fresh_store_with_fixture().await?;
-    let mem_handle = store_b
+    let mem_handle = *store_b
         .data()
         .memory()
-        .map_err(|e| anyhow::anyhow!("store_b memory not attached: {e}"))?
-        .clone();
+        .map_err(|e| anyhow::anyhow!("store_b memory not attached: {e}"))?;
     *store_b.data_mut() = Kernel::new_without_stdio(vec![], vec![]);
-    store_b.data_mut().attach_memory(mem_handle.clone());
+    store_b.data_mut().attach_memory(mem_handle);
 
     // Two-step apply avoids the dual &mut borrow against `Store<Kernel>`.
     {
@@ -219,13 +218,12 @@ async fn snapshot_roundtrip_supports_re_execution() -> Result<()> {
     };
 
     let (mut store_b, instance_b) = fresh_store_with_fixture().await?;
-    let mem_handle = store_b
+    let mem_handle = *store_b
         .data()
         .memory()
-        .map_err(|e| anyhow::anyhow!("store_b memory not attached: {e}"))?
-        .clone();
+        .map_err(|e| anyhow::anyhow!("store_b memory not attached: {e}"))?;
     *store_b.data_mut() = Kernel::new_without_stdio(vec![], vec![]);
-    store_b.data_mut().attach_memory(mem_handle.clone());
+    store_b.data_mut().attach_memory(mem_handle);
     {
         let kernel = store_b.data_mut();
         apply_snapshot_kernel_state(&snap, kernel)?;
@@ -319,8 +317,7 @@ fn futex_table_roundtrips_via_snapshot() -> Result<()> {
         futex_table: futex_wire,
     };
     let wire = postcard::to_stdvec(&snap).expect("encode snapshot");
-    let snap_decoded: KernelSnapshot =
-        postcard::from_bytes(&wire).expect("decode snapshot");
+    let snap_decoded: KernelSnapshot = postcard::from_bytes(&wire).expect("decode snapshot");
     assert_eq!(
         snap_decoded.futex_table, snap.futex_table,
         "futex_table field must round-trip the postcard wire form intact"
@@ -339,8 +336,20 @@ fn futex_table_roundtrips_via_snapshot() -> Result<()> {
     let mut sorted = restored.clone();
     sorted.sort_by_key(|f| f.addr.0);
     assert_eq!(sorted.len(), 2, "both entries restored");
-    assert_eq!(sorted[0], FutexAddrSnapshot { addr: LeU32(0x1000), waiters: LeU32(1) });
-    assert_eq!(sorted[1], FutexAddrSnapshot { addr: LeU32(0x2000), waiters: LeU32(2) });
+    assert_eq!(
+        sorted[0],
+        FutexAddrSnapshot {
+            addr: LeU32(0x1000),
+            waiters: LeU32(1)
+        }
+    );
+    assert_eq!(
+        sorted[1],
+        FutexAddrSnapshot {
+            addr: LeU32(0x2000),
+            waiters: LeU32(2)
+        }
+    );
 
     // 5. Rebuild-on-restore uses fresh `Arc<Notify>` allocations.
     //    We can't reach into the rebuilt entries directly (no

@@ -68,6 +68,7 @@ mod tests {
             signals: SignalStateSnapshot::default(),
             exit_code: None,
             comm: [0u8; 16],
+            futex_table: vec![],
         }
     }
 

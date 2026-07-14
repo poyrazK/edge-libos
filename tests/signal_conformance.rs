@@ -94,24 +94,6 @@ const SIGPROCMASK_WAT: &str = r#"
           (i64.const 0) (i64.const 0))))
 "#;
 
-/// rt_sigprocmask(SIG_BLOCK, NULL, oldset@4096, 8) — returns current mask.
-const SIGPROCMASK_QUERY_WAT: &str = r#"
-    (module
-      (import "kernel" "syscall"
-        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
-      (memory (export "memory") 1)
-      (func (export "get_mask") (result i64)
-        (drop
-          (call $syscall
-            (i64.const 14)
-            (i64.const 0)           ;; SIG_BLOCK
-            (i64.const 0)           ;; set = NULL
-            (i64.const 4096)
-            (i64.const 8)
-            (i64.const 0) (i64.const 0)))
-        (i64.load (i32.const 4096))))
-"#;
-
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -120,6 +102,7 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
     rt.block_on(f)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_sigaction(
     engine: &wasmtime::Engine,
     linker: &wasmtime::Linker<Kernel>,

@@ -199,7 +199,7 @@ fn main() -> Result<()> {
 /// writes `0x02` — the AF_INET family byte — at offset 4100). So we do
 /// NOT walk the buffer until the first NUL; we read the literal prefix:
 ///   - bytes 0..4 == b"PASS"         → "PASS"
-///   - bytes 0..5 == b"FAIL:"        → "FAIL:<reason up to first NUL>"
+///   - bytes 0..5 == b"FAIL:"        → "FAIL:\<reason up to first NUL>"
 ///   - anything else                 → "" (no marker)
 fn read_marker(store: &wasmtime::Store<Kernel>) -> String {
     const MARKER_ADDR: usize = 4096;

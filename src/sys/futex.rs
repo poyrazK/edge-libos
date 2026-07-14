@@ -207,13 +207,10 @@ async fn futex_wait(
         };
 
         let mut table = caller.data().futex_table.lock();
-        let entry = table
-            .by_addr
-            .entry(uaddr)
-            .or_insert_with(|| FutexEntry {
-                notify: Arc::new(Notify::new()),
-                waiters: 0,
-            });
+        let entry = table.by_addr.entry(uaddr).or_insert_with(|| FutexEntry {
+            notify: Arc::new(Notify::new()),
+            waiters: 0,
+        });
         entry.waiters += 1;
         (entry.notify.clone(), deadline)
     };
@@ -308,7 +305,11 @@ pub fn futex_wake(caller: &mut Caller<'_, Kernel>, uaddr: u32, val: i32) -> i64 
 /// Returns `-EINVAL` if nsec is out of range or sec is negative.
 fn decode_timespec(caller: &mut Caller<'_, Kernel>, ptr: i64) -> Result<Duration, i64> {
     let bytes = mem::guest_slice(caller, ptr, TIMESPEC_SIZE)?;
-    let sec = i64::from_le_bytes(bytes[TIMESPEC_SEC_OFF..TIMESPEC_SEC_OFF + 8].try_into().unwrap());
+    let sec = i64::from_le_bytes(
+        bytes[TIMESPEC_SEC_OFF..TIMESPEC_SEC_OFF + 8]
+            .try_into()
+            .unwrap(),
+    );
     let nsec = i64::from_le_bytes(
         bytes[TIMESPEC_NSEC_OFF..TIMESPEC_NSEC_OFF + 8]
             .try_into()
@@ -370,7 +371,11 @@ mod tests {
             waiters: LeU32(2),
         };
         let bytes = postcard::to_stdvec(&s).expect("encode FutexAddrSnapshot");
-        assert_eq!(bytes.len(), 8, "FutexAddrSnapshot must be 8 fixed-width LE bytes");
+        assert_eq!(
+            bytes.len(),
+            8,
+            "FutexAddrSnapshot must be 8 fixed-width LE bytes"
+        );
         assert_eq!(&bytes[0..4], &[0x78, 0x56, 0x34, 0x12]);
         assert_eq!(&bytes[4..8], &[0x02, 0x00, 0x00, 0x00]);
         let back: FutexAddrSnapshot =

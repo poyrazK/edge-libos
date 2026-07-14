@@ -13,17 +13,17 @@
 //!
 //! 3. `epoll_wait(epfd, events_ptr, maxevents, timeout_ms)` is the async
 //!    pivot:
-//!      (a) Snapshot current readiness for each registered fd
-//!          (synchronous — same logic as `poll(2)`).
-//!      (b) If any entry has nonzero `revents`, pack them into the
-//!          guest's `events` array and return the count immediately.
-//!      (c) Otherwise, build a `tokio::select!` over:
-//!          (i)   a `sleep(timeout_ms)` (or `pending()` if timeout < 0),
-//!          (ii)  the per-fd `Notify::notified()` futures cloned from
-//!                each registered fd's `notify_read` / `notify_write`,
-//!          (iii) the epoll instance's own `cancel.notify()`.
-//!      (d) On wake, re-snapshot readiness; if any fd now reports
-//!          events, pack and return.
+//!    - (a) Snapshot current readiness for each registered fd
+//!      (synchronous — same logic as `poll(2)`).
+//!    - (b) If any entry has nonzero `revents`, pack them into the
+//!      guest's `events` array and return the count immediately.
+//!    - (c) Otherwise, build a `tokio::select!` over:
+//!      - (i)   a `sleep(timeout_ms)` (or `pending()` if timeout < 0),
+//!      - (ii)  the per-fd `Notify::notified()` futures cloned from
+//!        each registered fd's `notify_read` / `notify_write`,
+//!      - (iii) the epoll instance's own `cancel.notify()`.
+//!    - (d) On wake, re-snapshot readiness; if any fd now reports
+//!      events, pack and return.
 //!
 //! P1-7's scope: only `epoll_wait(timeout >= 0)` is fully async-suspending.
 //! `epoll_wait(-1)` is also supported (waits indefinitely).
@@ -503,9 +503,9 @@ fn pack_events(
         let off = i * EPOLL_EVENT_SIZE;
         // wasm32-musl `struct epoll_event` is 12 bytes: u32 events + u64 data.
         // `data` is preserved through the round-trip from `EpollEntry::data`
-        // (set by the guest's `EPOLL_CTL_ADD`).
-        let ev_u32: u32 = revents & 0xFFFF_FFFF;
-        buf[off..off + 4].copy_from_slice(&ev_u32.to_le_bytes());
+        // (set by the guest's `EPOLL_CTL_ADD`). `revents` is the low 32
+        // bits of the kernel-shaped epoll_event.events field.
+        buf[off..off + 4].copy_from_slice(&revents.to_le_bytes());
         buf[off + 4..off + 12].copy_from_slice(&entry.data.to_le_bytes());
     }
     count as i64
@@ -540,7 +540,7 @@ pub async fn epoll_pwait(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         };
         let sec = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
         let nsec = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+        if sec < 0 || nsec < 0 || !(0..1_000_000_000).contains(&nsec) {
             return -EINVAL;
         }
         (sec as i64).saturating_mul(1000) + (nsec as i64) / 1_000_000
