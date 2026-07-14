@@ -475,6 +475,12 @@ impl std::error::Error for SnapshotError {
 /// retained on the kernel but the bytes are read out into the snapshot's
 /// `pages` overlay here; `apply_snapshot` grows + chunk-copies them on
 /// restore.
+///
+/// **Concurrency:** the caller must serialize against guest execution —
+/// this runtime is single-threaded (`wasm_threads` is off and the tokio
+/// runtime is current-thread), so the freeze CLI's quiescent-point
+/// ordering is sufficient; if you ever change that, gate this function
+/// behind an explicit barrier.
 pub fn try_to_snapshot(
     kernel: &Kernel,
     store: &impl wasmtime::AsContext,
@@ -629,7 +635,7 @@ pub fn apply_snapshot(
     store: &mut impl wasmtime::AsContextMut<Data = Kernel>,
 ) -> Result<(), SnapshotError> {
     apply_snapshot_kernel_state(&snap, kernel)?;
-    apply_snapshot_linear_memory(&snap, kernel, store)
+    apply_snapshot_to_memory_inner(&snap, kernel, store)
 }
 
 /// Step 1 of `apply_snapshot`: replace kernel-resident state (args,
@@ -822,7 +828,7 @@ pub fn apply_snapshot_kernel_state(
 /// pages, this is a no-op (the memory remains at whatever size the
 /// target store was born with — sufficient for the roundtrip test
 /// fixture, which builds a 32-page module ahead of time).
-fn apply_snapshot_linear_memory(
+fn apply_snapshot_to_memory_inner(
     snap: &KernelSnapshot,
     kernel: &mut Kernel,
     store: &mut impl wasmtime::AsContextMut<Data = Kernel>,
@@ -842,7 +848,7 @@ fn apply_snapshot_linear_memory(
             )
         })?
         .clone();
-    apply_snapshot_linear_memory_via(snap, mem, store)
+    apply_snapshot_to_memory(snap, mem, store)
 }
 
 /// Memory-only restore driver. Takes the cloned `Memory` handle
@@ -854,7 +860,7 @@ fn apply_snapshot_linear_memory(
 /// **Public** so integration tests can drive the apply by hand
 /// (also see [`apply_snapshot_kernel_state`] for the kernel-only
 /// half of the same operation).
-pub fn apply_snapshot_linear_memory_via(
+pub fn apply_snapshot_to_memory(
     snap: &KernelSnapshot,
     mem: wasmtime::Memory,
     store: &mut impl wasmtime::AsContextMut<Data = Kernel>,
@@ -1316,7 +1322,7 @@ mod tests {
         // Step 2: linear memory via the cloned `Memory` handle. No
         // `&mut Kernel` borrow active — only `&mut store` and the
         // Memory handle, which is `Copy`.
-        apply_snapshot_linear_memory_via(&snap, mem, &mut store)?;
+        apply_snapshot_to_memory(&snap, mem, &mut store)?;
         Ok(verify(store.data(), &store))
     }
 

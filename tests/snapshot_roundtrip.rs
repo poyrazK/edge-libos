@@ -29,8 +29,8 @@
 use anyhow::Result;
 
 use edge_libos::{
-    apply_snapshot_kernel_state, apply_snapshot_linear_memory_via, build_store, try_to_snapshot,
-    Kernel, KernelSnapshot,
+    apply_snapshot_kernel_state, apply_snapshot_to_memory, build_store, try_to_snapshot, Kernel,
+    KernelSnapshot,
 };
 
 mod common;
@@ -157,7 +157,7 @@ async fn snapshot_roundtrip_preserves_memory_and_stdout() -> Result<()> {
         let kernel = store_b.data_mut();
         apply_snapshot_kernel_state(&snap, kernel)?;
     }
-    apply_snapshot_linear_memory_via(&snap, mem_handle, &mut store_b)?;
+    apply_snapshot_to_memory(&snap, mem_handle, &mut store_b)?;
 
     // Linear-memory restore check: the 19-byte pattern (incl. NUL) the
     // fixture wrote at offset 0x100 must survive byte-for-byte.
@@ -213,7 +213,7 @@ async fn snapshot_roundtrip_supports_re_execution() -> Result<()> {
         let kernel = store_b.data_mut();
         apply_snapshot_kernel_state(&snap, kernel)?;
     }
-    apply_snapshot_linear_memory_via(&snap, mem_handle, &mut store_b)?;
+    apply_snapshot_to_memory(&snap, mem_handle, &mut store_b)?;
 
     // Re-execute on store B — same compiled module, same restored
     // state, so the second invocation must produce identical output.
