@@ -326,7 +326,7 @@ impl SocketInner {
     /// P2-D1: build the snapshot form. Caller owns a fresh `SocketSnapshot`.
     /// Locks the inner mutex briefly, drops the guard, copies out.
     pub fn snapshot(&self) -> crate::snapshot::SocketSnapshot {
-        use crate::snapshot::{SocketSnapshot, UnixSockSnapshot};
+        use crate::snapshot::{endian::LeI32, SocketSnapshot, UnixSockSnapshot};
         let unix_inner = self.unix.as_ref().map(|u| UnixSockSnapshot {
             path: u.path.clone(),
             peer_addr_present: u.peer_addr.is_some(),
@@ -336,12 +336,12 @@ impl SocketInner {
             sock_kind: self.kind,
             nonblock: self.nonblock.load(std::sync::atomic::Ordering::Relaxed),
             bound: self.bound.clone(),
-            listen_backlog: self.listen_backlog,
+            listen_backlog: self.listen_backlog.map(LeI32),
             so_reuseaddr: self.so_reuseaddr,
             so_keepalive: self.so_keepalive,
             tcp_nodelay: self.tcp_nodelay,
             peer_addr_present: self.peer_addr.is_some(),
-            last_error: self.last_error.load(std::sync::atomic::Ordering::Relaxed),
+            last_error: LeI32(self.last_error.load(std::sync::atomic::Ordering::Relaxed)),
             shutdown_flags: self.shutdown_flags,
             is_acceptor: self.is_acceptor,
             peek_buf,
@@ -436,7 +436,10 @@ impl EpollInner {
     /// guard, copies out. Cancels the runtime `Notify` (informational
     /// field — restore rebuilds an empty Notify).
     pub fn snapshot(&self) -> crate::snapshot::EpollSnapshot {
-        use crate::snapshot::{EpollEntrySnapshot, EpollSnapshot};
+        use crate::snapshot::{
+            endian::{LeU32, LeU64},
+            EpollEntrySnapshot, EpollSnapshot,
+        };
         let entries: Vec<(u32, EpollEntrySnapshot)> = {
             let guard = self.entries.lock();
             let mut v: Vec<(u32, EpollEntrySnapshot)> = guard
@@ -445,9 +448,9 @@ impl EpollInner {
                     (
                         *fd,
                         EpollEntrySnapshot {
-                            fd: e.fd,
-                            events: e.events,
-                            data: e.data,
+                            fd: LeU32(e.fd),
+                            events: LeU32(e.events),
+                            data: LeU64(e.data),
                         },
                     )
                 })
@@ -457,7 +460,7 @@ impl EpollInner {
         };
         EpollSnapshot {
             entries: entries.into_iter().map(|(_, e)| e).collect::<Vec<_>>(),
-            self_event_fd: self.self_event_fd,
+            self_event_fd: self.self_event_fd.map(LeU32),
         }
     }
 }
@@ -473,9 +476,10 @@ pub struct EventFdInner {
 impl EventFdInner {
     /// P2-D1: snapshot form. Locks briefly, drops guard, copies out.
     pub fn snapshot(&self) -> crate::snapshot::EventFdSnapshot {
+        use crate::snapshot::endian::LeU64;
         let counter = *self.counter.lock();
         crate::snapshot::EventFdSnapshot {
-            counter,
+            counter: LeU64(counter),
             nonblock: self.nonblock.load(std::sync::atomic::Ordering::Relaxed),
         }
     }

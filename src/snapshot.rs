@@ -54,6 +54,7 @@ use serde::{Deserialize, Serialize};
 use crate::fd::FdTable;
 use crate::fd::SockAddr;
 use crate::kernel::{Kernel, RngSeed};
+use crate::snapshot::endian::{LeI32, LeI64, LeU32, LeU64};
 use crate::sys::signal::SignalState;
 use crate::vfs::Vfs;
 
@@ -132,17 +133,19 @@ pub mod parking_lot_mutex_bytes {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KernelSnapshot {
-    pub format_version: u32,
+    /// ADR 0002 §3 + §4: first wire word is `LeU32(1)` (or
+    /// equivalent `u8` per §4 — LeU32 form subsumes it).
+    pub format_version: LeU32,
     pub fds: FdSnapshot,
     pub mm: LinearAllocatorSnapshot,
     pub vfs: VfsSnapshot,
     pub clock: ClockStateSnapshot,
-    pub brk: u32,
+    pub brk: LeU32,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub rng_seed: RngSeed,
     pub signals: SignalStateSnapshot,
-    pub exit_code: Option<i32>,
+    pub exit_code: Option<LeI32>,
     pub comm: [u8; 16],
 }
 
@@ -150,14 +153,14 @@ pub struct KernelSnapshot {
 pub struct FdSnapshot {
     /// Sorted by `(fd,)` for deterministic postcard output.
     pub entries: Vec<FdEntrySnapshot>,
-    pub next_fd: u32,
+    pub next_fd: LeU32,
     /// Sorted ascending.
-    pub cloexec: Vec<u32>,
+    pub cloexec: Vec<LeU32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FdEntrySnapshot {
-    pub fd: u32,
+    pub fd: LeU32,
     pub kind: ResourceSnapshot,
 }
 
@@ -270,7 +273,7 @@ pub struct PipeSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FileSnapshot {
     pub path: Option<PathBuf>,
-    pub pos: u64,
+    pub pos: LeU64,
     pub is_dir: bool,
     pub dir_cache: Option<Vec<u8>>,
 }
@@ -281,12 +284,12 @@ pub struct SocketSnapshot {
     pub nonblock: bool,
     pub bound: Option<SockAddr>,
     /// Recorded for fidelity; the OS picks the actual backlog on restore.
-    pub listen_backlog: Option<i32>,
+    pub listen_backlog: Option<LeI32>,
     pub so_reuseaddr: bool,
     pub so_keepalive: bool,
     pub tcp_nodelay: bool,
     pub peer_addr_present: bool,
-    pub last_error: i32,
+    pub last_error: LeI32,
     pub shutdown_flags: u8,
     pub is_acceptor: bool,
     #[serde(with = "vecdeque_bytes")]
@@ -309,19 +312,19 @@ pub struct UnixSockSnapshot {
 pub struct EpollSnapshot {
     /// Vec (sorted) because serde on HashMap is non-deterministic.
     pub entries: Vec<EpollEntrySnapshot>,
-    pub self_event_fd: Option<u32>,
+    pub self_event_fd: Option<LeU32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpollEntrySnapshot {
-    pub fd: u32,
-    pub events: u32,
-    pub data: u64,
+    pub fd: LeU32,
+    pub events: LeU32,
+    pub data: LeU64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EventFdSnapshot {
-    pub counter: u64,
+    pub counter: LeU64,
     pub nonblock: bool,
 }
 
@@ -330,7 +333,7 @@ pub struct LinearAllocatorSnapshot {
     /// Identical shape to `crate::mm::Arena`; we serialize the runtime
     /// type directly because `Arena` already derives the right traits.
     pub arenas: Vec<crate::mm::Arena>,
-    pub high_water: u32,
+    pub high_water: LeU32,
 }
 
 /// Identical-shape mirror of `crate::kernel::ClockState` so the runtime
@@ -338,14 +341,14 @@ pub struct LinearAllocatorSnapshot {
 /// from this into the kernel's `ClockState`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClockStateSnapshot {
-    pub boot_monotonic_ns: u64,
+    pub boot_monotonic_ns: LeU64,
 }
 
 /// Identical-shape mirror of `crate::sys::signal::SignalState`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SignalStateSnapshot {
     pub actions: std::collections::BTreeMap<i32, crate::sys::signal::SigAction>,
-    pub mask: u64,
+    pub mask: LeU64,
     pub alt_stack: Option<Vec<u8>>,
 }
 
@@ -375,7 +378,7 @@ impl From<&SignalState> for SignalStateSnapshot {
         }
         Self {
             actions,
-            mask: s.mask,
+            mask: LeU64(s.mask),
             alt_stack: s.alt_stack.clone(),
         }
     }
@@ -384,7 +387,7 @@ impl From<&SignalState> for SignalStateSnapshot {
 impl From<&crate::kernel::ClockState> for ClockStateSnapshot {
     fn from(c: &crate::kernel::ClockState) -> Self {
         Self {
-            boot_monotonic_ns: c.boot_monotonic_ns,
+            boot_monotonic_ns: LeU64(c.boot_monotonic_ns),
         }
     }
 }
@@ -477,7 +480,7 @@ pub fn try_to_snapshot(
                 let guard = shared.lock();
                 ResourceSnapshot::from_file(crate::snapshot::FileSnapshot {
                     path: guard.path.clone(),
-                    pos: guard.pos,
+                    pos: LeU64(guard.pos),
                     is_dir: guard.is_dir,
                     dir_cache: guard.dir_cache.clone(),
                 })
@@ -489,31 +492,39 @@ pub fn try_to_snapshot(
             Resource::Epoll(e) => ResourceSnapshot::from_epoll(e.snapshot()),
             Resource::EventFd(e) => ResourceSnapshot::from_eventfd(e.snapshot()),
         };
-        entries.push(FdEntrySnapshot { fd, kind });
+        entries.push(FdEntrySnapshot {
+            fd: LeU32(fd),
+            kind,
+        });
     }
 
-    let cloexec: Vec<u32> = {
-        let mut v: Vec<u32> = kernel.fds.iter_cloexec_for_snapshot();
+    let cloexec: Vec<LeU32> = {
+        let mut v: Vec<LeU32> = kernel
+            .fds
+            .iter_cloexec_for_snapshot()
+            .into_iter()
+            .map(LeU32)
+            .collect();
         v.sort();
         v
     };
 
     Ok(KernelSnapshot {
-        format_version: SNAPSHOT_FORMAT_VERSION,
+        format_version: LeU32(SNAPSHOT_FORMAT_VERSION),
         fds: crate::snapshot::FdSnapshot {
             entries,
-            next_fd: kernel.fds.next_fd_for_snapshot(),
+            next_fd: LeU32(kernel.fds.next_fd_for_snapshot()),
             cloexec,
         },
         mm: kernel.mm.snapshot(),
         vfs: crate::snapshot::VfsSnapshot::from(&kernel.vfs),
         clock: crate::snapshot::ClockStateSnapshot::from(&kernel.clock),
-        brk: kernel.brk,
+        brk: LeU32(kernel.brk),
         args: kernel.args.clone(),
         env: kernel.env.clone(),
         rng_seed: kernel.rng_seed,
         signals: crate::snapshot::SignalStateSnapshot::from(&kernel.signals),
-        exit_code: kernel.exit_code,
+        exit_code: kernel.exit_code.map(LeI32),
         comm: kernel.comm,
     })
 }
@@ -541,9 +552,9 @@ pub fn apply_snapshot(
     kernel: &mut Kernel,
     _mem: &mut Vec<u8>,
 ) -> Result<(), SnapshotError> {
-    if snap.format_version != SNAPSHOT_FORMAT_VERSION {
+    if snap.format_version.0 != SNAPSHOT_FORMAT_VERSION {
         return Err(SnapshotError::FormatVersionMismatch {
-            found: snap.format_version,
+            found: snap.format_version.0,
             supported: SNAPSHOT_FORMAT_VERSION,
         });
     }
@@ -552,8 +563,8 @@ pub fn apply_snapshot(
     kernel.args = snap.args;
     kernel.env = snap.env;
     kernel.comm = snap.comm;
-    kernel.exit_code = snap.exit_code;
-    kernel.brk = snap.brk;
+    kernel.exit_code = snap.exit_code.map(|c| c.0);
+    kernel.brk = snap.brk.0;
     kernel.rng_seed = snap.rng_seed;
     kernel.rng = rand::rngs::SmallRng::from_seed(kernel.rng_seed);
     kernel.vfs = Vfs {
@@ -561,7 +572,7 @@ pub fn apply_snapshot(
         cwd: snap.vfs.cwd,
     };
     kernel.clock = crate::kernel::ClockState {
-        boot_monotonic_ns: snap.clock.boot_monotonic_ns,
+        boot_monotonic_ns: snap.clock.boot_monotonic_ns.0,
     };
     let mut actions: std::collections::HashMap<i32, crate::sys::signal::SigAction> =
         std::collections::HashMap::new();
@@ -570,7 +581,7 @@ pub fn apply_snapshot(
     }
     kernel.signals = SignalState {
         actions,
-        mask: snap.signals.mask,
+        mask: snap.signals.mask.0,
         alt_stack: snap.signals.alt_stack,
     };
     kernel.mm.replace_from_snapshot(snap.mm);
@@ -656,11 +667,11 @@ pub fn apply_snapshot(
                     .open(&path)
                     .map_err(|e| SnapshotError::IoError(e, format!("open {}", path.display())))?;
                 use std::io::{Seek, SeekFrom};
-                f.seek(SeekFrom::Start(fsnap.pos))
+                f.seek(SeekFrom::Start(fsnap.pos.0))
                     .map_err(|e| SnapshotError::IoError(e, format!("seek {}", path.display())))?;
                 let mut fp = FilePos::new(f);
                 fp.path = Some(path);
-                fp.pos = fsnap.pos;
+                fp.pos = fsnap.pos.0;
                 fp.dir_cache = fsnap.dir_cache;
                 Resource::File(SharedFilePos::new(parking_lot::Mutex::new(fp)))
             }
@@ -685,11 +696,11 @@ pub fn apply_snapshot(
                     .iter()
                     .map(|e| {
                         (
-                            e.fd,
+                            e.fd.0,
                             crate::fd::EpollEntry {
-                                fd: e.fd,
-                                events: e.events,
-                                data: e.data,
+                                fd: e.fd.0,
+                                events: e.events.0,
+                                data: e.data.0,
                                 wake: Arc::new(tokio::sync::Notify::new()),
                             },
                         )
@@ -698,21 +709,21 @@ pub fn apply_snapshot(
                 Resource::Epoll(EpollInner {
                     entries: parking_lot::Mutex::new(entries_map),
                     cancel: Arc::new(tokio::sync::Notify::new()),
-                    self_event_fd: esnap.self_event_fd,
+                    self_event_fd: esnap.self_event_fd.map(|f| f.0),
                 })
             }
             ResourceKind::EventFd => {
                 let esnap = body.eventfd.clone().ok_or(SnapshotError::UnknownResource)?;
                 Resource::EventFd(EventFdInner {
-                    counter: parking_lot::Mutex::new(esnap.counter),
+                    counter: parking_lot::Mutex::new(esnap.counter.0),
                     notify: Arc::new(tokio::sync::Notify::new()),
                     nonblock: AtomicBool::new(esnap.nonblock),
                 })
             }
         };
-        kernel.fds.insert_at(fd_num, resource).map_err(|e| {
+        kernel.fds.insert_at(fd_num.0, resource).map_err(|e| {
             SnapshotError::IoError(
-                std::io::Error::other(format!("fd {fd_num} conflict: {e}")),
+                std::io::Error::other(format!("fd {} conflict: {e}", fd_num.0)),
                 "fd insert_at".into(),
             )
         })?;
@@ -720,12 +731,12 @@ pub fn apply_snapshot(
 
     // Re-bind cloexec bits.
     for fd in &snap.fds.cloexec {
-        kernel.fds.set_cloexec(*fd, true);
+        kernel.fds.set_cloexec(fd.0, true);
     }
 
     // Restore the "next available" pointer so subsequent allocations
     // honor the snapshot's idea of fd space.
-    kernel.fds.set_next_fd_for_snapshot(snap.fds.next_fd);
+    kernel.fds.set_next_fd_for_snapshot(snap.fds.next_fd.0);
 
     Ok(())
 }
@@ -745,7 +756,7 @@ mod tests {
     fn smoke_postcard_roundtrip_of_format_version_only() {
         // Encode a minimal snapshot via postcard and decode it back.
         let snap = KernelSnapshot {
-            format_version: SNAPSHOT_FORMAT_VERSION,
+            format_version: LeU32(SNAPSHOT_FORMAT_VERSION),
             fds: FdSnapshot::default(),
             mm: LinearAllocatorSnapshot::default(),
             vfs: VfsSnapshot {
@@ -753,7 +764,7 @@ mod tests {
                 cwd: "/".into(),
             },
             clock: ClockStateSnapshot::default(),
-            brk: 0,
+            brk: LeU32(0),
             args: vec!["a".to_string()],
             env: vec![("K".to_string(), "V".to_string())],
             rng_seed: [7u8; 32],
@@ -764,7 +775,7 @@ mod tests {
         let bytes = postcard::to_stdvec(&snap).expect("encode");
         let back: KernelSnapshot = postcard::from_bytes(&bytes).expect("decode");
         // Field-by-field; KernelSnapshot doesn't derive PartialEq.
-        assert_eq!(back.format_version, 1);
+        assert_eq!(back.format_version, LeU32(1));
     }
 
     #[test]
@@ -790,13 +801,13 @@ mod tests {
         // Build a snapshot directly and round-trip.
         let lsnap = LinearAllocatorSnapshot {
             arenas: vec![crate::mm::Arena::new(0x1_000_0000)],
-            high_water: 0x1_001_0000,
+            high_water: LeU32(0x1_001_0000),
         };
         let bytes = postcard::to_stdvec(&lsnap).expect("encode");
         let back: LinearAllocatorSnapshot = postcard::from_bytes(&bytes).expect("decode");
         // Field-by-field checks; PartialEq was dropped to avoid Eq-bound
         // chains through SocketAddr-free paths.
-        assert_eq!(back.high_water, 0x1_001_0000);
+        assert_eq!(back.high_water, LeU32(0x1_001_0000));
         assert_eq!(back.arenas.len(), 1);
         assert_eq!(back.arenas[0].base, 0x1_000_0000);
         assert_eq!(back.arenas[0].used, 0);
@@ -838,8 +849,8 @@ mod tests {
         let snap = try_to_snapshot(&kernel, &[]).expect("snapshot succeeds");
 
         // Header.
-        assert_eq!(snap.format_version, SNAPSHOT_FORMAT_VERSION);
-        assert_eq!(snap.brk, 0x1000);
+        assert_eq!(snap.format_version, LeU32(SNAPSHOT_FORMAT_VERSION));
+        assert_eq!(snap.brk, LeU32(0x1000));
         assert_eq!(snap.rng_seed, [42u8; 32]);
         assert_eq!(
             snap.args,
@@ -850,18 +861,18 @@ mod tests {
 
         // FDs: 0 (stdin), 1 (stdout), 2 (stderr), 3 (eventfd) all present.
         assert_eq!(snap.fds.entries.len(), 4);
-        let fds: Vec<u32> = snap.fds.entries.iter().map(|e| e.fd).collect();
+        let fds: Vec<u32> = snap.fds.entries.iter().map(|e| e.fd.0).collect();
         assert_eq!(fds, vec![0, 1, 2, 3]);
 
         // Specifically the EventFd entry has counter=7.
-        let efd_entry = snap.fds.entries.iter().find(|e| e.fd == 3).unwrap();
+        let efd_entry = snap.fds.entries.iter().find(|e| e.fd == LeU32(3)).unwrap();
         assert_eq!(efd_entry.kind.kind, ResourceKind::EventFd);
         let efd = efd_entry.kind.body.eventfd.as_ref().expect("eventfd body");
-        assert_eq!(efd.counter, 7);
+        assert_eq!(efd.counter, LeU64(7));
         assert!(!efd.nonblock);
 
         // next_fd should be ≥ 4.
-        assert!(snap.fds.next_fd >= 4);
+        assert!(snap.fds.next_fd.0 >= 4);
 
         // Round-trip the entire snapshot via postcard.
         let bytes = postcard::to_stdvec(&snap).expect("encode succeeds");
@@ -974,13 +985,13 @@ mod tests {
         // easily make a TcpListener here without binding a port). The
         // expected outcome: apply_snapshot returns Unsupported.
         let snap = KernelSnapshot {
-            format_version: SNAPSHOT_FORMAT_VERSION,
+            format_version: LeU32(SNAPSHOT_FORMAT_VERSION),
             fds: FdSnapshot {
                 entries: vec![FdEntrySnapshot {
-                    fd: 3,
+                    fd: LeU32(3),
                     kind: ResourceSnapshot::from_socket(SocketSnapshot::default()),
                 }],
-                next_fd: 4,
+                next_fd: LeU32(4),
                 cloexec: vec![],
             },
             ..make_test_snapshot()
@@ -994,7 +1005,7 @@ mod tests {
 
     fn make_test_snapshot() -> KernelSnapshot {
         KernelSnapshot {
-            format_version: SNAPSHOT_FORMAT_VERSION,
+            format_version: LeU32(SNAPSHOT_FORMAT_VERSION),
             fds: FdSnapshot::default(),
             mm: LinearAllocatorSnapshot::default(),
             vfs: VfsSnapshot {
@@ -1002,7 +1013,7 @@ mod tests {
                 cwd: "/".into(),
             },
             clock: ClockStateSnapshot::default(),
-            brk: 0,
+            brk: LeU32(0),
             args: vec![],
             env: vec![],
             rng_seed: [0u8; 32],
@@ -1015,7 +1026,7 @@ mod tests {
     #[test]
     fn apply_snapshot_rejects_format_mismatch() {
         let mut snap = make_test_snapshot();
-        snap.format_version = 99;
+        snap.format_version = LeU32(99);
         let mut target = Kernel::new_without_stdio(vec![], vec![]);
         let mut mem_buf: Vec<u8> = Vec::new();
         let err = apply_snapshot(snap, &mut target, &mut mem_buf)
