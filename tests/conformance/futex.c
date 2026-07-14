@@ -7,9 +7,11 @@
 #define FUTEX_CMD_WAKE 1
 #define FUTEX_PRIVATE_FLAG 0x80
 
-// Use scratch slot at 8192 — MARKER_ADDR=4096 is reserved by mark_pass/
-// mark_fail() (see tests/conformance/syscall.h).
-#define FUTEX_WORD_ADDR 8192
+// Use scratch slot at MARKER_ADDR + 4096 (= 8192 today). Anchoring the
+// offset to MARKER_ADDR keeps the test robust if MARKER_ADDR ever moves;
+// mark_pass()/mark_fail() overwrites the first 64 bytes at MARKER_ADDR
+// on entry (see tests/conformance/syscall.h).
+#define FUTEX_WORD_ADDR (MARKER_ADDR + 4096)
 
 __attribute__((visibility("default")))
 void _start(void) {
