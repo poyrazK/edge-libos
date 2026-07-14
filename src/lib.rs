@@ -25,4 +25,8 @@ pub mod vfs;
 pub use dispatch::{dispatch, install_observer, syscall_name, SyscallObserver};
 pub use host::{add_to_linker, build_engine, build_store};
 pub use kernel::Kernel;
+pub use snapshot::{
+    apply_snapshot, apply_snapshot_kernel_state, apply_snapshot_to_memory, try_to_snapshot,
+    KernelSnapshot, MemoryPageSnapshot, SnapshotError, PAGE_SIZE_BYTES, SNAPSHOT_FORMAT_VERSION,
+};
 pub use sys::signal::SigAction;
