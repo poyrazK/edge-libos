@@ -20,12 +20,12 @@ use edge_libos::Kernel;
 
 const NR_FUTEX: i64 = 202;
 
-/// `FUTEX_WAIT = 0`, `FUTEX_WAKE = 1`, `FUTEX_PRIVATE_FLAG = 0x80`,
-/// `FUTEX_FD = 2`. The remaining ops (REQUEUE, CMP_REQUEUE, WAKE_OP,
-/// LOCK_PI*, WAIT_BITSET, WAKE_BITSET) all return `-ENOSYS`.
+/// `FUTEX_WAIT = 0`, `FUTEX_WAKE = 1`, `FUTEX_PRIVATE_FLAG = 0x80`.
+/// `FUTEX_FD = 2` and the remaining ops (REQUEUE, CMP_REQUEUE, WAKE_OP,
+/// LOCK_PI*, WAIT_BITSET, WAKE_BITSET) all return `-ENOSYS` — we hard-code
+/// the value `2` in the WAT below rather than threading a Rust const through.
 const FUTEX_WAIT: i64 = 0;
 const FUTEX_WAKE: i64 = 1;
-const FUTEX_FD: i64 = 2;
 const FUTEX_PRIVATE_FLAG: i64 = 0x80;
 
 /// WAT: write 1 to `4096`, then `futex_wait(4096, WAIT, 99, 0)` — value

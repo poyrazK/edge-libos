@@ -15,11 +15,8 @@ use std::process::Command;
 use anyhow::Result;
 
 fn write_tmp(name: &str, body: &str) -> std::path::PathBuf {
-    let final_path = std::env::temp_dir().join(format!(
-        "edge-libos-{}-{}",
-        std::process::id(),
-        name
-    ));
+    let final_path =
+        std::env::temp_dir().join(format!("edge-libos-{}-{}", std::process::id(), name));
     std::fs::write(&final_path, body).expect("write tmp");
     final_path
 }
@@ -87,7 +84,8 @@ read(3, \"hello\", 5) = 5
 write(1, \"hello\\n\", 6) = 6
 close(3) = 0
 ";
-    let trace = "{\"name\":\"openat\"}\n{\"name\":\"read\"}\n{\"name\":\"write\"}\n{\"name\":\"close\"}\n";
+    let trace =
+        "{\"name\":\"openat\"}\n{\"name\":\"read\"}\n{\"name\":\"write\"}\n{\"name\":\"close\"}\n";
     let bp = write_tmp("b3.txt", baseline);
     let tp = write_tmp("t3.json", trace);
     let out = Command::new("python3")
@@ -111,8 +109,7 @@ fn golden_baseline_parses_to_expected_syscall_count() -> Result<()> {
     // syscalls (the P0 surface, after Step 25-30 added legacy shims).
     // If somebody adds or removes a syscall this number should be
     // updated deliberately, not accidentally.
-    let baseline_text =
-        std::fs::read_to_string("tests/strace_baselines/baseline.boot.txt")?;
+    let baseline_text = std::fs::read_to_string("tests/strace_baselines/baseline.boot.txt")?;
     let count = baseline_text
         .lines()
         .filter(|l| {

@@ -228,10 +228,14 @@ fn poll_one(fds: &FdTable, fd: i32, events: i16) -> i16 {
         Err(_) => return POLLNVAL,
     };
     match res {
-        Resource::Stdin(p) => ready_pipe_read(events, !*p.closed.lock() || !p.buf.lock().is_empty()),
+        Resource::Stdin(p) => {
+            ready_pipe_read(events, !*p.closed.lock() || !p.buf.lock().is_empty())
+        }
         Resource::Stdout(_) | Resource::Stderr(_) => POLLOUT & events,
         Resource::File(_) => POLLIN | POLLOUT, // regular files are always ready
-        Resource::PipeRead(p) => ready_pipe_read(events, !p.buf.lock().is_empty() || *p.closed.lock()),
+        Resource::PipeRead(p) => {
+            ready_pipe_read(events, !p.buf.lock().is_empty() || *p.closed.lock())
+        }
         Resource::PipeWrite(_) => POLLOUT & events, // buf pipes are always writeable
         Resource::Socket(s) => ready_socket(events, s),
         // P1-7: epoll/eventfd fds aren't useful as poll targets — report
@@ -252,10 +256,7 @@ fn ready_pipe_read(events: i16, has_data_or_eof: bool) -> i16 {
     r
 }
 
-fn ready_socket(
-    events: i16,
-    s: &crate::fd::SharedSocket,
-) -> i16 {
+fn ready_socket(events: i16, s: &crate::fd::SharedSocket) -> i16 {
     let mut r: i16 = 0;
     // Stream sockets: connected ⇒ always POLLIN-ready (the recvfrom will
     // await real data via the lazy TcpStream). For a listener, no socket
@@ -371,18 +372,14 @@ pub async fn select(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
             }
             let in_read = match read_mask {
                 Some(b) => {
-                    let v = u64::from_le_bytes(
-                        b[word * 8..word * 8 + 8].try_into().unwrap(),
-                    );
+                    let v = u64::from_le_bytes(b[word * 8..word * 8 + 8].try_into().unwrap());
                     (v >> bit) & 1 != 0
                 }
                 None => false,
             };
             let in_write = match write_mask {
                 Some(b) => {
-                    let v = u64::from_le_bytes(
-                        b[word * 8..word * 8 + 8].try_into().unwrap(),
-                    );
+                    let v = u64::from_le_bytes(b[word * 8..word * 8 + 8].try_into().unwrap());
                     (v >> bit) & 1 != 0
                 }
                 None => false,
@@ -464,8 +461,7 @@ pub async fn select(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                 .enumerate()
                 .map(|(i, (fd, ev))| {
                     let off = i * POLLFD_SIZE;
-                    let revents =
-                        i16::from_le_bytes(bytes[off + 6..off + 8].try_into().unwrap());
+                    let revents = i16::from_le_bytes(bytes[off + 6..off + 8].try_into().unwrap());
                     (*fd, *ev, revents)
                 })
                 .collect()
@@ -580,7 +576,10 @@ mod tests {
         // at 4 (short), revents at 6 (short).
         assert_eq!(POLLFD_SIZE, 8);
         // Sanity: i32 + 2*i16 == 8.
-        assert_eq!(std::mem::size_of::<i32>() + 2 * std::mem::size_of::<i16>(), 8);
+        assert_eq!(
+            std::mem::size_of::<i32>() + 2 * std::mem::size_of::<i16>(),
+            8
+        );
     }
 
     // P2-C3 part 1: NR / FD_SET constants.

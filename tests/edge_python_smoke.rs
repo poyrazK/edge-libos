@@ -39,7 +39,9 @@ fn edge_python_propagates_stdout_and_exit_code() -> Result<()> {
     std::fs::write(&wasm_path, &bytes)?;
 
     let bin = env!("CARGO_BIN_EXE_edge-python");
-    let output = Command::new(bin).arg(wasm_path.to_str().unwrap()).output()?;
+    let output = Command::new(bin)
+        .arg(wasm_path.to_str().unwrap())
+        .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -83,7 +85,9 @@ fn edge_python_drains_stderr() -> Result<()> {
     std::fs::write(&wasm_path, &bytes)?;
 
     let bin = env!("CARGO_BIN_EXE_edge-python");
-    let output = Command::new(bin).arg(wasm_path.to_str().unwrap()).output()?;
+    let output = Command::new(bin)
+        .arg(wasm_path.to_str().unwrap())
+        .output()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert_eq!(

@@ -36,8 +36,8 @@ use anyhow::{Context, Result};
 use wasmtime::Linker;
 
 use edge_libos::{
-    add_to_linker, build_engine, build_store, install_observer, syscall_name,
-    Kernel, SyscallObserver,
+    add_to_linker, build_engine, build_store, install_observer, syscall_name, Kernel,
+    SyscallObserver,
 };
 
 /// One traced syscall.
@@ -141,7 +141,12 @@ fn main() -> Result<()> {
             e.ts_ns,
             e.nr,
             e.name,
-            e.args[0], e.args[1], e.args[2], e.args[3], e.args[4], e.args[5],
+            e.args[0],
+            e.args[1],
+            e.args[2],
+            e.args[3],
+            e.args[4],
+            e.args[5],
             e.ret,
         );
     }
@@ -158,8 +163,7 @@ fn main() -> Result<()> {
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
             .collect();
-        let baseline_static: BTreeSet<&str> =
-            baseline_names.iter().map(|s| s.as_str()).collect();
+        let baseline_static: BTreeSet<&str> = baseline_names.iter().map(|s| s.as_str()).collect();
         let missing: Vec<&&str> = baseline_static.difference(&names_seen).collect();
         let extra: Vec<&&str> = names_seen.difference(&baseline_static).collect();
         if missing.is_empty() {
@@ -227,10 +231,7 @@ fn read_marker(store: &wasmtime::Store<Kernel>) -> String {
 ///
 /// P2-A2: we use the standard `add_to_linker` (no custom dispatch) and
 /// install a thread-local `TraceObserver` for the duration of the run.
-async fn run_guest(
-    wasm_path: &str,
-    _script_args: &[String],
-) -> Result<(Vec<TraceEntry>, String)> {
+async fn run_guest(wasm_path: &str, _script_args: &[String]) -> Result<(Vec<TraceEntry>, String)> {
     let engine = build_engine()?;
     let mut linker: Linker<Kernel> = Linker::new(&engine);
     add_to_linker(&mut linker)?;
@@ -241,8 +242,8 @@ async fn run_guest(
 
     let kernel = Kernel::new(vec![], vec![]);
     let mut store = build_store(&engine, kernel);
-    let bytes = std::fs::read(wasm_path)
-        .map_err(|e| anyhow::anyhow!("reading {wasm_path}: {e}"))?;
+    let bytes =
+        std::fs::read(wasm_path).map_err(|e| anyhow::anyhow!("reading {wasm_path}: {e}"))?;
     let module = if bytes.len() >= 4 && &bytes[0..4] == b"\0asm" {
         wasmtime::Module::new(&engine, &bytes)?
     } else {

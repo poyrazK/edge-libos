@@ -50,13 +50,17 @@ artifact and requires `zig cc` + a git submodule — see `guest/build.sh`.
 
 ## Test totals
 
-- **42** Rust unit tests (in `#[cfg(test)]` modules under `src/`)
-- **158** Rust integration tests (across `tests/*.rs`)
-- **50** C conformance tests (`tests/conformance/*.c`, marker-enforced)
-- **Total: 250 tests, all green.**
+- **79** Rust unit tests (in `#[cfg(test)]` modules under `src/`)
+- **159** Rust integration tests (across `tests/*.rs`)
+- **101** C conformance tests (`tests/conformance/*.c`, marker-enforced)
+- **Total: 339 tests, all green.**
 
 P2-B4 added `statx(2)` + a C test. P2-B5 added `dup/dup2/dup3` +
-shared-state refactor + 5 new C tests.
+shared-state refactor + 5 new C tests. P2-C1+C2+C3 added identity,
+process, signal, time, ioctl, AF_UNIX sockets, sendmsg/recvmsg, ppoll,
+epoll_pwait, eventfd, getrandom, pipe2, close_range, sysinfo, times,
+and a literal CPython DoD gate. P2-D1 added the snapshot foundation
+(`postcard` + serde `KernelSnapshot` roundtrip).
 
 Source of truth: `bash tests/count_tests.sh`. The conformance runner
 also prints the total at the end of its run.

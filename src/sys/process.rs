@@ -78,10 +78,7 @@ pub async fn sched_yield() -> i64 {
 /// `sched_getaffinity(pid, len, mask_ptr)` — fill the cpu mask with
 /// "all CPUs" (a single 1 bit at position 0). Accepts self pid (0 or 1)
 /// only; other pids → -ESRCH.
-pub async fn sched_getaffinity(
-    caller: &mut Caller<'_, Kernel>,
-    a: [i64; 6],
-) -> i64 {
+pub async fn sched_getaffinity(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let pid = a[0];
     let len = a[1];
     let mask_ptr = a[2];
@@ -106,10 +103,7 @@ pub async fn sched_getaffinity(
 
 /// `prctl(option, ...)` — minimum set: PR_SET/GET_NAME, PR_GET/SET_DUMPABLE,
 /// PR_GET/SET_NO_NEW_PRIVS. Anything else returns -EINVAL.
-pub async fn prctl(
-    caller: &mut Caller<'_, Kernel>,
-    a: [i64; 6],
-) -> i64 {
+pub async fn prctl(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let option = a[0] as i32;
     let arg2 = a[1];
     let arg3 = a[2];
@@ -169,10 +163,7 @@ pub async fn prctl(
 /// `kill(pid, sig)` — single-process v1 only. We treat all pids as self;
 /// non-self pids return -ESRCH. The signal is recorded but not delivered
 /// (matching the rest of the signal surface).
-pub async fn kill(
-    _caller: &mut Caller<'_, Kernel>,
-    a: [i64; 6],
-) -> i64 {
+pub async fn kill(_caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let pid = a[0];
     let sig = a[1];
     if pid != 0 && pid != 1 {
@@ -187,10 +178,7 @@ pub async fn kill(
 
 /// `tgkill(tgid, tid, sig)` — same as kill for our single-process model.
 /// Non-self tgids/tids → -ESRCH.
-pub async fn tgkill(
-    _caller: &mut Caller<'_, Kernel>,
-    a: [i64; 6],
-) -> i64 {
+pub async fn tgkill(_caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let tgid = a[0];
     let tid = a[1];
     let sig = a[2];
@@ -204,7 +192,9 @@ pub async fn tgkill(
 }
 
 #[allow(dead_code)]
-fn _kill_perm() -> i64 { -EPERM }
+fn _kill_perm() -> i64 {
+    -EPERM
+}
 
 #[cfg(test)]
 mod tests {

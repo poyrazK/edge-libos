@@ -95,7 +95,9 @@ fn compute_time(caller: &Caller<'_, Kernel>, clockid: i64) -> Option<(i64, i64)>
             let nsec = now.timestamp_subsec_nanos() as i64;
             Some((sec, nsec))
         }
-        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_PROCESS_CPUTIME_ID
+        CLOCK_MONOTONIC
+        | CLOCK_MONOTONIC_RAW
+        | CLOCK_PROCESS_CPUTIME_ID
         | CLOCK_THREAD_CPUTIME_ID => {
             let elapsed = caller.data().started_at.elapsed();
             let total_ns = elapsed.as_nanos();
@@ -115,8 +117,11 @@ pub async fn clock_getres(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let tp = a[1];
     // Validate clockid first; honor same set as clock_gettime.
     match clockid {
-        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW
-        | CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {}
+        CLOCK_REALTIME
+        | CLOCK_MONOTONIC
+        | CLOCK_MONOTONIC_RAW
+        | CLOCK_PROCESS_CPUTIME_ID
+        | CLOCK_THREAD_CPUTIME_ID => {}
         _ => return -EINVAL,
     }
     if tp == 0 {
@@ -135,10 +140,7 @@ pub async fn clock_getres(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 /// * `flags == 0` — relative sleep; same as nanosleep.
 /// * `flags == TIMER_ABSTIME` — sleep until `req` is reached; if `req`
 ///   is in the past, return 0 immediately.
-pub async fn clock_nanosleep(
-    caller: &mut Caller<'_, Kernel>,
-    a: [i64; 6],
-) -> i64 {
+pub async fn clock_nanosleep(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let clockid = a[0];
     let flags = a[1] as i32;
     let req = a[2];
@@ -146,8 +148,11 @@ pub async fn clock_nanosleep(
 
     // Validate clockid; honor same set as clock_gettime.
     match clockid {
-        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW
-        | CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {}
+        CLOCK_REALTIME
+        | CLOCK_MONOTONIC
+        | CLOCK_MONOTONIC_RAW
+        | CLOCK_PROCESS_CPUTIME_ID
+        | CLOCK_THREAD_CPUTIME_ID => {}
         _ => return -EINVAL,
     }
 
@@ -265,14 +270,12 @@ pub async fn sysinfo(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     for b in bytes.iter_mut() {
         *b = 0;
     }
-    bytes[SYSINFO_UPTIME_OFF..SYSINFO_UPTIME_OFF + 8]
-        .copy_from_slice(&1_i64.to_le_bytes());
+    bytes[SYSINFO_UPTIME_OFF..SYSINFO_UPTIME_OFF + 8].copy_from_slice(&1_i64.to_le_bytes());
     bytes[SYSINFO_TOTALRAM_OFF..SYSINFO_TOTALRAM_OFF + 8]
         .copy_from_slice(&(1u64 << 30).to_le_bytes());
     bytes[SYSINFO_FREERAM_OFF..SYSINFO_FREERAM_OFF + 8]
         .copy_from_slice(&(1u64 << 30).to_le_bytes());
-    bytes[SYSINFO_PROCS_OFF..SYSINFO_PROCS_OFF + 8]
-        .copy_from_slice(&1_i64.to_le_bytes());
+    bytes[SYSINFO_PROCS_OFF..SYSINFO_PROCS_OFF + 8].copy_from_slice(&1_i64.to_le_bytes());
     0
 }
 

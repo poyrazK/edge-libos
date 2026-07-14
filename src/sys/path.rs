@@ -32,8 +32,8 @@ use std::path::PathBuf;
 
 use wasmtime::Caller;
 
-use crate::errno::{ENOSYS, EACCES, EBADF, ENOTDIR};
-use crate::fd::{AT_FDCWD, FdTable, Resource};
+use crate::errno::{EACCES, EBADF, ENOSYS, ENOTDIR};
+use crate::fd::{FdTable, Resource, AT_FDCWD};
 use crate::kernel::Kernel;
 use crate::vfs::{Vfs, VfsResult};
 
@@ -59,7 +59,11 @@ pub fn resolve(caller: &mut Caller<'_, Kernel>, dirfd: i64, path: &str) -> VfsRe
 
 /// Resolve against `cwd` (or absolute path). Snapshots `(root, cwd)` then
 /// delegates to `Vfs::resolve_path` with the original `dirfd`.
-fn resolve_via_cwd_or_root(caller: &mut Caller<'_, Kernel>, dirfd: i64, path: &str) -> VfsResult<PathBuf> {
+fn resolve_via_cwd_or_root(
+    caller: &mut Caller<'_, Kernel>,
+    dirfd: i64,
+    path: &str,
+) -> VfsResult<PathBuf> {
     let (root, cwd) = {
         let kern = caller.data();
         (kern.vfs.root.clone(), kern.vfs.cwd.clone())
@@ -165,7 +169,10 @@ mod tests {
         let d = TmpDir::new();
         File::create(d.0.join("foo")).unwrap();
         let kern = fresh_kernel(&d.0);
-        let vfs = Vfs { root: kern.vfs.root.clone(), cwd: kern.vfs.cwd.clone() };
+        let vfs = Vfs {
+            root: kern.vfs.root.clone(),
+            cwd: kern.vfs.cwd.clone(),
+        };
         let abs = vfs.resolve_path(AT_FDCWD, "foo").expect("resolve AT_FDCWD");
         assert!(abs.ends_with("foo"));
         assert!(abs.starts_with(&vfs.root));
@@ -179,8 +186,13 @@ mod tests {
         File::create(&file_path).unwrap();
         let canon = std::fs::canonicalize(&file_path).unwrap();
         let kern = fresh_kernel(&d.0);
-        let vfs = Vfs { root: kern.vfs.root.clone(), cwd: kern.vfs.cwd.clone() };
-        let abs = vfs.resolve_path(AT_FDCWD, canon.to_str().unwrap()).expect("resolve absolute");
+        let vfs = Vfs {
+            root: kern.vfs.root.clone(),
+            cwd: kern.vfs.cwd.clone(),
+        };
+        let abs = vfs
+            .resolve_path(AT_FDCWD, canon.to_str().unwrap())
+            .expect("resolve absolute");
         assert_eq!(abs, canon);
     }
 
@@ -223,7 +235,10 @@ mod tests {
         File::create(sub.join("child")).unwrap();
 
         let kern = fresh_kernel(&d.0);
-        let vfs = Vfs { root: kern.vfs.root.clone(), cwd: kern.vfs.cwd.clone() };
+        let vfs = Vfs {
+            root: kern.vfs.root.clone(),
+            cwd: kern.vfs.cwd.clone(),
+        };
 
         // Simulate the dirfd branch: dir_path = sub, path = "child".
         let dir_path = sub.clone();
@@ -239,7 +254,10 @@ mod tests {
         // AT_FDCWD = -100. Anything else < 0 is unsupported.
         let d = TmpDir::new();
         let kern = fresh_kernel(&d.0);
-        let vfs = Vfs { root: kern.vfs.root.clone(), cwd: kern.vfs.cwd.clone() };
+        let vfs = Vfs {
+            root: kern.vfs.root.clone(),
+            cwd: kern.vfs.cwd.clone(),
+        };
         let r = vfs.resolve_path(-50, "foo");
         assert_eq!(r, Err(-ENOSYS));
     }

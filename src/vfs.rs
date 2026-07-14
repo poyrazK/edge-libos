@@ -14,12 +14,18 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use crate::errno::{EACCES, EFAULT, EIO, ELOOP, ENOENT, ENOTDIR};
 
 /// Result alias — `Ok(T)` or `Err(-errno)`.
 pub type VfsResult<T> = Result<T, i64>;
 
 /// Per-process VFS state.
+///
+/// P2-D1: derives `Serialize`/`Deserialize` so `KernelSnapshot` can
+/// record cwd/root without a custom impl.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Vfs {
     /// Preopen root. All paths resolve under this. Cannot escape via `..`.
     pub root: PathBuf,
@@ -174,12 +180,7 @@ impl Vfs {
     /// to the dir's own encoding, not the guest buffer). Caller controls
     /// the buffer size via `len`. Returns the encoded slice and the total
     /// length of the dir's encoding so the caller can advance its position.
-    pub fn getdents_at(
-        &self,
-        abs: &Path,
-        start: usize,
-        len: usize,
-    ) -> VfsResult<(Vec<u8>, usize)> {
+    pub fn getdents_at(&self, abs: &Path, start: usize, len: usize) -> VfsResult<(Vec<u8>, usize)> {
         if len == 0 {
             return Err(-(crate::errno::EINVAL));
         }
@@ -264,8 +265,10 @@ impl Stat {
         let mode = mode_from(meta.file_type(), meta.permissions().mode());
         let (atime, atime_nsec) = time_split(meta.accessed().unwrap_or(UNIX_EPOCH));
         let (mtime, mtime_nsec) = time_split(meta.modified().unwrap_or(UNIX_EPOCH));
-        let (ctime, ctime_nsec) =
-            time_split(meta.created().unwrap_or(meta.modified().unwrap_or(UNIX_EPOCH)));
+        let (ctime, ctime_nsec) = time_split(
+            meta.created()
+                .unwrap_or(meta.modified().unwrap_or(UNIX_EPOCH)),
+        );
         Self {
             st_dev: 0,
             st_ino: meta.ino(),
@@ -387,14 +390,14 @@ fn time_split(t: SystemTime) -> (u64, u32) {
 
 fn dirent_type(ft: Option<&FileType>) -> u8 {
     match ft {
-        Some(t) if t.is_dir() => 4, // DT_DIR
-        Some(t) if t.is_file() => 8, // DT_REG
-        Some(t) if t.is_symlink() => 10, // DT_LNK
-        Some(t) if FileTypeExt::is_char_device(t) => 2, // DT_CHR
+        Some(t) if t.is_dir() => 4,                      // DT_DIR
+        Some(t) if t.is_file() => 8,                     // DT_REG
+        Some(t) if t.is_symlink() => 10,                 // DT_LNK
+        Some(t) if FileTypeExt::is_char_device(t) => 2,  // DT_CHR
         Some(t) if FileTypeExt::is_block_device(t) => 6, // DT_BLK
-        Some(t) if t.is_fifo() => 1, // DT_FIFO
-        Some(t) if t.is_socket() => 12, // DT_SOCK
-        _ => 0,                    // DT_UNKNOWN
+        Some(t) if t.is_fifo() => 1,                     // DT_FIFO
+        Some(t) if t.is_socket() => 12,                  // DT_SOCK
+        _ => 0,                                          // DT_UNKNOWN
     }
 }
 

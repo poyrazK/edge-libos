@@ -40,9 +40,9 @@ const POISON_PTR: &[i64] = &[
     i64::MIN,
     i64::MAX,
     1 << 33,
-    65_536,        // 1 page = exactly mem_size
-    65_537,        // mem_size + 1
-    131_072,       // 2 pages
+    65_536,  // 1 page = exactly mem_size
+    65_537,  // mem_size + 1
+    131_072, // 2 pages
 ];
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
@@ -61,9 +61,8 @@ async fn dispatch_argv(
     a: [i64; 6],
 ) -> Result<i64> {
     let (mut store, instance) = common::instantiate_async(engine, linker, module).await?;
-    let f = instance.get_typed_func::<(i64, i64, i64, i64, i64, i64, i64), i64>(
-        &mut store, "call",
-    )?;
+    let f =
+        instance.get_typed_func::<(i64, i64, i64, i64, i64, i64, i64), i64>(&mut store, "call")?;
     let ret = f
         .call_async(&mut store, (nr, a[0], a[1], a[2], a[3], a[4], a[5]))
         .await?;
@@ -109,7 +108,9 @@ fn fuzz_read_bad_buf_pointer() -> Result<()> {
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     for ptr in POISON_PTR {
         let r = block_on(assert_efault_or_safe(
-            &engine, &linker, &module,
+            &engine,
+            &linker,
+            &module,
             edge_libos::sys::file::NR_READ as i64,
             [0, *ptr, 16, 0, 0, 0],
             "read",
@@ -126,7 +127,9 @@ fn fuzz_write_bad_buf_pointer() -> Result<()> {
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     for ptr in POISON_PTR {
         let r = block_on(assert_efault_or_safe(
-            &engine, &linker, &module,
+            &engine,
+            &linker,
+            &module,
             edge_libos::sys::file::NR_WRITE as i64,
             [1, *ptr, 16, 0, 0, 0],
             "write",
@@ -142,7 +145,9 @@ fn fuzz_openat_bad_path_pointer() -> Result<()> {
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     for ptr in POISON_PTR {
         let r = block_on(assert_efault_or_safe(
-            &engine, &linker, &module,
+            &engine,
+            &linker,
+            &module,
             edge_libos::sys::file::NR_OPENAT as i64,
             [-100, *ptr, 0, 0, 0, 0], // AT_FDCWD, path, flags, mode
             "openat",
@@ -158,7 +163,9 @@ fn fuzz_fstat_bad_statbuf_pointer() -> Result<()> {
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     for ptr in POISON_PTR {
         let r = block_on(assert_efault_or_safe(
-            &engine, &linker, &module,
+            &engine,
+            &linker,
+            &module,
             edge_libos::sys::file::NR_FSTAT as i64,
             [1, *ptr, 0, 0, 0, 0], // fd=1 (stdout, valid), bad statbuf ptr
             "fstat",
@@ -174,7 +181,9 @@ fn fuzz_getdents64_bad_buf_pointer() -> Result<()> {
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     for ptr in POISON_PTR {
         let r = block_on(assert_efault_or_safe(
-            &engine, &linker, &module,
+            &engine,
+            &linker,
+            &module,
             edge_libos::sys::file::NR_GETDENTS64 as i64,
             [1, *ptr, 1024, 0, 0, 0], // fd=1, bad buf, len
             "getdents64",
@@ -190,7 +199,9 @@ fn fuzz_clock_gettime_bad_timespec_pointer() -> Result<()> {
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     for ptr in POISON_PTR {
         let r = block_on(assert_efault_or_safe(
-            &engine, &linker, &module,
+            &engine,
+            &linker,
+            &module,
             edge_libos::sys::time::NR_CLOCK_GETTIME as i64,
             [0, *ptr, 0, 0, 0, 0], // clockid=REALTIME, bad tp ptr
             "clock_gettime",
@@ -206,7 +217,9 @@ fn fuzz_gettimeofday_bad_timeval_pointer() -> Result<()> {
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     for ptr in POISON_PTR {
         let r = block_on(assert_efault_or_safe(
-            &engine, &linker, &module,
+            &engine,
+            &linker,
+            &module,
             edge_libos::sys::time::NR_GETTIMEOFDAY as i64,
             [*ptr, 0, 0, 0, 0, 0], // bad tp ptr, tz ignored
             "gettimeofday",
@@ -223,7 +236,9 @@ fn fuzz_nanosleep_bad_req_pointer() -> Result<()> {
     for ptr in POISON_PTR {
         // rem=0 (NULL) to avoid second-pointer exposure in the test.
         let r = block_on(assert_efault_or_safe(
-            &engine, &linker, &module,
+            &engine,
+            &linker,
+            &module,
             edge_libos::sys::time::NR_NANOSLEEP as i64,
             [*ptr, 0, 0, 0, 0, 0], // bad req ptr, rem=NULL
             "nanosleep",
@@ -239,7 +254,9 @@ fn fuzz_getrandom_bad_buf_pointer() -> Result<()> {
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     for ptr in POISON_PTR {
         let r = block_on(assert_efault_or_safe(
-            &engine, &linker, &module,
+            &engine,
+            &linker,
+            &module,
             edge_libos::sys::random::NR_GETRANDOM as i64,
             [*ptr, 16, 0, 0, 0, 0], // bad buf ptr, len=16, no flags
             "getrandom",
@@ -255,7 +272,9 @@ fn fuzz_rt_sigaction_bad_act_pointer() -> Result<()> {
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     for ptr in POISON_PTR {
         let r = block_on(assert_efault_or_safe(
-            &engine, &linker, &module,
+            &engine,
+            &linker,
+            &module,
             edge_libos::sys::signal::NR_RT_SIGACTION as i64,
             [2 /* SIGINT */, *ptr, 0, 8, 0, 0], // signum, bad act, oldact=NULL, size=8
             "rt_sigaction",
@@ -271,7 +290,9 @@ fn fuzz_rt_sigprocmask_bad_set_pointer() -> Result<()> {
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     for ptr in POISON_PTR {
         let r = block_on(assert_efault_or_safe(
-            &engine, &linker, &module,
+            &engine,
+            &linker,
+            &module,
             edge_libos::sys::signal::NR_RT_SIGPROCMASK as i64,
             [0, *ptr, 0, 8, 0, 0], // SIG_BLOCK, bad set, oldset=NULL, size=8
             "rt_sigprocmask",
@@ -287,7 +308,9 @@ fn fuzz_pipe2_bad_fdarray_pointer() -> Result<()> {
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     for ptr in POISON_PTR {
         let r = block_on(assert_efault_or_safe(
-            &engine, &linker, &module,
+            &engine,
+            &linker,
+            &module,
             edge_libos::sys::file::NR_PIPE2 as i64,
             [*ptr, 0, 0, 0, 0, 0], // bad fdarray ptr, flags=0
             "pipe2",
@@ -304,7 +327,9 @@ fn fuzz_bind_bad_sockaddr_pointer() -> Result<()> {
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     for ptr in POISON_PTR {
         let r = block_on(assert_efault_or_safe(
-            &engine, &linker, &module,
+            &engine,
+            &linker,
+            &module,
             edge_libos::sys::socket::NR_BIND as i64,
             [3 /*fd*/, *ptr, 16, 0, 0, 0],
             "bind",
@@ -323,9 +348,15 @@ fn fuzz_listen_no_pointer_args() -> Result<()> {
     let (engine, linker) = common::engine_and_linker()?;
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     let r = block_on(assert_efault_or_safe(
-        &engine, &linker, &module,
+        &engine,
+        &linker,
+        &module,
         edge_libos::sys::socket::NR_LISTEN as i64,
-        [0 /*fd (stdin, not a socket)*/, 5 /*backlog*/, 0, 0, 0, 0],
+        [
+            0, /*fd (stdin, not a socket)*/
+            5, /*backlog*/
+            0, 0, 0, 0,
+        ],
         "listen",
     ))?;
     let _ = r;
@@ -340,9 +371,17 @@ fn fuzz_setsockopt_bad_optval_pointer() -> Result<()> {
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     for ptr in POISON_PTR {
         let r = block_on(assert_efault_or_safe(
-            &engine, &linker, &module,
+            &engine,
+            &linker,
+            &module,
             edge_libos::sys::socket::NR_SETSOCKOPT as i64,
-            [3 /*fd*/, 1 /*SOL_SOCKET*/, 2 /*SO_REUSEADDR*/, *ptr, 4 /*optlen*/, 0],
+            [
+                3, /*fd*/
+                1, /*SOL_SOCKET*/
+                2, /*SO_REUSEADDR*/
+                *ptr, 4, /*optlen*/
+                0,
+            ],
             "setsockopt",
         ))?;
         let _ = r;
@@ -358,9 +397,16 @@ fn fuzz_getsockopt_bad_optval_pointer() -> Result<()> {
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     for ptr in POISON_PTR {
         let r = block_on(assert_efault_or_safe(
-            &engine, &linker, &module,
+            &engine,
+            &linker,
+            &module,
             edge_libos::sys::socket::NR_GETSOCKOPT as i64,
-            [3 /*fd*/, 1 /*SOL_SOCKET*/, 4 /*SO_ERROR*/, *ptr, 4, 0],
+            [
+                3, /*fd*/
+                1, /*SOL_SOCKET*/
+                4, /*SO_ERROR*/
+                *ptr, 4, 0,
+            ],
             "getsockopt",
         ))?;
         let _ = r;
@@ -375,7 +421,9 @@ fn fuzz_getsockname_bad_addr_pointer() -> Result<()> {
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     for ptr in POISON_PTR {
         let r = block_on(assert_efault_or_safe(
-            &engine, &linker, &module,
+            &engine,
+            &linker,
+            &module,
             edge_libos::sys::socket::NR_GETSOCKNAME as i64,
             [3 /*fd*/, *ptr, 16, 0, 0, 0],
             "getsockname",
@@ -392,7 +440,9 @@ fn fuzz_getpeername_bad_addr_pointer() -> Result<()> {
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     for ptr in POISON_PTR {
         let r = block_on(assert_efault_or_safe(
-            &engine, &linker, &module,
+            &engine,
+            &linker,
+            &module,
             edge_libos::sys::socket::NR_GETPEERNAME as i64,
             [3 /*fd*/, *ptr, 16, 0, 0, 0],
             "getpeername",
@@ -409,7 +459,9 @@ fn fuzz_poll_bad_fds_pointer() -> Result<()> {
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     for ptr in POISON_PTR {
         let r = block_on(assert_efault_or_safe(
-            &engine, &linker, &module,
+            &engine,
+            &linker,
+            &module,
             edge_libos::sys::poll::NR_POLL as i64,
             [*ptr, 1, 0, 0, 0, 0],
             "poll",
@@ -426,7 +478,9 @@ fn fuzz_epoll_create1_no_pointer_args() -> Result<()> {
     let (engine, linker) = common::engine_and_linker()?;
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     let ret = block_on(dispatch_argv(
-        &engine, &linker, &module,
+        &engine,
+        &linker,
+        &module,
         edge_libos::sys::epoll::NR_EPOLL_CREATE1 as i64,
         [0 /*flags*/, 0, 0, 0, 0, 0],
     ))?;
@@ -451,9 +505,16 @@ fn fuzz_epoll_ctl_bad_event_pointer() -> Result<()> {
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     for ptr in POISON_PTR {
         let r = block_on(assert_efault_or_safe(
-            &engine, &linker, &module,
+            &engine,
+            &linker,
+            &module,
             edge_libos::sys::epoll::NR_EPOLL_CTL as i64,
-            [9999 /*epfd*/, 1 /*ADD*/, 1 /*fd*/, *ptr, 0, 0],
+            [
+                9999, /*epfd*/
+                1,    /*ADD*/
+                1,    /*fd*/
+                *ptr, 0, 0,
+            ],
             "epoll_ctl",
         ))?;
         let _ = r;
@@ -470,7 +531,9 @@ fn fuzz_epoll_wait_bad_events_pointer() -> Result<()> {
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     for ptr in POISON_PTR {
         let r = block_on(assert_efault_or_safe(
-            &engine, &linker, &module,
+            &engine,
+            &linker,
+            &module,
             edge_libos::sys::epoll::NR_EPOLL_WAIT as i64,
             [9999 /*epfd*/, *ptr, 4, 0, 0, 0],
             "epoll_wait",
@@ -487,7 +550,9 @@ fn fuzz_eventfd2_no_pointer_args() -> Result<()> {
     let (engine, linker) = common::engine_and_linker()?;
     let module = common::compile_wat(&engine, CALLER_WAT)?;
     let ret = block_on(dispatch_argv(
-        &engine, &linker, &module,
+        &engine,
+        &linker,
+        &module,
         edge_libos::sys::eventfd::NR_EVENTFD2 as i64,
         [0 /*initval*/, 0, 0, 0, 0, 0],
     ))?;
@@ -510,66 +575,156 @@ fn fuzz_overflow_ptr_plus_len_every_pointer_syscall() -> Result<()> {
     let huge = i64::MAX / 2;
 
     let cases: &[(u32, &str, [i64; 6])] = &[
-        (edge_libos::sys::file::NR_READ, "read",
-         [0, huge, huge, 0, 0, 0]),
-        (edge_libos::sys::file::NR_WRITE, "write",
-         [1, huge, huge, 0, 0, 0]),
-        (edge_libos::sys::file::NR_OPENAT, "openat",
-         [-100, huge, 0, 0, 0, 0]),
-        (edge_libos::sys::file::NR_FSTAT, "fstat",
-         [1, huge, 0, 0, 0, 0]),
-        (edge_libos::sys::file::NR_GETDENTS64, "getdents64",
-         [1, huge, huge, 0, 0, 0]),
-        (edge_libos::sys::time::NR_CLOCK_GETTIME, "clock_gettime",
-         [0, huge, 0, 0, 0, 0]),
-        (edge_libos::sys::time::NR_GETTIMEOFDAY, "gettimeofday",
-         [huge, 0, 0, 0, 0, 0]),
-        (edge_libos::sys::time::NR_NANOSLEEP, "nanosleep",
-         [huge, 0, 0, 0, 0, 0]),
-        (edge_libos::sys::random::NR_GETRANDOM, "getrandom",
-         [huge, huge, 0, 0, 0, 0]),
-        (edge_libos::sys::signal::NR_RT_SIGACTION, "rt_sigaction",
-         [2, huge, 0, 8, 0, 0]),
-        (edge_libos::sys::signal::NR_RT_SIGPROCMASK, "rt_sigprocmask",
-         [0, huge, 0, 8, 0, 0]),
-        (edge_libos::sys::file::NR_PIPE2, "pipe2",
-         [huge, 0, 0, 0, 0, 0]),
-        (edge_libos::sys::file::NR_PIPE, "pipe",
-         [huge, 0, 0, 0, 0, 0]),
-        (edge_libos::sys::file::NR_OPEN, "open",
-         [huge, 0, 0, 0, 0, 0]),
-        (edge_libos::sys::file::NR_STAT, "stat",
-         [huge, huge, 0, 0, 0, 0]),
-        (edge_libos::sys::file::NR_LSTAT, "lstat",
-         [huge, huge, 0, 0, 0, 0]),
-        (edge_libos::sys::file::NR_GETCWD, "getcwd",
-         [huge, 256, 0, 0, 0, 0]),
-        (edge_libos::sys::file::NR_READV, "readv",
-         [1, huge, huge, 0, 0, 0]),
-        (edge_libos::sys::file::NR_WRITEV, "writev",
-         [1, huge, huge, 0, 0, 0]),
-        (edge_libos::sys::socket::NR_BIND, "bind",
-         [3, huge, huge, 0, 0, 0]),
-        (edge_libos::sys::socket::NR_SETSOCKOPT, "setsockopt",
-         [3, 1, 2, huge, huge, 0]),
-        (edge_libos::sys::socket::NR_GETSOCKOPT, "getsockopt",
-         [3, 1, 4, huge, huge, 0]),
-        (edge_libos::sys::socket::NR_GETSOCKNAME, "getsockname",
-         [3, huge, huge, 0, 0, 0]),
-        (edge_libos::sys::socket::NR_GETPEERNAME, "getpeername",
-         [3, huge, huge, 0, 0, 0]),
-        (edge_libos::sys::poll::NR_POLL, "poll",
-         [huge, 1, 0, 0, 0, 0]),
-        (edge_libos::sys::epoll::NR_EPOLL_CTL, "epoll_ctl",
-         [huge, 1, 1, huge, 0, 0]),
-        (edge_libos::sys::epoll::NR_EPOLL_WAIT, "epoll_wait",
-         [huge, huge, 4, 0, 0, 0]),
-        (edge_libos::sys::epoll::NR_EPOLL_CREATE1, "epoll_create1",
-         [0, 0, 0, 0, 0, 0]),
-        (edge_libos::sys::eventfd::NR_EVENTFD2, "eventfd2",
-         [0, 0, 0, 0, 0, 0]),
-        (edge_libos::sys::futex::NR_FUTEX, "futex",
-         [100_000_000, 0, 0, 0, 0, 0]),
+        (
+            edge_libos::sys::file::NR_READ,
+            "read",
+            [0, huge, huge, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::file::NR_WRITE,
+            "write",
+            [1, huge, huge, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::file::NR_OPENAT,
+            "openat",
+            [-100, huge, 0, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::file::NR_FSTAT,
+            "fstat",
+            [1, huge, 0, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::file::NR_GETDENTS64,
+            "getdents64",
+            [1, huge, huge, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::time::NR_CLOCK_GETTIME,
+            "clock_gettime",
+            [0, huge, 0, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::time::NR_GETTIMEOFDAY,
+            "gettimeofday",
+            [huge, 0, 0, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::time::NR_NANOSLEEP,
+            "nanosleep",
+            [huge, 0, 0, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::random::NR_GETRANDOM,
+            "getrandom",
+            [huge, huge, 0, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::signal::NR_RT_SIGACTION,
+            "rt_sigaction",
+            [2, huge, 0, 8, 0, 0],
+        ),
+        (
+            edge_libos::sys::signal::NR_RT_SIGPROCMASK,
+            "rt_sigprocmask",
+            [0, huge, 0, 8, 0, 0],
+        ),
+        (
+            edge_libos::sys::file::NR_PIPE2,
+            "pipe2",
+            [huge, 0, 0, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::file::NR_PIPE,
+            "pipe",
+            [huge, 0, 0, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::file::NR_OPEN,
+            "open",
+            [huge, 0, 0, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::file::NR_STAT,
+            "stat",
+            [huge, huge, 0, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::file::NR_LSTAT,
+            "lstat",
+            [huge, huge, 0, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::file::NR_GETCWD,
+            "getcwd",
+            [huge, 256, 0, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::file::NR_READV,
+            "readv",
+            [1, huge, huge, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::file::NR_WRITEV,
+            "writev",
+            [1, huge, huge, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::socket::NR_BIND,
+            "bind",
+            [3, huge, huge, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::socket::NR_SETSOCKOPT,
+            "setsockopt",
+            [3, 1, 2, huge, huge, 0],
+        ),
+        (
+            edge_libos::sys::socket::NR_GETSOCKOPT,
+            "getsockopt",
+            [3, 1, 4, huge, huge, 0],
+        ),
+        (
+            edge_libos::sys::socket::NR_GETSOCKNAME,
+            "getsockname",
+            [3, huge, huge, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::socket::NR_GETPEERNAME,
+            "getpeername",
+            [3, huge, huge, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::poll::NR_POLL,
+            "poll",
+            [huge, 1, 0, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::epoll::NR_EPOLL_CTL,
+            "epoll_ctl",
+            [huge, 1, 1, huge, 0, 0],
+        ),
+        (
+            edge_libos::sys::epoll::NR_EPOLL_WAIT,
+            "epoll_wait",
+            [huge, huge, 4, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::epoll::NR_EPOLL_CREATE1,
+            "epoll_create1",
+            [0, 0, 0, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::eventfd::NR_EVENTFD2,
+            "eventfd2",
+            [0, 0, 0, 0, 0, 0],
+        ),
+        (
+            edge_libos::sys::futex::NR_FUTEX,
+            "futex",
+            [100_000_000, 0, 0, 0, 0, 0],
+        ),
     ];
     for (nr, name, args) in cases {
         // epoll_create1 + eventfd2 have no pointer args; they always
@@ -578,11 +733,7 @@ fn fuzz_overflow_ptr_plus_len_every_pointer_syscall() -> Result<()> {
         if *nr == edge_libos::sys::epoll::NR_EPOLL_CREATE1
             || *nr == edge_libos::sys::eventfd::NR_EVENTFD2
         {
-            let ret = block_on(dispatch_argv(
-                &engine, &linker, &module,
-                *nr as i64,
-                *args,
-            ))?;
+            let ret = block_on(dispatch_argv(&engine, &linker, &module, *nr as i64, *args))?;
             assert!(
                 ret >= 3
                     || ret == -edge_libos::errno::EFAULT
@@ -594,10 +745,7 @@ fn fuzz_overflow_ptr_plus_len_every_pointer_syscall() -> Result<()> {
             continue;
         }
         let ret = block_on(assert_efault_or_safe(
-            &engine, &linker, &module,
-            *nr as i64,
-            *args,
-            name,
+            &engine, &linker, &module, *nr as i64, *args, name,
         ))?;
         let _ = ret;
     }
@@ -613,7 +761,9 @@ fn fuzz_i64_min_pointer_returns_efault_not_panic() -> Result<()> {
     let module = common::compile_wat(&engine, CALLER_WAT)?;
 
     let ret = block_on(dispatch_argv(
-        &engine, &linker, &module,
+        &engine,
+        &linker,
+        &module,
         edge_libos::sys::file::NR_WRITE as i64,
         [1, i64::MIN, 16, 0, 0, 0],
     ))?;

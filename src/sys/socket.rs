@@ -126,14 +126,13 @@ pub async fn socket(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     };
 
     let inner = if family == AF_UNIX {
-        std::sync::Arc::new(parking_lot::Mutex::new(SocketInner::new_unix(kind, nonblock)))
+        std::sync::Arc::new(parking_lot::Mutex::new(SocketInner::new_unix(
+            kind, nonblock,
+        )))
     } else {
         std::sync::Arc::new(parking_lot::Mutex::new(SocketInner::new(kind, nonblock)))
     };
-    let fd = caller
-        .data_mut()
-        .fds
-        .insert(Resource::Socket(inner));
+    let fd = caller.data_mut().fds.insert(Resource::Socket(inner));
     fd as i64
 }
 
@@ -166,7 +165,9 @@ pub fn socket_for_test(
     } else {
         SocketInner::new(kind, false)
     };
-    Ok(fds.insert(Resource::Socket(std::sync::Arc::new(parking_lot::Mutex::new(inner)))))
+    Ok(fds.insert(Resource::Socket(std::sync::Arc::new(
+        parking_lot::Mutex::new(inner),
+    ))))
 }
 
 #[cfg(test)]
@@ -187,21 +188,31 @@ mod tests {
     #[test]
     fn socket_unknown_family_returns_eafnosupport() {
         let mut fds = FdTable::empty();
-        assert_eq!(socket_for_test(&mut fds, 9999, SOCK_STREAM), Err(-EAFNOSUPPORT));
+        assert_eq!(
+            socket_for_test(&mut fds, 9999, SOCK_STREAM),
+            Err(-EAFNOSUPPORT)
+        );
     }
 
     #[test]
     fn socket_inet_seqpacket_returns_eprotonosupport() {
         let mut fds = FdTable::empty();
         // 0o205 = SOCK_SEQPACKET on Linux. Not in our P1 set.
-        assert_eq!(socket_for_test(&mut fds, AF_INET, 0o205), Err(-EPROTONOSUPPORT));
+        assert_eq!(
+            socket_for_test(&mut fds, AF_INET, 0o205),
+            Err(-EPROTONOSUPPORT)
+        );
     }
 }
 
 /// Parse a `sockaddr_in` (16 bytes) or `sockaddr_in6` (28 bytes) from the
 /// guest pointer. Returns `Err(-EINVAL)` on a bad family or truncated
 /// `addrlen`; `Err(-EAFNOSUPPORT)` for families we don't model yet.
-fn parse_sockaddr(caller: &mut Caller<'_, Kernel>, addr_ptr: i64, addr_len: i64) -> Result<SockAddr, i64> {
+fn parse_sockaddr(
+    caller: &mut Caller<'_, Kernel>,
+    addr_ptr: i64,
+    addr_len: i64,
+) -> Result<SockAddr, i64> {
     if addr_ptr == 0 || addr_len == 0 {
         return Err(-(crate::errno::EDESTADDRREQ)); // no address supplied
     }
@@ -550,9 +561,12 @@ pub async fn accept4(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let mut accepted = SocketInner::from_accepted(stream, kind, sock_nonblock || parent_nonblock);
     // Record the peer address for `getpeername`.
     accepted.peer_addr = Some(peer);
-    let new_fd = caller.data_mut().fds.insert(Resource::Socket(std::sync::Arc::new(
-        parking_lot::Mutex::new(accepted),
-    )));
+    let new_fd = caller
+        .data_mut()
+        .fds
+        .insert(Resource::Socket(std::sync::Arc::new(
+            parking_lot::Mutex::new(accepted),
+        )));
     new_fd as i64
 }
 
@@ -609,8 +623,7 @@ async fn accept4_unix(
                 };
                 let std_l = l.into_std().expect("listener into_std");
                 let cloned = std_l.try_clone().expect("std listener try_clone");
-                let tokio_cloned =
-                    tokio::net::UnixListener::from_std(cloned).expect("from_std");
+                let tokio_cloned = tokio::net::UnixListener::from_std(cloned).expect("from_std");
                 // Put the original back so the next accept finds it.
                 unix.listener = Some(tokio::net::UnixListener::from_std(std_l).expect("from_std"));
                 tokio_cloned
@@ -665,9 +678,12 @@ async fn accept4_unix(
             accepted.peer_addr_unix = Some(sa);
         }
     }
-    let new_fd = caller.data_mut().fds.insert(Resource::Socket(std::sync::Arc::new(
-        parking_lot::Mutex::new(accepted),
-    )));
+    let new_fd = caller
+        .data_mut()
+        .fds
+        .insert(Resource::Socket(std::sync::Arc::new(
+            parking_lot::Mutex::new(accepted),
+        )));
     new_fd as i64
 }
 
@@ -785,7 +801,8 @@ async fn connect_v4(caller: &mut Caller<'_, Kernel>, fd: u32, addr: SockAddr) ->
             // Record the error on the socket for getsockopt(SO_ERROR).
             // P1-6: getsockopt will surface this and clear it.
             if let Ok(Resource::Socket(s)) = caller.data().fds.get(fd) {
-                s.lock().last_error
+                s.lock()
+                    .last_error
                     .store(errno as i32, std::sync::atomic::Ordering::Relaxed);
             }
             return -errno;
@@ -849,12 +866,18 @@ pub async fn socketpair(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     a_inner.stream_unix = Some(a_stream);
     let mut b_inner = SocketInner::new_unix(kind, false);
     b_inner.stream_unix = Some(b_stream);
-    let a_fd = caller.data_mut().fds.insert(Resource::Socket(std::sync::Arc::new(
-        parking_lot::Mutex::new(a_inner),
-    )));
-    let b_fd = caller.data_mut().fds.insert(Resource::Socket(std::sync::Arc::new(
-        parking_lot::Mutex::new(b_inner),
-    )));
+    let a_fd = caller
+        .data_mut()
+        .fds
+        .insert(Resource::Socket(std::sync::Arc::new(
+            parking_lot::Mutex::new(a_inner),
+        )));
+    let b_fd = caller
+        .data_mut()
+        .fds
+        .insert(Resource::Socket(std::sync::Arc::new(
+            parking_lot::Mutex::new(b_inner),
+        )));
 
     if let Ok(buf) = mem::guest_slice_mut(caller, sv_ptr, 8) {
         buf[0..4].copy_from_slice(&a_fd.to_le_bytes());
@@ -883,7 +906,7 @@ pub async fn sendto(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let buf_ptr = a[1];
     let buf_len_raw = a[2];
     let _flags = a[3] as i32; // ignored in P1-5
-    let _addr_ptr = a[4];    // ignored for TCP
+    let _addr_ptr = a[4]; // ignored for TCP
     let _addrlen = a[5];
 
     // P2-C3 part 2: AF_UNIX dispatch.
@@ -1219,7 +1242,7 @@ pub async fn getsockopt(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let value: i32 = {
         let fds_table = &caller.data().fds;
         match (level, optname) {
-            (SOL_SOCKET, SO_TYPE) => 1, // SOCK_STREAM (only stream modeled)
+            (SOL_SOCKET, SO_TYPE) => 1,   // SOCK_STREAM (only stream modeled)
             (SOL_SOCKET, SO_DOMAIN) => 2, // AF_INET
             (SOL_SOCKET, SO_ERROR) => match fds_table.get(fd) {
                 Ok(Resource::Socket(s)) => s
@@ -1227,7 +1250,7 @@ pub async fn getsockopt(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                     .last_error
                     .swap(0, std::sync::atomic::Ordering::Relaxed),
                 _ => 0,
-            }
+            },
             (SOL_SOCKET, SO_ACCEPTCONN) => match fds_table.get(fd) {
                 Ok(Resource::Socket(s)) => s.lock().is_acceptor as i32,
                 _ => 0,
@@ -1358,12 +1381,9 @@ pub async fn getsockname(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
             Ok(Resource::Socket(s)) => {
                 let gs = s.lock();
                 match &gs.bound {
-                    Some(crate::fd::SockAddr::V4 { port, addr }) => {
-                        std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
-                            std::net::Ipv4Addr::from(*addr),
-                            *port,
-                        ))
-                    }
+                    Some(crate::fd::SockAddr::V4 { port, addr }) => std::net::SocketAddr::V4(
+                        std::net::SocketAddrV4::new(std::net::Ipv4Addr::from(*addr), *port),
+                    ),
                     Some(crate::fd::SockAddr::V6 { .. }) => {
                         // IPv6 support is P2; report EINVAL for now.
                         return -EINVAL;
@@ -1640,7 +1660,10 @@ mod p1_2_tests {
         let fd = socket_for_test(&mut fds, AF_INET, SOCK_STREAM).unwrap();
         match fds.get_mut(fd).unwrap() {
             Resource::Socket(s) => {
-                s.lock().bound = Some(SockAddr::V4 { port: 8080, addr: [127, 0, 0, 1] });
+                s.lock().bound = Some(SockAddr::V4 {
+                    port: 8080,
+                    addr: [127, 0, 0, 1],
+                });
             }
             _ => unreachable!(),
         }
@@ -1669,7 +1692,10 @@ mod p1_2_tests {
             Resource::Socket(s) => {
                 let mut gs = s.lock();
                 assert!(!gs.is_listening());
-                gs.bound = Some(SockAddr::V4 { port: 0, addr: [0, 0, 0, 0] });
+                gs.bound = Some(SockAddr::V4 {
+                    port: 0,
+                    addr: [0, 0, 0, 0],
+                });
                 assert!(!gs.is_listening(), "bind alone is not listening");
                 gs.listen_backlog = Some(128);
                 assert!(gs.is_listening(), "bind + listen -> listening");
@@ -1680,7 +1706,10 @@ mod p1_2_tests {
 
     #[test]
     fn as_v4_converts_bound_address() {
-        let addr = SockAddr::V4 { port: 8080, addr: [192, 168, 1, 1] };
+        let addr = SockAddr::V4 {
+            port: 8080,
+            addr: [192, 168, 1, 1],
+        };
         let v4 = addr.as_v4().expect("V4 -> Some");
         assert_eq!(*v4.ip(), std::net::Ipv4Addr::new(192, 168, 1, 1));
         assert_eq!(v4.port(), 8080);
@@ -1701,12 +1730,9 @@ fn read_msghdr_iov(
         Err(e) => return Err(e),
     };
     let iov_ptr = u32::from_le_bytes(mhdr[MSG_IOV_OFF..MSG_IOV_OFF + 4].try_into().unwrap()) as i64;
-    let iov_count = u32::from_le_bytes(
-        mhdr[MSG_IOVLEN_OFF..MSG_IOVLEN_OFF + 4].try_into().unwrap(),
-    ) as i64;
-    let flags = i32::from_le_bytes(
-        mhdr[MSG_FLAGS_OFF..MSG_FLAGS_OFF + 4].try_into().unwrap(),
-    );
+    let iov_count =
+        u32::from_le_bytes(mhdr[MSG_IOVLEN_OFF..MSG_IOVLEN_OFF + 4].try_into().unwrap()) as i64;
+    let flags = i32::from_le_bytes(mhdr[MSG_FLAGS_OFF..MSG_FLAGS_OFF + 4].try_into().unwrap());
 
     if iov_count <= 0 || iov_ptr == 0 {
         // Empty iovec list (or NULL iov_ptr with zero count): no payload
@@ -1780,7 +1806,9 @@ pub async fn sendmsg(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         match fds.get_mut(fd) {
             Ok(Resource::Socket(s)) => {
                 let prev = s.lock().nonblock.load(std::sync::atomic::Ordering::Relaxed);
-                s.lock().nonblock.store(true, std::sync::atomic::Ordering::Relaxed);
+                s.lock()
+                    .nonblock
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 Some(prev)
             }
             _ => None,
@@ -1821,7 +1849,8 @@ pub async fn sendmsg(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                 gs.stream = Some(stream);
             }
             if let Some(prev) = was_nonblock {
-                gs.nonblock.store(prev, std::sync::atomic::Ordering::Relaxed);
+                gs.nonblock
+                    .store(prev, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -1869,18 +1898,24 @@ pub async fn recvmsg(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         Err(e) => return e,
     };
     let iov_ptr = u32::from_le_bytes(mhdr[MSG_IOV_OFF..MSG_IOV_OFF + 4].try_into().unwrap()) as i64;
-    let iov_count = u32::from_le_bytes(
-        mhdr[MSG_IOVLEN_OFF..MSG_IOVLEN_OFF + 4].try_into().unwrap(),
-    ) as i64;
+    let iov_count =
+        u32::from_le_bytes(mhdr[MSG_IOVLEN_OFF..MSG_IOVLEN_OFF + 4].try_into().unwrap()) as i64;
     let control_ptr = u32::from_le_bytes(
-        mhdr[MSG_CONTROL_OFF..MSG_CONTROL_OFF + 4].try_into().unwrap(),
+        mhdr[MSG_CONTROL_OFF..MSG_CONTROL_OFF + 4]
+            .try_into()
+            .unwrap(),
     ) as i64;
     let _control_len = u32::from_le_bytes(
-        mhdr[MSG_CONTROLLEN_OFF..MSG_CONTROLLEN_OFF + 4].try_into().unwrap(),
+        mhdr[MSG_CONTROLLEN_OFF..MSG_CONTROLLEN_OFF + 4]
+            .try_into()
+            .unwrap(),
     );
-    let name_ptr = u32::from_le_bytes(mhdr[MSG_NAME_OFF..MSG_NAME_OFF + 4].try_into().unwrap()) as i64;
+    let name_ptr =
+        u32::from_le_bytes(mhdr[MSG_NAME_OFF..MSG_NAME_OFF + 4].try_into().unwrap()) as i64;
     let _name_len = u32::from_le_bytes(
-        mhdr[MSG_NAMELEN_OFF..MSG_NAMELEN_OFF + 4].try_into().unwrap(),
+        mhdr[MSG_NAMELEN_OFF..MSG_NAMELEN_OFF + 4]
+            .try_into()
+            .unwrap(),
     );
 
     if iov_count <= 0 || iov_ptr == 0 {
@@ -1914,7 +1949,9 @@ pub async fn recvmsg(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         match fds.get_mut(fd) {
             Ok(Resource::Socket(s)) => {
                 let prev = s.lock().nonblock.load(std::sync::atomic::Ordering::Relaxed);
-                s.lock().nonblock.store(true, std::sync::atomic::Ordering::Relaxed);
+                s.lock()
+                    .nonblock
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 Some(prev)
             }
             _ => None,
@@ -2012,11 +2049,7 @@ pub async fn recvmsg(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     n as i64
 }
 
-fn copy_bytes_to_spans(
-    caller: &mut Caller<'_, Kernel>,
-    spans: &[(i64, usize)],
-    data: &[u8],
-) {
+fn copy_bytes_to_spans(caller: &mut Caller<'_, Kernel>, spans: &[(i64, usize)], data: &[u8]) {
     let mut offset = 0;
     for (base, len) in spans {
         if offset >= data.len() || *len == 0 {
@@ -2045,15 +2078,13 @@ fn write_back_msghdr(
     let _ = control_ptr; // not used; we never report ancillary data
 }
 
-fn restore_nonblock(
-    caller: &mut Caller<'_, Kernel>,
-    fd: u32,
-    was_nonblock: Option<bool>,
-) {
+fn restore_nonblock(caller: &mut Caller<'_, Kernel>, fd: u32, was_nonblock: Option<bool>) {
     if let Some(prev) = was_nonblock {
         let fds = &mut caller.data_mut().fds;
         if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
-            s.lock().nonblock.store(prev, std::sync::atomic::Ordering::Relaxed);
+            s.lock()
+                .nonblock
+                .store(prev, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }

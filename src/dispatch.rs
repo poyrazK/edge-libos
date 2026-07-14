@@ -113,11 +113,7 @@ pub fn register(linker: &mut Linker<Kernel>) -> Result<()> {
 ///
 /// This function is `async` so P1 socket work drops in without re-architecture.
 /// Sync syscalls simply return immediately inside the future.
-pub async fn dispatch(
-    mut caller: wasmtime::Caller<'_, Kernel>,
-    nr: u32,
-    a: [i64; 6],
-) -> i64 {
+pub async fn dispatch(mut caller: wasmtime::Caller<'_, Kernel>, nr: u32, a: [i64; 6]) -> i64 {
     match nr {
         // Process
         sys::process::NR_EXIT => sys::process::exit(&mut caller, a).await,
@@ -240,9 +236,7 @@ pub async fn dispatch(
 
         // P2-C2: process
         sys::process::NR_SCHED_YIELD => sys::process::sched_yield().await,
-        sys::process::NR_SCHED_GETAFFINITY => {
-            sys::process::sched_getaffinity(&mut caller, a).await
-        }
+        sys::process::NR_SCHED_GETAFFINITY => sys::process::sched_getaffinity(&mut caller, a).await,
         sys::process::NR_PRCTL => sys::process::prctl(&mut caller, a).await,
         sys::process::NR_KILL => sys::process::kill(&mut caller, a).await,
         sys::process::NR_TGKILL => sys::process::tgkill(&mut caller, a).await,
@@ -253,9 +247,7 @@ pub async fn dispatch(
 
         // P2-C2: time
         sys::time::NR_CLOCK_GETRES => sys::time::clock_getres(&mut caller, a).await,
-        sys::time::NR_CLOCK_NANOSLEEP => {
-            sys::time::clock_nanosleep(&mut caller, a).await
-        }
+        sys::time::NR_CLOCK_NANOSLEEP => sys::time::clock_nanosleep(&mut caller, a).await,
 
         // P2 closing: sysinfo + times stubs.
         sys::time::NR_SYSINFO => sys::time::sysinfo(&mut caller, a).await,

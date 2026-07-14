@@ -153,9 +153,10 @@ async fn call_fcntl(
 
 /// Read two u32 little-endian fds from offset 4096 in linear memory.
 fn read_fds(store: &mut wasmtime::Store<Kernel>) -> Result<(i64, i64)> {
-    let mem = store.data().memory.ok_or_else(|| {
-        anyhow::anyhow!("no guest memory attached")
-    })?;
+    let mem = store
+        .data()
+        .memory
+        .ok_or_else(|| anyhow::anyhow!("no guest memory attached"))?;
     let mut buf = [0u8; 8];
     mem.read(&mut *store, 4096, &mut buf)
         .map_err(|e| anyhow::anyhow!("read failed: {e}"))?;
@@ -176,7 +177,11 @@ fn setsockopt_so_reuseaddr_returns_zero() -> Result<()> {
     let ret = block_on(async {
         let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
         let fd = call_socket(&linker, &mut store, &sock, 2, 1).await?;
-        call_setsockopt(&linker, &mut store, &so, fd, 1 /*SOL_SOCKET*/, 2 /*SO_REUSEADDR*/).await
+        call_setsockopt(
+            &linker, &mut store, &so, fd, 1, /*SOL_SOCKET*/
+            2, /*SO_REUSEADDR*/
+        )
+        .await
     })?;
     assert_eq!(ret, 0);
     Ok(())
@@ -192,7 +197,11 @@ fn setsockopt_tcp_nodelay_returns_zero() -> Result<()> {
     let ret = block_on(async {
         let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
         let fd = call_socket(&linker, &mut store, &sock, 2, 1).await?;
-        call_setsockopt(&linker, &mut store, &so, fd, 6 /*IPPROTO_TCP*/, 1 /*TCP_NODELAY*/).await
+        call_setsockopt(
+            &linker, &mut store, &so, fd, 6, /*IPPROTO_TCP*/
+            1, /*TCP_NODELAY*/
+        )
+        .await
     })?;
     assert_eq!(ret, 0);
     Ok(())
@@ -244,7 +253,10 @@ fn pipe2_o_nonblock_sets_flag_on_pair() -> Result<()> {
         // F_GETFL(rd) → O_RDONLY | O_NONBLOCK = 0 | 0o4000
         call_fcntl(&linker, &mut store, &fcntl_mod, rd, 3 /*F_GETFL*/, 0).await
     })?;
-    assert_eq!(ret, 0o4000, "F_GETFL on nonblocking pipe read end should report O_NONBLOCK");
+    assert_eq!(
+        ret, 0o4000,
+        "F_GETFL on nonblocking pipe read end should report O_NONBLOCK"
+    );
     Ok(())
 }
 
@@ -263,18 +275,34 @@ fn fcntl_setfl_zero_clears_o_nonblock() -> Result<()> {
         let (rd, _wr) = read_fds(&mut store)?;
         // Sanity: starts blocking (no O_NONBLOCK).
         let initial = call_fcntl(&linker, &mut store, &fcntl_mod, rd, 3 /*F_GETFL*/, 0).await?;
-        assert_eq!(initial & 0o4000, 0, "blocking pipe should not report O_NONBLOCK initially");
+        assert_eq!(
+            initial & 0o4000,
+            0,
+            "blocking pipe should not report O_NONBLOCK initially"
+        );
         // Flip to nonblocking.
-        let set_rc = call_fcntl(&linker, &mut store, &fcntl_mod, rd, 4 /*F_SETFL*/, 0o4000).await?;
+        let set_rc = call_fcntl(
+            &linker, &mut store, &fcntl_mod, rd, 4, /*F_SETFL*/
+            0o4000,
+        )
+        .await?;
         assert_eq!(set_rc, 0, "F_SETFL=O_NONBLOCK should return 0");
         // Now F_GETFL should report O_NONBLOCK.
         let after_set = call_fcntl(&linker, &mut store, &fcntl_mod, rd, 3 /*F_GETFL*/, 0).await?;
-        assert_eq!(after_set & 0o4000, 0o4000, "O_NONBLOCK should be set after F_SETFL=0o4000");
+        assert_eq!(
+            after_set & 0o4000,
+            0o4000,
+            "O_NONBLOCK should be set after F_SETFL=0o4000"
+        );
         // Clear it.
         let clear_rc = call_fcntl(&linker, &mut store, &fcntl_mod, rd, 4 /*F_SETFL*/, 0).await?;
         assert_eq!(clear_rc, 0, "F_SETFL=0 should return 0");
         let after_clear = call_fcntl(&linker, &mut store, &fcntl_mod, rd, 3 /*F_GETFL*/, 0).await?;
-        assert_eq!(after_clear & 0o4000, 0, "O_NONBLOCK should be cleared after F_SETFL=0");
+        assert_eq!(
+            after_clear & 0o4000,
+            0,
+            "O_NONBLOCK should be cleared after F_SETFL=0"
+        );
         Ok::<_, anyhow::Error>((after_clear, after_set))
     })?;
     let _ = (after_clear, after_set);

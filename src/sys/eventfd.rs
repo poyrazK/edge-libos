@@ -74,10 +74,7 @@ pub(crate) fn eventfd_read(e: &EventFdInner) -> Result<u64, i64> {
     let mut c = e.counter.lock();
     let v = *c;
     if v == 0 {
-        return if e
-            .nonblock
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        return if e.nonblock.load(std::sync::atomic::Ordering::Relaxed) {
             Err(-crate::errno::EAGAIN)
         } else {
             // Blocking read with empty counter: caller should await.
@@ -104,7 +101,11 @@ pub(crate) fn eventfd_write(e: &EventFdInner, addend: u64) -> u64 {
 
 /// Validate that a generic read/write buf is at least 8 bytes for an eventfd.
 pub(crate) fn require_u64_buf(buf_len: i64) -> Result<(), i64> {
-    if buf_len < 8 { Err(-EINVAL) } else { Ok(()) }
+    if buf_len < 8 {
+        Err(-EINVAL)
+    } else {
+        Ok(())
+    }
 }
 
 /// Backwards-compatible wrapper: `eventfd2` syscall -> `eventfd2_init`
@@ -156,7 +157,9 @@ pub async fn eventfd_write_compat(
             Ok(b) => b,
             Err(e) => return e,
         };
-        u64::from_ne_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]])
+        u64::from_ne_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ])
     };
     {
         let fds = &mut caller.data_mut().fds;
