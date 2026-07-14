@@ -1,11 +1,24 @@
-// futex is unimplemented in v1; assert -ENOSYS (-38).
-// P3 reservation: real impl needs wasm_threads + shared memory;
-// see docs/adr/0001-p3-futex-semantics.md.
+// futex: P3 Tier-1 implements FUTEX_WAIT + FUTEX_WAKE.
+// This test asserts FUTEX_WAKE (with FUTEX_PRIVATE_FLAG) on a never-waited
+// address returns 0 — the minimum-viable contract check.
+// See docs/adr/0001-p3-futex-semantics.md for the full design contract.
 #include "syscall.h"
+
+#define FUTEX_CMD_WAKE 1
+#define FUTEX_PRIVATE_FLAG 0x80
+
+// Use scratch slot at 8192 — MARKER_ADDR=4096 is reserved by mark_pass/
+// mark_fail() (see tests/conformance/syscall.h).
+#define FUTEX_WORD_ADDR 8192
 
 __attribute__((visibility("default")))
 void _start(void) {
-    int64_t r = sc6(NR_FUTEX, 0, 0, 0, 0, 0, 0);
-    if (r == -38) mark_pass();
-    else mark_fail("futex != -ENOSYS");
+    volatile uint32_t *futex_word = (volatile uint32_t *)FUTEX_WORD_ADDR;
+    *futex_word = 0;
+    int64_t r = sc6(NR_FUTEX,
+                    (int64_t)(intptr_t)futex_word,
+                    FUTEX_CMD_WAKE | FUTEX_PRIVATE_FLAG,
+                    1, 0, 0, 0);
+    if (r == 0) mark_pass();
+    else mark_fail("futex_wake != 0");
 }
