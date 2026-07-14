@@ -68,6 +68,7 @@ unused_in_dispatch=$(comm -23 <(printf '%s\n' "$RUST_NAMES") \
                                   <(printf '%s\n' "$DISPATCH_NAMES"))
 if [[ -n "$unused_in_dispatch" ]]; then
     echo "FAIL: NR_* defined in src/sys but missing from src/dispatch.rs:" >&2
+    # shellcheck disable=SC2001  # sed is clearer than ${var//pattern/repl} for line-prefix
     echo "$unused_in_dispatch" | sed 's/^/  /' >&2
     fail=1
 fi
@@ -78,6 +79,7 @@ phantom_in_dispatch=$(comm -13 <(printf '%s\n' "$RUST_NAMES") \
                                   <(printf '%s\n' "$DISPATCH_NAMES"))
 if [[ -n "$phantom_in_dispatch" ]]; then
     echo "FAIL: src/dispatch.rs references NR_* not defined in src/sys:" >&2
+    # shellcheck disable=SC2001
     echo "$phantom_in_dispatch" | sed 's/^/  /' >&2
     fail=1
 fi
@@ -87,6 +89,7 @@ c_missing=$(comm -23 <(printf '%s\n' "$DISPATCH_NAMES") \
                        <(printf '%s\n' "$C_NAMES"))
 if [[ -n "$c_missing" ]]; then
     echo "FAIL: dispatch::dispatch has NR_* without a C #define in syscall.h:" >&2
+    # shellcheck disable=SC2001
     echo "$c_missing" | sed 's/^/  /' >&2
     echo "  → Either add a C conformance test (preferred) or add the" >&2
     echo "    #define NR_* line to tests/conformance/syscall.h so the" >&2

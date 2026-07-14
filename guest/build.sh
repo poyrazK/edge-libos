@@ -43,7 +43,8 @@ if [[ ! -d "$CPYTHON" ]]; then
     exit 1
 fi
 
-CC="$ZIG cc -target wasm32-freestanding -O2"  # shellcheck disable=SC2034  # consumed by generated Makefile recipe (line 63)
+# shellcheck disable=SC2034  # consumed by generated Makefile recipe (line 63)
+CC="$ZIG cc -target wasm32-freestanding -O2"
 # zig 0.16.0 musl sysroot (headers only — we provide our own shim, no libc).
 MUSL_HEADERS="$("$ZIG" env 2>/dev/null | grep -oE 'lib_dir=.*' | head -1 | cut -d= -f2-)"
 if [[ -z "$MUSL_HEADERS" ]]; then

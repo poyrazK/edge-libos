@@ -23,7 +23,7 @@
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-cd "$ROOT"
+cd "$ROOT" || exit 1
 
 PASS=0
 FAIL=0
