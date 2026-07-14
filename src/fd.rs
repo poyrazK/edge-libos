@@ -323,6 +323,48 @@ impl SocketInner {
         s
     }
 
+    /// P2-D3.2: construct a SocketInner for a freshly reopened TCP listener
+    /// during `apply_snapshot`. Caller has already done `std::net::TcpListener::bind`
+    /// + (optionally) `SO_REUSEADDR` + `tokio::net::TcpListener::from_std`.
+    /// `listen_backlog = Some(0)` is needed so `is_listening()` returns true;
+    /// the OS assigns the real backlog.
+    #[allow(dead_code)]
+    pub fn from_tcp_listener(
+        listener: tokio::net::TcpListener,
+        bound: SockAddr,
+        so_reuseaddr: bool,
+        nonblock: bool,
+    ) -> Self {
+        let mut s = Self::new(SocketKind::Stream, nonblock);
+        s.listener = Some(listener);
+        s.bound = Some(bound);
+        s.listen_backlog = Some(0);
+        s.so_reuseaddr = so_reuseaddr;
+        s.is_acceptor = true;
+        s
+    }
+
+    /// P2-D3.2: construct a SocketInner for a freshly reopened AF_UNIX
+    /// filesystem listener during `apply_snapshot`. Host-side path
+    /// unlink-race is handled at the apply call site (mirrors
+    /// `src/sys/socket.rs::bind`'s D3.0 side-quest fix).
+    #[allow(dead_code)]
+    pub fn from_unix_listener(
+        listener: tokio::net::UnixListener,
+        path: PathBuf,
+        nonblock: bool,
+    ) -> Self {
+        let mut s = Self::new_unix(SocketKind::Stream, nonblock);
+        s.bound = Some(SockAddr::Unix { path: path.clone() });
+        s.listen_backlog = Some(0);
+        s.is_acceptor = true;
+        if let Some(u) = s.unix.as_mut() {
+            u.path = Some(path);
+            u.listener = Some(listener);
+        }
+        s
+    }
+
     /// P2-D1: build the snapshot form. Caller owns a fresh `SocketSnapshot`.
     /// Locks the inner mutex briefly, drops the guard, copies out.
     pub fn snapshot(&self) -> crate::snapshot::SocketSnapshot {
