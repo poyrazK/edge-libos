@@ -2107,7 +2107,6 @@ pub async fn chroot(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 
 // (No dead-code silencer needed; everything in this file is used.)
 
-
 #[cfg(test)]
 mod statx_offset_tests {
     use super::*;
