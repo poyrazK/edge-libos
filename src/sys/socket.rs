@@ -15,6 +15,7 @@ use crate::errno::{EAFNOSUPPORT, EBADF, EFAULT, EINVAL, EOPNOTSUPP, EPROTONOSUPP
 use crate::fd::{Resource, SockAddr, SocketInner, SocketKind};
 use crate::kernel::Kernel;
 use crate::mem;
+use std::os::unix::fs::FileTypeExt;
 
 // NR_* (Linux x86-64 unistd_64.h).
 pub const NR_SOCKET: u32 = 41;
@@ -327,12 +328,37 @@ pub async fn bind(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         if !is_unix_stream {
             return -EOPNOTSUPP; // not an AF_UNIX socket
         }
-        // UnixListener::bind removes any existing file at `path`.
+        // AF_UNIX `bind(2)` semantics: if `path` already exists as a
+        // socket inode from a previous run, the host `bind(2)` returns
+        // EADDRINUSE (Linux does not unlink for us; `close(2)` doesn't
+        // either). To make re-bind idempotent for the conformance runner
+        // — which always reuses the same path — explicitly unlink a stale
+        // **socket** inode first. We refuse to unlink anything else
+        // (regular file, directory, symlink) so a hostile guest can't
+        // coax us into `unlink("/etc/passwd")`.
+        match std::fs::metadata(path) {
+            Ok(m) if m.file_type().is_socket() => {
+                if let Err(e) = std::fs::remove_file(path) {
+                    // Another fd is holding it (TOCTOU); surface EADDRINUSE.
+                    return if e.kind() == std::io::ErrorKind::NotFound {
+                        0 // raced: gone now, fall through to bind below
+                    } else {
+                        -crate::errno::EADDRINUSE
+                    };
+                }
+            }
+            Ok(_) => return -crate::errno::EADDRINUSE, // path is a non-socket inode
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // No stale inode; happy case, proceed to bind.
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return -crate::errno::EACCES;
+            }
+            Err(_) => return -crate::errno::EIO,
+        }
         let listener = match tokio::net::UnixListener::bind(path) {
             Ok(l) => l,
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                // Another fd already bound this path (rare; refcount would
-                // normally unlink first). Surface as EADDRINUSE.
                 return -crate::errno::EADDRINUSE;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

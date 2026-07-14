@@ -111,6 +111,13 @@ pub mod vecdeque_bytes {
 /// `crate::snapshot::endian` for the rationale + wire-format spec.
 pub mod endian;
 
+/// P2-D3.1 — postcard façade: thin wrappers over `postcard::{to_stdvec,
+/// from_bytes}` and `std::fs::{read, write}` so freeze/serve callers
+/// don't repeat the error-mapping boilerplate.
+pub mod io;
+
+pub use io::{decode_snapshot, encode_snapshot, read_snapshot_file, write_snapshot_file};
+
 /// Helper trait for the `Arc<parking_lot::Mutex<T>>` pattern used in fd.rs.
 ///
 /// P2-D1: this module is not yet used by the snapshot types — it is
