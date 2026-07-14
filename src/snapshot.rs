@@ -89,6 +89,11 @@ pub mod vecdeque_bytes {
     }
 }
 
+/// P2-D2 / ADR 0002 §2 — explicit little-endian newtypes for every
+/// multi-byte integer in the snapshot wire format. See
+/// `crate::snapshot::endian` for the rationale + wire-format spec.
+pub mod endian;
+
 /// Helper trait for the `Arc<parking_lot::Mutex<T>>` pattern used in fd.rs.
 ///
 /// P2-D1: this module is not yet used by the snapshot types — it is
