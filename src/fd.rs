@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UnixDatagram, UnixListener, UnixStream};
 
@@ -31,6 +32,21 @@ pub struct PipeRead {
     /// available, or close). `poll` subscribes to this for async
     /// readiness waits.
     pub notify: Arc<tokio::sync::Notify>,
+}
+
+impl PipeRead {
+    /// P2-D1: snapshot the pipe's state. Locks briefly, drops guard,
+    /// copies out. The `Notify` is dropped from the snapshot.
+    pub fn snapshot(&self) -> crate::snapshot::PipeSnapshot {
+        let buf = self.buf.lock().clone();
+        let closed = *self.closed.lock();
+        let nonblock = self.nonblock.load(std::sync::atomic::Ordering::Relaxed);
+        crate::snapshot::PipeSnapshot {
+            buf,
+            closed,
+            nonblock,
+        }
+    }
 }
 
 impl AsyncRead for PipeRead {
@@ -67,6 +83,20 @@ pub struct PipeWrite {
     /// P2-B3: fires when bytes are pushed onto the pipe (wakes any
     /// `poll` waiting for POLLIN on the read side).
     pub notify: Arc<tokio::sync::Notify>,
+}
+
+impl PipeWrite {
+    /// P2-D1: snapshot the pipe's state.
+    pub fn snapshot(&self) -> crate::snapshot::PipeSnapshot {
+        let buf = self.buf.lock().clone();
+        let closed = *self.closed.lock();
+        let nonblock = self.nonblock.load(std::sync::atomic::Ordering::Relaxed);
+        crate::snapshot::PipeSnapshot {
+            buf,
+            closed,
+            nonblock,
+        }
+    }
 }
 
 impl AsyncWrite for PipeWrite {
@@ -121,8 +151,11 @@ pub fn make_pipe() -> (PipeRead, PipeWrite) {
 
 /// What kind of socket this is. P1-1 only allocates the resource; the
 /// stream-vs-datagram distinction matters once `connect`/`sendto` land.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// P2-D1: derives `Serialize`/`Deserialize` for snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SocketKind {
+    #[default]
     Stream,
     Datagram,
 }
@@ -134,7 +167,9 @@ pub enum SocketKind {
 ///
 /// P2-C3 part 2: `Unix` variant for AF_UNIX filesystem-path sockets.
 /// Abstract namespace (`sun_path[0] == 0`) → `-EOPNOTSUPP`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// P2-D1: derives `Serialize`/`Deserialize` for snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SockAddr {
     V4 { port: u16, addr: [u8; 4] },
     V6 { port: u16, addr: [u8; 16] },
@@ -282,6 +317,33 @@ impl SocketInner {
         s
     }
 
+    /// P2-D1: build the snapshot form. Caller owns a fresh `SocketSnapshot`.
+    /// Locks the inner mutex briefly, drops the guard, copies out.
+    pub fn snapshot(&self) -> crate::snapshot::SocketSnapshot {
+        use crate::snapshot::{SocketSnapshot, UnixSockSnapshot};
+        let unix_inner = self.unix.as_ref().map(|u| UnixSockSnapshot {
+            path: u.path.clone(),
+            peer_addr_present: u.peer_addr.is_some(),
+        });
+        let peek_buf = self.peek_buf.lock().clone();
+        SocketSnapshot {
+            sock_kind: self.kind,
+            nonblock: self.nonblock.load(std::sync::atomic::Ordering::Relaxed),
+            bound: self.bound.clone(),
+            listen_backlog: self.listen_backlog,
+            so_reuseaddr: self.so_reuseaddr,
+            so_keepalive: self.so_keepalive,
+            tcp_nodelay: self.tcp_nodelay,
+            peer_addr_present: self.peer_addr.is_some(),
+            last_error: self.last_error.load(std::sync::atomic::Ordering::Relaxed),
+            shutdown_flags: self.shutdown_flags,
+            is_acceptor: self.is_acceptor,
+            peek_buf,
+            family_unix: self.family_unix,
+            unix_inner,
+        }
+    }
+
     /// P1-6: family inferred from `bound` (or AF_INET if unknown). For
     /// AF_UNIX sockets the `family_unix` flag is authoritative regardless
     /// of whether `bound` is set.
@@ -358,12 +420,54 @@ pub struct EpollInner {
     pub self_event_fd: Option<u32>,
 }
 
+impl EpollInner {
+    /// P2-D1: snapshot form. Locks the entries map briefly, drops the
+    /// guard, copies out. Cancels the runtime `Notify` (informational
+    /// field — restore rebuilds an empty Notify).
+    pub fn snapshot(&self) -> crate::snapshot::EpollSnapshot {
+        use crate::snapshot::{EpollEntrySnapshot, EpollSnapshot};
+        let entries: Vec<(u32, EpollEntrySnapshot)> = {
+            let guard = self.entries.lock();
+            let mut v: Vec<(u32, EpollEntrySnapshot)> = guard
+                .iter()
+                .map(|(fd, e)| {
+                    (
+                        *fd,
+                        EpollEntrySnapshot {
+                            fd: e.fd,
+                            events: e.events,
+                            data: e.data,
+                        },
+                    )
+                })
+                .collect();
+            v.sort_by_key(|(fd, _)| *fd);
+            v
+        };
+        EpollSnapshot {
+            entries: entries.into_iter().map(|(_, e)| e).collect::<Vec<_>>(),
+            self_event_fd: self.self_event_fd,
+        }
+    }
+}
+
 /// P1-7: kernel-side state for an `eventfd2` fd.
 #[allow(dead_code)]
 pub struct EventFdInner {
     pub counter: parking_lot::Mutex<u64>,
     pub notify: Arc<tokio::sync::Notify>,
     pub nonblock: AtomicBool,
+}
+
+impl EventFdInner {
+    /// P2-D1: snapshot form. Locks briefly, drops guard, copies out.
+    pub fn snapshot(&self) -> crate::snapshot::EventFdSnapshot {
+        let counter = *self.counter.lock();
+        crate::snapshot::EventFdSnapshot {
+            counter,
+            nonblock: self.nonblock.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
 }
 
 /// A `Resource` is what's behind a fd. Variants fill in as syscalls land.
@@ -530,6 +634,28 @@ impl FdTable {
     /// True if `fd` is currently bound.
     pub fn contains(&self, fd: u32) -> bool {
         self.table.contains_key(&fd)
+    }
+
+    /// P2-D1: iterate (fd, &Resource) without exposing the inner table.
+    pub fn iter_for_snapshot(&self) -> Vec<(u32, &Resource)> {
+        self.table.iter().map(|(fd, r)| (*fd, r)).collect()
+    }
+
+    /// P2-D1: cloexec set as a `Vec<u32>` (caller sorts).
+    pub fn iter_cloexec_for_snapshot(&self) -> Vec<u32> {
+        self.cloexec.iter().copied().collect()
+    }
+
+    /// P2-D1: expose `next_fd` for snapshot without making it pub.
+    pub fn next_fd_for_snapshot(&self) -> u32 {
+        self.next_fd
+    }
+
+    /// P2-D1: restore `next_fd` from a snapshot. The freeze CLI calls
+    /// this after rebuilding the table from `apply_snapshot` so the
+    /// next allocation honors the snapshot's idea of "next available".
+    pub fn set_next_fd_for_snapshot(&mut self, fd: u32) {
+        self.next_fd = fd;
     }
 }
 

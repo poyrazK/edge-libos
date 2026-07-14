@@ -65,6 +65,22 @@ impl LinearAllocator {
         }
     }
 
+    /// P2-D1: produce a snapshot of the allocator state. `Arena` already
+    /// derives `Serialize`/`Deserialize`, so we just copy out.
+    pub fn snapshot(&self) -> crate::snapshot::LinearAllocatorSnapshot {
+        crate::snapshot::LinearAllocatorSnapshot {
+            arenas: self.arenas.clone(),
+            high_water: self.high_water,
+        }
+    }
+
+    /// P2-D1: replace the allocator state with a snapshot. Used by
+    /// `apply_snapshot` (D1.7).
+    pub fn replace_from_snapshot(&mut self, snap: crate::snapshot::LinearAllocatorSnapshot) {
+        self.arenas = snap.arenas;
+        self.high_water = snap.high_water;
+    }
+
     /// Decide where to place an allocation. Pure: no memory writes happen
     /// here. The caller is responsible for zero-filling the returned range
     /// (and growing memory if the result is `NeedGrow`).

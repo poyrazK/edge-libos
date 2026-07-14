@@ -28,6 +28,11 @@ parking_lot          = "0.12"
 rand                 = { version = "0.8", features = ["small_rng"] }
 chrono               = { version = "0.4", default-features = false, features = ["clock"] }
 
+# P2-D1: snapshot foundation. Both already transitive in Cargo.lock;
+# declaring them direct makes src/snapshot.rs usable.
+serde                = { version = "1", features = ["derive"] }
+postcard             = { version = "1", features = ["alloc"] }
+
 [dev-dependencies]
 wat        = "1"
 tempfile   = "3"
