@@ -123,9 +123,9 @@ description. These use **`parking_lot::Mutex` (sync) — never hold a lock acros
 `.await`**.
 
 **Async pivot:** handlers are `async fn` even when synchronous (sync ones just
-return immediately). The socket/epoll/poll path is genuinely async (tokio
-current-thread runtime, single-threaded). epoll_wait uses `tokio::select!`
-over a timeout + per-fd `Notify` + cancel.
+return immediately). The socket/epoll/poll path is genuinely async on a
+tokio current-thread runtime, one `Store` per fiber (see Multi-fiber below).
+epoll_wait uses `tokio::select!` over a timeout + per-fd `Notify` + cancel.
 
 **Multi-fiber (P3 Tier-3, ADR 0001 §2):** `wasm_threads(true)` +
 `shared_memory(true)` + `wasm_shared_everything_threads(true)` are all
