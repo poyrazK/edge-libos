@@ -15,6 +15,7 @@ use wasmtime::Memory;
 
 use crate::fd::FdTable;
 use crate::mm::LinearAllocator;
+use crate::sys::futex::FutexTable;
 use crate::sys::signal::SignalState;
 use crate::vfs::Vfs;
 
@@ -41,6 +42,9 @@ pub struct Kernel {
     pub exit_code: Option<i32>,
     /// P2-C2: prctl(PR_SET_NAME) writes here; PR_GET_NAME reads from here.
     pub comm: [u8; 16],
+    /// P3 — ADR 0001 §2: wait/wake storage keyed by guest-address.
+    /// See `docs/adr/0001-p3-futex-semantics.md`.
+    pub futex_table: parking_lot::Mutex<FutexTable>,
 }
 
 impl Kernel {
@@ -94,6 +98,7 @@ impl Kernel {
             started_at: now,
             exit_code: None,
             comm: [0; 16],
+            futex_table: parking_lot::Mutex::new(FutexTable::default()),
         }
     }
 

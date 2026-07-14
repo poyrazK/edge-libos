@@ -261,14 +261,14 @@ pub async fn dispatch(
         sys::time::NR_SYSINFO => sys::time::sysinfo(&mut caller, a).await,
         sys::time::NR_TIMES => sys::time::times(&mut caller, a).await,
 
-        // P3 reservation: clone / fork / wait4 / futex. Each returns
-        // -ENOSYS; real impls land in P3 after P2-D snapshot machinery
-        // and wasm_threads support are in place. See ADR 0002 for the
-        // fork snapshot story and ADR 0001 for futex semantics.
+        // P3 reservation: clone / fork / wait4. Each returns -ENOSYS; real
+        // impls land in P3 after P2-D snapshot machinery and wasm_threads
+        // support are in place. See ADR 0002 for the fork snapshot story.
+        // P3 Tier-1: futex(2) FUTEX_WAIT/FUTEX_WAKE shipped — see ADR 0001.
         sys::process::NR_CLONE => to_ret(crate::errno::ENOSYS),
         sys::process::NR_FORK => to_ret(crate::errno::ENOSYS),
         sys::process::NR_WAIT4 => to_ret(crate::errno::ENOSYS),
-        sys::futex::NR_FUTEX => to_ret(crate::errno::ENOSYS),
+        sys::futex::NR_FUTEX => sys::futex::futex(&mut caller, a).await,
 
         // P2-C2: memory
         sys::memory::NR_MREMAP => sys::memory::mremap(&mut caller, a),
