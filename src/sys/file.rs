@@ -111,7 +111,7 @@ pub const PATH_MAX: i64 = 4096;
 /// `vfs`'s private internals. Returns the errno as a positive i64.
 fn io_to_errno(e: std::io::Error) -> i64 {
     use std::io::ErrorKind::*;
-    let code = match e.kind() {
+    match e.kind() {
         NotFound => crate::errno::ENOENT,
         PermissionDenied => crate::errno::EACCES,
         AlreadyExists => crate::errno::EEXIST,
@@ -121,8 +121,7 @@ fn io_to_errno(e: std::io::Error) -> i64 {
         DirectoryNotEmpty => crate::errno::ENOTEMPTY,
         TooManyLinks => crate::errno::ELOOP,
         _ => crate::errno::EIO,
-    };
-    code
+    }
 }
 
 // open() flags (linux/fcntl.h). Keep the bare minimum CPython needs.
@@ -393,126 +392,7 @@ impl Statx {
 /// filesystems (e.g. tmpfs on Linux) can hand back negative or oversized
 /// values; musl would treat those as a malformed statx.
 fn clamp_nsec(n: i64) -> i64 {
-    if n < 0 {
-        0
-    } else if n > 999_999_999 {
-        999_999_999
-    } else {
-        n
-    }
-}
-
-#[cfg(test)]
-mod statx_offset_tests {
-    use super::*;
-
-    /// Build a known Statx and verify each field lands at its expected
-    /// byte offset in the 256-byte buffer. Anchored against
-    /// linux/stat.h so a layout drift fails compilation loudly.
-    #[test]
-    fn offsets_match_linux_stat_h() {
-        let s = Statx {
-            stx_mask: 0xdead_beef,
-            stx_blksize: 0x1111_2222,
-            stx_attributes: 0x3333_4444_5555_6666,
-            stx_nlink: 7,
-            stx_uid: 1000,
-            stx_gid: 1000,
-            stx_mode: 0o100644,
-            stx_ino: 0xabcd_1234_5678_9abc,
-            stx_size: 0x0102_0304_0506_0708,
-            stx_blocks: 0x090a_0b0c,
-            stx_attributes_mask: 0xdead_beef_dead_beef,
-            stx_atime_sec: 1_700_000_000,
-            stx_atime_nsec: 123_456_789,
-            stx_btime_sec: 0,
-            stx_btime_nsec: 0,
-            stx_ctime_sec: 1_700_000_001,
-            stx_ctime_nsec: 234_567_890,
-            stx_mtime_sec: 1_700_000_002,
-            stx_mtime_nsec: 345_678_901,
-            stx_rdev_major: 0,
-            stx_rdev_minor: 0,
-            stx_dev_major: 0,
-            stx_dev_minor: 0,
-            stx_mnt_id: 0,
-            stx_dio_mem_align: 0,
-            stx_dio_offset_align: 0,
-        };
-        let buf = s.encode();
-
-        assert_eq!(buf.len(), 256);
-        // stx_mask @ 0
-        assert_eq!(&buf[0..4], &s.stx_mask.to_le_bytes());
-        // stx_blksize @ 4
-        assert_eq!(&buf[4..8], &s.stx_blksize.to_le_bytes());
-        // stx_attributes @ 8
-        assert_eq!(&buf[8..16], &s.stx_attributes.to_le_bytes());
-        // stx_nlink @ 16
-        assert_eq!(&buf[16..24], &s.stx_nlink.to_le_bytes());
-        // stx_uid @ 24
-        assert_eq!(&buf[24..28], &s.stx_uid.to_le_bytes());
-        // stx_gid @ 28
-        assert_eq!(&buf[28..32], &s.stx_gid.to_le_bytes());
-        // stx_mode @ 32 (u16) — verify only 2 bytes used
-        assert_eq!(&buf[32..34], &s.stx_mode.to_le_bytes());
-        // 6-byte pad 34..40 must be zero
-        assert!(buf[34..40].iter().all(|b| *b == 0));
-        // stx_ino @ 40
-        assert_eq!(&buf[40..48], &s.stx_ino.to_le_bytes());
-        // stx_size @ 48
-        assert_eq!(&buf[48..56], &s.stx_size.to_le_bytes());
-        // stx_blocks @ 56
-        assert_eq!(&buf[56..64], &s.stx_blocks.to_le_bytes());
-        // stx_attributes_mask @ 64
-        assert_eq!(&buf[64..72], &s.stx_attributes_mask.to_le_bytes());
-        // stx_atime @ 72
-        assert_eq!(&buf[72..80], &s.stx_atime_sec.to_le_bytes());
-        assert_eq!(&buf[80..88], &s.stx_atime_nsec.to_le_bytes());
-        // stx_btime @ 88 (zeroed)
-        assert!(buf[88..104].iter().all(|b| *b == 0));
-        // stx_ctime @ 104
-        assert_eq!(&buf[104..112], &s.stx_ctime_sec.to_le_bytes());
-        assert_eq!(&buf[112..120], &s.stx_ctime_nsec.to_le_bytes());
-        // stx_mtime @ 120
-        assert_eq!(&buf[120..128], &s.stx_mtime_sec.to_le_bytes());
-        assert_eq!(&buf[128..136], &s.stx_mtime_nsec.to_le_bytes());
-        // stx_rdev_major/minor @ 136/140
-        assert_eq!(&buf[136..140], &s.stx_rdev_major.to_le_bytes());
-        assert_eq!(&buf[140..144], &s.stx_rdev_minor.to_le_bytes());
-        // stx_dev_major/minor @ 144/152
-        assert_eq!(&buf[144..152], &s.stx_dev_major.to_le_bytes());
-        assert_eq!(&buf[152..160], &s.stx_dev_minor.to_le_bytes());
-        // stx_mnt_id @ 160
-        assert_eq!(&buf[160..168], &s.stx_mnt_id.to_le_bytes());
-        // stx_dio_* @ 168/172
-        assert_eq!(&buf[168..172], &s.stx_dio_mem_align.to_le_bytes());
-        assert_eq!(&buf[172..176], &s.stx_dio_offset_align.to_le_bytes());
-        // reserved 176..256 — all zero
-        assert!(buf[176..256].iter().all(|b| *b == 0));
-    }
-
-    #[test]
-    fn clamp_nsec_helper() {
-        assert_eq!(clamp_nsec(-5), 0);
-        assert_eq!(clamp_nsec(0), 0);
-        assert_eq!(clamp_nsec(500_000_000), 500_000_000);
-        assert_eq!(clamp_nsec(1_000_000_000), 999_999_999);
-    }
-
-    #[test]
-    fn filled_mask_excludes_btime() {
-        let m = Statx::filled_mask();
-        assert_eq!(
-            m & STATX_BTIME,
-            0,
-            "BTIME must be excluded from filled_mask"
-        );
-        assert_ne!(m & STATX_TYPE, 0);
-        assert_ne!(m & STATX_MODE, 0);
-        assert_ne!(m & STATX_INO, 0);
-        assert_ne!(m & STATX_BLOCKS, 0);
-    }
+    n.clamp(0, 999_999_999)
 }
 
 /// `read(fd, buf, len)`. Reads up to `len` bytes from `fd` into `buf`.
@@ -1298,7 +1178,7 @@ pub async fn rename(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 /// * `flags == 0`               → plain rename (std::fs::rename).
 /// * `RENAME_NOREPLACE (0x1)`   → -EEXIST if newpath already exists.
 /// * `RENAME_EXCHANGE (0x2)`    → atomic swap (POSIX rename supports it
-///                                on Linux; std::fs::rename maps to it).
+///   on Linux; std::fs::rename maps to it).
 /// * `RENAME_WHITEOUT (0x4)`    → -EINVAL (not modeled; overlayfs only).
 /// * other bits                 → -EINVAL.
 pub async fn renameat(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
@@ -2226,3 +2106,117 @@ pub async fn chroot(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 }
 
 // (No dead-code silencer needed; everything in this file is used.)
+
+
+#[cfg(test)]
+mod statx_offset_tests {
+    use super::*;
+
+    /// Build a known Statx and verify each field lands at its expected
+    /// byte offset in the 256-byte buffer. Anchored against
+    /// linux/stat.h so a layout drift fails compilation loudly.
+    #[test]
+    fn offsets_match_linux_stat_h() {
+        let s = Statx {
+            stx_mask: 0xdead_beef,
+            stx_blksize: 0x1111_2222,
+            stx_attributes: 0x3333_4444_5555_6666,
+            stx_nlink: 7,
+            stx_uid: 1000,
+            stx_gid: 1000,
+            stx_mode: 0o100644,
+            stx_ino: 0xabcd_1234_5678_9abc,
+            stx_size: 0x0102_0304_0506_0708,
+            stx_blocks: 0x090a_0b0c,
+            stx_attributes_mask: 0xdead_beef_dead_beef,
+            stx_atime_sec: 1_700_000_000,
+            stx_atime_nsec: 123_456_789,
+            stx_btime_sec: 0,
+            stx_btime_nsec: 0,
+            stx_ctime_sec: 1_700_000_001,
+            stx_ctime_nsec: 234_567_890,
+            stx_mtime_sec: 1_700_000_002,
+            stx_mtime_nsec: 345_678_901,
+            stx_rdev_major: 0,
+            stx_rdev_minor: 0,
+            stx_dev_major: 0,
+            stx_dev_minor: 0,
+            stx_mnt_id: 0,
+            stx_dio_mem_align: 0,
+            stx_dio_offset_align: 0,
+        };
+        let buf = s.encode();
+
+        assert_eq!(buf.len(), 256);
+        // stx_mask @ 0
+        assert_eq!(&buf[0..4], &s.stx_mask.to_le_bytes());
+        // stx_blksize @ 4
+        assert_eq!(&buf[4..8], &s.stx_blksize.to_le_bytes());
+        // stx_attributes @ 8
+        assert_eq!(&buf[8..16], &s.stx_attributes.to_le_bytes());
+        // stx_nlink @ 16
+        assert_eq!(&buf[16..24], &s.stx_nlink.to_le_bytes());
+        // stx_uid @ 24
+        assert_eq!(&buf[24..28], &s.stx_uid.to_le_bytes());
+        // stx_gid @ 28
+        assert_eq!(&buf[28..32], &s.stx_gid.to_le_bytes());
+        // stx_mode @ 32 (u16) — verify only 2 bytes used
+        assert_eq!(&buf[32..34], &s.stx_mode.to_le_bytes());
+        // 6-byte pad 34..40 must be zero
+        assert!(buf[34..40].iter().all(|b| *b == 0));
+        // stx_ino @ 40
+        assert_eq!(&buf[40..48], &s.stx_ino.to_le_bytes());
+        // stx_size @ 48
+        assert_eq!(&buf[48..56], &s.stx_size.to_le_bytes());
+        // stx_blocks @ 56
+        assert_eq!(&buf[56..64], &s.stx_blocks.to_le_bytes());
+        // stx_attributes_mask @ 64
+        assert_eq!(&buf[64..72], &s.stx_attributes_mask.to_le_bytes());
+        // stx_atime @ 72
+        assert_eq!(&buf[72..80], &s.stx_atime_sec.to_le_bytes());
+        assert_eq!(&buf[80..88], &s.stx_atime_nsec.to_le_bytes());
+        // stx_btime @ 88 (zeroed)
+        assert!(buf[88..104].iter().all(|b| *b == 0));
+        // stx_ctime @ 104
+        assert_eq!(&buf[104..112], &s.stx_ctime_sec.to_le_bytes());
+        assert_eq!(&buf[112..120], &s.stx_ctime_nsec.to_le_bytes());
+        // stx_mtime @ 120
+        assert_eq!(&buf[120..128], &s.stx_mtime_sec.to_le_bytes());
+        assert_eq!(&buf[128..136], &s.stx_mtime_nsec.to_le_bytes());
+        // stx_rdev_major/minor @ 136/140
+        assert_eq!(&buf[136..140], &s.stx_rdev_major.to_le_bytes());
+        assert_eq!(&buf[140..144], &s.stx_rdev_minor.to_le_bytes());
+        // stx_dev_major/minor @ 144/152
+        assert_eq!(&buf[144..152], &s.stx_dev_major.to_le_bytes());
+        assert_eq!(&buf[152..160], &s.stx_dev_minor.to_le_bytes());
+        // stx_mnt_id @ 160
+        assert_eq!(&buf[160..168], &s.stx_mnt_id.to_le_bytes());
+        // stx_dio_* @ 168/172
+        assert_eq!(&buf[168..172], &s.stx_dio_mem_align.to_le_bytes());
+        assert_eq!(&buf[172..176], &s.stx_dio_offset_align.to_le_bytes());
+        // reserved 176..256 — all zero
+        assert!(buf[176..256].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn clamp_nsec_helper() {
+        assert_eq!(clamp_nsec(-5), 0);
+        assert_eq!(clamp_nsec(0), 0);
+        assert_eq!(clamp_nsec(500_000_000), 500_000_000);
+        assert_eq!(clamp_nsec(1_000_000_000), 999_999_999);
+    }
+
+    #[test]
+    fn filled_mask_excludes_btime() {
+        let m = Statx::filled_mask();
+        assert_eq!(
+            m & STATX_BTIME,
+            0,
+            "BTIME must be excluded from filled_mask"
+        );
+        assert_ne!(m & STATX_TYPE, 0);
+        assert_ne!(m & STATX_MODE, 0);
+        assert_ne!(m & STATX_INO, 0);
+        assert_ne!(m & STATX_BLOCKS, 0);
+    }
+}

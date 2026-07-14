@@ -211,9 +211,7 @@ pub fn sigaltstack(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
             }
         } else {
             // SS_DISABLE: clear the record.
-            for i in 0..SIGALTSTACK_SIZE as usize {
-                bytes[i] = 0;
-            }
+            bytes[..SIGALTSTACK_SIZE as usize].fill(0);
         }
     }
 

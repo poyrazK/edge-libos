@@ -211,10 +211,10 @@ mod tests {
         }));
         // Inserted fd is a Stdin resource, not a File. resolve_via_dirfd
         // would return ENOTDIR for it. We assert the resource kind here.
-        match fds.get(fd).unwrap() {
-            Resource::File(_) => panic!("expected non-File resource"),
-            _ => {} // OK — would be ENOTDIR in resolve_via_dirfd.
+        if let Resource::File(_) = fds.get(fd).unwrap() {
+            panic!("expected non-File resource");
         }
+        // Non-File is OK here — would be ENOTDIR in resolve_via_dirfd.
     }
 
     #[test]

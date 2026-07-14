@@ -102,6 +102,7 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
     rt.block_on(f)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_sigaction(
     engine: &wasmtime::Engine,
     linker: &wasmtime::Linker<Kernel>,

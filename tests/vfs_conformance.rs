@@ -293,7 +293,6 @@ const READV_ZERO_WAT: &str = r#"
 "#;
 
 /// Helpers -----------------------------------------------------------------
-
 /// Build a WAT with a literal byte payload written at offset 4096.
 fn wat_with_payload(payload: &[u8]) -> String {
     let mut s = String::new();
@@ -325,13 +324,12 @@ fn wat_with_payload(payload: &[u8]) -> String {
 
 /// Run a no-arg-extra wasm function and return the result + store.
 // (unused — tests instantiate their own stores inline)
-
 /// Place a NUL-terminated copy of `s` at offset 4096, return the ptr (4096).
 fn write_cstr(store: &mut wasmtime::Store<Kernel>, s: &str) -> i64 {
     let mem = store.data().memory().unwrap().clone();
     let bytes = s.as_bytes();
     {
-        let mut data = mem.data_mut(store);
+        let data = mem.data_mut(store);
         data[4096..4096 + bytes.len()].copy_from_slice(bytes);
         data[4096 + bytes.len()] = 0;
     }

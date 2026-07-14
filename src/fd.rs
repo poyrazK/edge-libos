@@ -312,6 +312,7 @@ impl SocketInner {
 /// Lock-discipline: same as everywhere else — never hold a
 /// `parking_lot::Mutex` guard across `.await`.
 #[allow(dead_code)]
+#[derive(Default)]
 pub struct UnixSockInner {
     pub path: Option<PathBuf>,
     pub listener: Option<UnixListener>,
@@ -324,13 +325,7 @@ pub struct UnixSockInner {
 
 impl UnixSockInner {
     pub fn new() -> Self {
-        Self {
-            path: None,
-            listener: None,
-            stream: None,
-            dgram: None,
-            peer_addr: None,
-        }
+        Self::default()
     }
 }
 

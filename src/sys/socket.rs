@@ -221,21 +221,15 @@ fn parse_sockaddr(
         Err(_) => return Err(-EINVAL),
     };
     // Bounds-check the smallest possible sockaddr header (family field).
-    let header = match mem::guest_slice(caller, addr_ptr, 2) {
-        Ok(b) => b,
-        Err(e) => return Err(e),
-    };
+    let header = mem::guest_slice(caller, addr_ptr, 2)?;
     let family = u16::from_le_bytes([header[0], header[1]]) as i32;
 
     match family {
         AF_INET => {
-            if (len as usize) < SOCKADDR_IN_SIZE {
+            if len < SOCKADDR_IN_SIZE {
                 return Err(-EINVAL);
             }
-            let bytes = match mem::guest_slice(caller, addr_ptr, SOCKADDR_IN_SIZE as i64) {
-                Ok(b) => b,
-                Err(e) => return Err(e),
-            };
+            let bytes = mem::guest_slice(caller, addr_ptr, SOCKADDR_IN_SIZE as i64)?;
             // struct sockaddr_in { sa_family_t sin_family; u16 sin_port; u32 sin_addr; u8 pad[8]; }
             // Network byte order for port and addr.
             let port = u16::from_be_bytes([bytes[2], bytes[3]]);
@@ -243,13 +237,10 @@ fn parse_sockaddr(
             Ok(SockAddr::V4 { port, addr })
         }
         AF_INET6 => {
-            if (len as usize) < SOCKADDR_IN6_SIZE {
+            if len < SOCKADDR_IN6_SIZE {
                 return Err(-EINVAL);
             }
-            let bytes = match mem::guest_slice(caller, addr_ptr, SOCKADDR_IN6_SIZE as i64) {
-                Ok(b) => b,
-                Err(e) => return Err(e),
-            };
+            let bytes = mem::guest_slice(caller, addr_ptr, SOCKADDR_IN6_SIZE as i64)?;
             // struct sockaddr_in6 { u16 sin6_family; u16 sin6_port; u32 flowinfo; u8 addr[16]; u32 scope_id; }
             let port = u16::from_be_bytes([bytes[2], bytes[3]]);
             let mut addr = [0u8; 16];
@@ -259,14 +250,11 @@ fn parse_sockaddr(
         AF_UNIX => {
             // P2-C3 part 2: parse `struct sockaddr_un` (110 bytes).
             // `sun_family` (u16 LE) at offset 0, `sun_path` (108 bytes) at offset 2.
-            if (len as usize) < 3 {
+            if len < 3 {
                 // At least family + 1 byte of path (or NUL) required.
                 return Err(-EINVAL);
             }
-            let bytes = match mem::guest_slice(caller, addr_ptr, SOCKADDR_UN_SIZE as i64) {
-                Ok(b) => b,
-                Err(e) => return Err(e),
-            };
+            let bytes = mem::guest_slice(caller, addr_ptr, SOCKADDR_UN_SIZE as i64)?;
             // Abstract namespace (sun_path[0] == 0) → -EOPNOTSUPP.
             if bytes[2] == 0 {
                 return Err(-EOPNOTSUPP);
@@ -1725,10 +1713,7 @@ fn read_msghdr_iov(
     caller: &mut Caller<'_, Kernel>,
     msghdr_ptr: i64,
 ) -> Result<(Vec<u8>, i32, bool, i64), i64> {
-    let mhdr = match mem::guest_slice(caller, msghdr_ptr, MSGHDR_SIZE) {
-        Ok(b) => b,
-        Err(e) => return Err(e),
-    };
+    let mhdr = mem::guest_slice(caller, msghdr_ptr, MSGHDR_SIZE)?;
     let iov_ptr = u32::from_le_bytes(mhdr[MSG_IOV_OFF..MSG_IOV_OFF + 4].try_into().unwrap()) as i64;
     let iov_count =
         u32::from_le_bytes(mhdr[MSG_IOVLEN_OFF..MSG_IOVLEN_OFF + 4].try_into().unwrap()) as i64;
@@ -1742,10 +1727,7 @@ fn read_msghdr_iov(
     }
     let iov_count_us = iov_count as usize;
     let total_iov_bytes = (iov_count as i64).checked_mul(8).unwrap_or(i64::MAX);
-    let iov_bytes = match mem::guest_slice(caller, iov_ptr, total_iov_bytes) {
-        Ok(b) => b,
-        Err(e) => return Err(e),
-    };
+    let iov_bytes = mem::guest_slice(caller, iov_ptr, total_iov_bytes)?;
     let mut payload = Vec::new();
     let mut total_len: usize = 0;
     for i in 0..iov_count_us {
@@ -1754,10 +1736,7 @@ fn read_msghdr_iov(
         let iov_len = u32::from_le_bytes(iov_bytes[base + 4..base + 8].try_into().unwrap()) as i64;
         total_len = total_len.saturating_add(iov_len.max(0) as usize);
         if iov_base != 0 && iov_len > 0 {
-            let data = match mem::guest_slice(caller, iov_base, iov_len) {
-                Ok(d) => d,
-                Err(e) => return Err(e),
-            };
+            let data = mem::guest_slice(caller, iov_base, iov_len)?;
             payload.extend_from_slice(data);
         }
     }
@@ -1769,7 +1748,7 @@ fn read_msghdr_iov(
 /// * `MSG_DONTWAIT` — flip nonblock for the duration.
 /// * `MSG_NOSIGNAL` — accepted, discarded (we don't deliver SIGPIPE).
 /// * `MSG_PEEK` — invalid for send; ignored.
-/// Other flags accepted silently. Returns the number of bytes written.
+/// * Other flags accepted silently. Returns the number of bytes written.
 pub async fn sendmsg(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let fd = match u32::try_from(a[0]) {
         Ok(f) => f,
@@ -1965,7 +1944,7 @@ pub async fn recvmsg(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     {
         let fds = &mut caller.data_mut().fds;
         if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
-            let mut gs = s.lock();
+            let gs = s.lock();
             let mut buf = gs.peek_buf.lock();
             if !buf.is_empty() {
                 let take = buf.len().min(total_cap);
@@ -2132,10 +2111,9 @@ async fn sendto_unix(
     buf_ptr: i64,
     buf_len_raw: i64,
 ) -> i64 {
-    let _ = match usize::try_from(buf_len_raw) {
-        Ok(_) => {}
-        Err(_) => return -crate::errno::EFAULT,
-    };
+    if usize::try_from(buf_len_raw).is_err() {
+        return -crate::errno::EFAULT;
+    }
     let bytes = match mem::guest_slice(caller, buf_ptr, buf_len_raw) {
         Ok(b) => b.to_vec(),
         Err(e) => return e,

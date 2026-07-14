@@ -31,7 +31,7 @@ impl Vfs {
     /// Build a VFS rooted at `preopen`. The cwd starts at `preopen`.
     pub fn new(preopen: impl Into<PathBuf>) -> VfsResult<Self> {
         let root = preopen.into();
-        let root = fs::canonicalize(&root).map_err(|e| io_to_errno(e))?;
+        let root = fs::canonicalize(&root).map_err(io_to_errno)?;
         Ok(Self {
             cwd: root.clone(),
             root,
@@ -266,7 +266,7 @@ impl Stat {
         Self {
             st_dev: 0,
             st_ino: meta.ino(),
-            st_nlink: meta.nlink() as u64,
+            st_nlink: meta.nlink(),
             st_mode: mode,
             st_uid: 1000,
             st_gid: 1000,
@@ -416,7 +416,7 @@ fn io_to_errno(e: io::Error) -> i64 {
         TooManyLinks => ELOOP,
         _ => EIO,
     };
-    -(code as i64)
+    -code
 }
 
 #[cfg(test)]

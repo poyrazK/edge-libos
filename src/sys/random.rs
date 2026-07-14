@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn max_len_is_sane() {
-        assert!(MAX_LEN >= 64, "must allow CPython hash-seed request");
-        assert!(MAX_LEN <= 65536, "must not allow runaway requests");
+        const _: () = assert!(MAX_LEN >= 64); // CPython hash-seed request
+        const _: () = assert!(MAX_LEN <= 65536); // not runaway
     }
 }
