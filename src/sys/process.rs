@@ -167,7 +167,7 @@ pub async fn kill(_caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     if pid != 0 && pid != 1 {
         return -ESRCH;
     }
-    if sig < 0 || !(0..=64).contains(&sig) {
+    if !(0..=64).contains(&sig) {
         return -EINVAL;
     }
     // We don't actually deliver in v1 — return success.
@@ -183,7 +183,7 @@ pub async fn tgkill(_caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     if (tgid != 0 && tgid != 1) || (tid != 0 && tid != 1) {
         return -ESRCH;
     }
-    if sig < 0 || !(0..=64).contains(&sig) {
+    if !(0..=64).contains(&sig) {
         return -EINVAL;
     }
     0

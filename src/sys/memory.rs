@@ -44,7 +44,7 @@ pub async fn mmap(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     // Snapshot the Memory handle (it's Copy) so we don't hold a &Kernel
     // borrow across the data_mut reborrow.
     let mem = match caller.data().memory() {
-        Ok(m) => m.clone(),
+        Ok(m) => *m,
         Err(e) => return e,
     };
     let cur = mem_size(caller);

@@ -57,7 +57,7 @@ pub async fn getrandom(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 
     // Now copy into guest memory via the (Copy) Memory handle.
     let mem = match caller.data().memory() {
-        Ok(m) => m.clone(),
+        Ok(m) => *m,
         Err(e) => return e,
     };
     let bytes = match mem::guest_slice_mut_via(&mem, caller, buf, len as i64) {
