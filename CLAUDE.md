@@ -152,7 +152,26 @@ binary; `src/cli/mod.rs::run_main` dispatches by subcommand:
   syscall. It does **not** re-mirror the dispatch table, so new syscalls are
   picked up automatically. Supports `--diff <baseline>` (fail if a baseline
   syscall is missing).
-- `freeze` / `serve` / `bench` — stubs in D3.3; body lands in D3.5 / D3.7.
+- `freeze <wasm> [--] [args...] --out <path>` — instantiates the
+  guest, drives it with a bounded 10s timeout (covers
+  short-lived guests + server-style guests parked in
+  `accept4`/`epoll_wait`), then writes a postcard snapshot.
+  Includes the **ephemeral-port-drift fix** at
+  `src/snapshot.rs:560-580` — without it, snapshots taken
+  from `bind(0.0.0.0:0)` would record `bound.port=0` and
+  `apply_snapshot` would bind a *different* port than the
+  snapshot says.
+- `serve <snap> <wasm> [--port <p>]` — reads a snapshot,
+  instantiates the matching wasm, applies kernel state +
+  memory, then respawns the guest at the post-snapshot
+  state. `--port <p>` pre-mutates the snapshot's V4 listener
+  bound port so `apply_snapshot` rebinds to `<p>` rather than
+  the WAT-recorded port.
+- `bench <snap> <wasm> --iters <n>` — hand-rolled
+  p50/p95/p99/max over `apply_snapshot_*` cycles (engine
+  construct hoisted out of the iter loop; ~10 ms saved/iter).
+  Zero new deps (no criterion, no divan). `p50 < 5 ms` gate;
+  violation → `CliError::Bench → exit 1`.
 
 The binary embeds nothing CPython-specific — the runtime accepts any guest
 whose imports are satisfied by `kernel.syscall` and imported memory/table.

@@ -160,6 +160,39 @@ deferred op being silently dropped — NEVER a panic, NEVER a
 `-EFAULT` returned to the guest for a snapshot-internal
 inconsistency. The guest never sees the restore happen.
 
+### 8. Cold-start measurement
+
+The wire-format stability above is necessary but not sufficient
+for the P2-D3 demo: every new restore has to be measurable against
+an SLA. P2-D3.7 provides `edge-cli bench <snap> <wasm> --iters 50`:
+
+- The two-arg form (`<snap> <wasm>`) reflects the snapshot's
+  design — `KernelSnapshot` does not carry module bytes
+  (`src/snapshot.rs:158-187`), so serving or benching from it
+  needs the matching wasm on disk.
+- Engine construction is hoisted out of the iter loop (~10ms
+  saved per iter); each iter re-builds linker+store+kernel,
+  deserializes the module, instantiates, attaches memory, and
+  times only the two-`apply_snapshot_*` calls. The gate measures
+  **restore cost**, which is the dominant component of cold-start.
+- The aspirational latency figure ("1 ms cold-start demo",
+  `README.md:97-98`) describes the **target restore cost**
+  after full CPython+FastAPI work lands. The current 50-iter
+  bench gate is **p50 < 5 ms** — five times looser than the
+  aspirational target, but tight enough to catch any regression
+  that drops restore cost off the µs scale. The gate is wired
+  into `scripts/reproduce_dod.sh` step 10 (D3.8); p50 >= 5 ms
+  causes `CliError::Bench → exit 1` (`src/cli/mod.rs:108-111`).
+- The bench reports p50/p95/p99/max in µs. p50 is the gate;
+  p95/p99 catch tail-latency regressions that p50 alone would
+  hide (e.g. a single expensive syscall path that's slower
+  5% of the time).
+
+Caveat (NOT addressed by this ADR): bench trusts the wasm
+path matches freeze's. Future: embed a module hash in
+`KernelSnapshot`, bump `SNAPSHOT_FORMAT_VERSION`, refuse to
+apply if hashes disagree.
+
 ## Consequences
 
 ### What this ADR mandates on P2-D

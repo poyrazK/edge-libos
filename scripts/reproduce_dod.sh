@@ -12,12 +12,13 @@
 #   7. DoD #1 + DoD #2 with the real python.wasm     — print(2+2), import fastapi
 #   8. DoD #3: edge-cli run serve_one_request.py   — real uvicorn+FastAPI HTTP serve
 #   9. bash tests/count_tests.sh                     — print the canonical test totals
+#  10. DoD #4: edge-cli bench                         — 50-iter cold-start, p50 < 5ms gate
 #
 # Steps that require tools not available on the host (no zig, no
 # strace, no CPython submodule) print a SKIP notice and the script
 # continues rather than aborting. A full Linux CI box with the cpython
 # submodule should hit every step green; macOS dev boxes typically
-# hit 1-5, 9 and skip 6-8 (no zig + no submodule).
+# hit 1-5, 9-10 and skip 6-8 (no zig + no submodule).
 
 set -uo pipefail
 
@@ -35,6 +36,7 @@ cd "$ROOT" || exit 1
 # SKIP_GUEST=1       skip step 6 (guest/build.sh)
 # SKIP_DOD_SMOKE=1   skip steps 7 + 8 (real python.wasm DoD smokes)
 # SKIP_TEST_TOTALS=1 skip step 9 (count_tests summary)
+# SKIP_BENCH=1       skip step 10 (edge-cli bench cold-start demo)
 SKIP_DEV_SETUP="${SKIP_DEV_SETUP:-0}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 SKIP_RUST_TEST="${SKIP_RUST_TEST:-0}"
@@ -43,6 +45,7 @@ SKIP_STRACE_DIFF="${SKIP_STRACE_DIFF:-0}"
 SKIP_GUEST="${SKIP_GUEST:-0}"
 SKIP_DOD_SMOKE="${SKIP_DOD_SMOKE:-0}"
 SKIP_TEST_TOTALS="${SKIP_TEST_TOTALS:-0}"
+SKIP_BENCH="${SKIP_BENCH:-0}"
 
 say()  { echo "==> $*"; }
 skip() { echo "SKIP: $*"; }
@@ -56,32 +59,32 @@ mark_ran()  { ran_steps+=("$1"); }
 mark_skip() { skipped_steps+=("$1"); }
 mark_env_skipped() { skipped_steps+=("$1 (env-skipped)"); }
 
-say "1/8 dev_setup.sh"
+say "1/10 dev_setup.sh"
 if [[ "$SKIP_DEV_SETUP" == "1" ]]; then skip "1 dev_setup (SKIP_DEV_SETUP=1)"; mark_env_skipped "dev_setup"
 elif bash scripts/dev_setup.sh; then mark_ran "dev_setup"; else mark_skip "dev_setup"; fi
 
-say "2/8 cargo build --release"
+say "2/10 cargo build --release"
 if [[ "$SKIP_BUILD" == "1" ]]; then skip "2 build (SKIP_BUILD=1)"; mark_env_skipped "build"
 elif cargo build --release; then mark_ran "build"; else warn "cargo build failed"; exit 1; fi
 
-say "3/8 cargo test --release"
+say "3/10 cargo test --release"
 if [[ "$SKIP_RUST_TEST" == "1" ]]; then skip "3 cargo test (SKIP_RUST_TEST=1)"; mark_env_skipped "cargo-test"
 elif cargo test --release; then mark_ran "cargo-test"; else warn "cargo test failed"; fi
 
 # 4. C conformance suite — marker-enforced. This is the test the P1 closeout
 # was falsely passing (it grepped the syscall name but never read the
 # mark_pass/mark_fail marker). Now it does.
-say "4/8 C conformance (marker-enforced)"
+say "4/10 C conformance (marker-enforced)"
 if [[ "$SKIP_C_CONFORMANCE" == "1" ]]; then skip "4 c-conformance (SKIP_C_CONFORMANCE=1)"; mark_env_skipped "c-conformance"
 elif bash tests/conformance/runner.sh; then mark_ran "c-conformance"; else mark_skip "c-conformance (failures reported above)"; fi
 
 # 5. Strace-baseline-diff subset. Runs independently of step 4.
-say "5/8 strace baseline diff"
+say "5/10 strace baseline diff"
 if [[ "$SKIP_STRACE_DIFF" == "1" ]]; then skip "5 strace-diff (SKIP_STRACE_DIFF=1)"; mark_env_skipped "strace-diff"
 elif cargo test --release --test strace_baseline_diff; then mark_ran "strace-diff"; else mark_skip "strace-diff"; fi
 
 # 6. CPython cross-compile. Requires zig + git submodule.
-say "6/8 guest/build.sh (CPython cross-compile)"
+say "6/10 guest/build.sh (CPython cross-compile)"
 if [[ "$SKIP_GUEST" == "1" ]]; then
     skip "6 guest/build (SKIP_GUEST=1)"; mark_env_skipped "guest-build"; PY_WASM=""
 elif [[ -d guest/cpython ]] && have zig; then
@@ -100,7 +103,7 @@ else
 fi
 
 # 7. DoD #1 + DoD #2 with the real python.wasm.
-say "7/8 DoD #1 + DoD #2 (print(2+2) and import fastapi)"
+say "7/10 DoD #1 + DoD #2 (print(2+2) and import fastapi)"
 if [[ "$SKIP_DOD_SMOKE" == "1" ]]; then
     skip "7 dod smoke (SKIP_DOD_SMOKE=1)"; mark_env_skipped "dod-smoke"
 elif [[ -n "$PY_WASM" && -f "$PY_WASM" ]]; then
@@ -120,7 +123,7 @@ else
 fi
 
 # 8. DoD #3 — the headline: real uvicorn+FastAPI HTTP serve.
-say "8/8 DoD #3: serve_one_request.py (real uvicorn+FastAPI)"
+say "8/10 DoD #3: serve_one_request.py (real uvicorn+FastAPI)"
 if [[ "$SKIP_DOD_SMOKE" == "1" ]]; then
     skip "8 dod-3 (SKIP_DOD_SMOKE=1)"; mark_env_skipped "dod-3"
 elif [[ -n "$PY_WASM" && -f "$PY_WASM" ]] && have curl; then
@@ -150,15 +153,68 @@ else
 fi
 
 # 9. Canonical test totals — agrees with HANDOFF.md and README.md.
-say "9 (post-check) test totals"
+say "9/10 test totals"
 if [[ "$SKIP_TEST_TOTALS" == "1" ]]; then skip "9 test-count (SKIP_TEST_TOTALS=1)"; mark_env_skipped "test-count"
 elif bash tests/count_tests.sh; then mark_ran "test-count"; else mark_skip "test-count"; fi
+
+# 10. DoD #4 — the cold-start demo. Drives `edge-cli freeze` to
+# produce a snapshot, then `edge-cli bench <snap> <wasm> --iters 50`,
+# asserting p50 < 5ms. The gate fires via `CliError::Bench → exit 1`
+# (src/cli/mod.rs:108-111); success is exit 0. If `python.wasm` was
+# built in step 6 we use it (real workload); otherwise we fall back
+# to the WAT smoke fixture if `wat2wasm` is on PATH; otherwise SKIP.
+say "10/10 DoD #4: edge-cli bench (50-iter cold-start, p50 < 5 ms)"
+if [[ "$SKIP_BENCH" == "1" ]]; then
+    skip "10 bench (SKIP_BENCH=1)"; mark_env_skipped "bench"
+    BENCH_RESULT="skipped"
+elif [[ -x "$ROOT/target/release/edge-cli" ]]; then
+    EDGE_CLI_BIN="$ROOT/target/release/edge-cli"
+    SNAP=/tmp/edge-cli.dod10.snap
+    WAT_SMOKE=/tmp/edge-cli.dod10.wasm
+    if [[ -n "$PY_WASM" && -f "$PY_WASM" ]]; then
+        BENCH_SRC="$PY_WASM"
+    elif have wat2wasm; then
+        wat2wasm tests/guests/serve_one_request.wat -o "$WAT_SMOKE" \
+            && BENCH_SRC="$WAT_SMOKE" \
+            || BENCH_SRC=""
+    else
+        BENCH_SRC=""
+    fi
+    if [[ -z "$BENCH_SRC" ]]; then
+        skip "no python.wasm and no wat2wasm for bench fixture"
+        mark_skip "bench"
+        BENCH_RESULT="skipped"
+    elif "$EDGE_CLI_BIN" freeze "$BENCH_SRC" --out "$SNAP" >/tmp/edge-cli.dod10.freeze.log 2>&1; then
+        if "$EDGE_CLI_BIN" bench "$SNAP" "$BENCH_SRC" --iters 50 \
+                >/tmp/edge-cli.dod10.bench.log 2>&1; then
+            BENCH_RESULT="ok"
+            P50_LINE=$(grep -E '^[[:space:]]+p50:' /tmp/edge-cli.dod10.bench.log | head -1 || true)
+            echo "    bench: ${P50_LINE:-<no p50 line>}"
+            mark_ran "bench"
+        else
+            warn "edge-cli bench FAILED (p50 >= 5ms?)"
+            sed 's/^/      /' /tmp/edge-cli.dod10.bench.log >&2 || true
+            mark_skip "bench (p50 >= 5ms)"
+            BENCH_RESULT="fail"
+        fi
+    else
+        warn "edge-cli freeze failed; cannot bench"
+        sed 's/^/      /' /tmp/edge-cli.dod10.freeze.log >&2 || true
+        mark_skip "bench (freeze failed)"
+        BENCH_RESULT="freeze-failed"
+    fi
+else
+    skip "no edge-cli binary built; cannot run bench"
+    mark_skip "bench"
+    BENCH_RESULT="skipped"
+fi
 
 say "✅ reproduce_dod.sh complete"
 echo
 echo "Summary:"
 echo "  Ran:     ${ran_steps[*]:-(none)}"
 echo "  Skipped: ${skipped_steps[*]:-(none)}"
+echo "  Bench:   ${BENCH_RESULT:-skipped}"
 echo
 echo "Conformance: bash tests/conformance/runner.sh"
 echo "Test totals: bash tests/count_tests.sh"
