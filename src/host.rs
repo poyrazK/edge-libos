@@ -20,11 +20,11 @@ pub fn build_engine() -> Result<Engine> {
     // NB: in wasmtime 45.0.3, async host functions are always supported —
     // `Config::async_support` is deprecated and a no-op.
     cfg.wasm_threads(false); // v1 single-threaded — see ADR 0001 §2.
-    // P3 follow-on (wasm_threads(true)): ALSO add "threads" to the
-    // wasmtime feature list in Cargo.toml:22 (currently
-    // ["component-model", "async", "anyhow"]). The bool flip alone is
-    // not enough — wasmtime 45.0.3 gates the threads feature at the
-    // crate-feature level.
+                             // P3 follow-on (wasm_threads(true)): ALSO add "threads" to the
+                             // wasmtime feature list in Cargo.toml:22 (currently
+                             // ["component-model", "async", "anyhow"]). The bool flip alone is
+                             // not enough — wasmtime 45.0.3 gates the threads feature at the
+                             // crate-feature level.
     Ok(Engine::new(&cfg)?)
 }
 

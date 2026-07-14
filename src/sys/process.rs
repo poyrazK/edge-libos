@@ -95,9 +95,7 @@ pub async fn sched_getaffinity(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> 
         Err(e) => return e,
     };
     bytes[0] = 0x01; // CPU 0 only
-    for i in 1..to_write as usize {
-        bytes[i] = 0;
-    }
+    bytes[1..to_write as usize].fill(0);
     to_write
 }
 
@@ -169,7 +167,7 @@ pub async fn kill(_caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     if pid != 0 && pid != 1 {
         return -ESRCH;
     }
-    if sig < 0 || sig > 64 {
+    if !(0..=64).contains(&sig) {
         return -EINVAL;
     }
     // We don't actually deliver in v1 — return success.
@@ -185,7 +183,7 @@ pub async fn tgkill(_caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     if (tgid != 0 && tgid != 1) || (tid != 0 && tid != 1) {
         return -ESRCH;
     }
-    if sig < 0 || sig > 64 {
+    if !(0..=64).contains(&sig) {
         return -EINVAL;
     }
     0

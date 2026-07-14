@@ -57,7 +57,7 @@ pub async fn getrandom(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 
     // Now copy into guest memory via the (Copy) Memory handle.
     let mem = match caller.data().memory() {
-        Ok(m) => m.clone(),
+        Ok(m) => *m,
         Err(e) => return e,
     };
     let bytes = match mem::guest_slice_mut_via(&mem, caller, buf, len as i64) {
@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn max_len_is_sane() {
-        assert!(MAX_LEN >= 64, "must allow CPython hash-seed request");
-        assert!(MAX_LEN <= 65536, "must not allow runaway requests");
+        const _: () = assert!(MAX_LEN >= 64); // CPython hash-seed request
+        const _: () = assert!(MAX_LEN <= 65536); // not runaway
     }
 }

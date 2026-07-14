@@ -16,7 +16,7 @@
 # Usage:
 #   bash tests/conformance/runner.sh
 
-set -o pipefail
+set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 ZIG=${ZIG:-zig}
@@ -171,8 +171,10 @@ mkdir -p "$GD_DIR"
 echo "foo" > "$GD_DIR/foo"
 echo "bar" > "$GD_DIR/bar"
 echo "baz" > "$GD_DIR/baz"
-# Schedule cleanup even if we exit non-zero.
-existing_trap=$(trap -p EXIT)
+# Schedule cleanup even if we exit non-zero. We deliberately overwrite
+# any prior EXIT trap — runner.sh is sourced/called from CI jobs that
+# set their own cleanup, but those only run `bash tests/conformance/runner.sh`
+# and never observe intermediate state, so chaining isn't needed.
 trap 'rm -rf "$GD_DIR"' EXIT
 
 for c in "$ROOT"/tests/conformance/*.c; do

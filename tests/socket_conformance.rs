@@ -27,7 +27,7 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 /// Test isolation: each test gets its own tmpdir for the kernel's preopen.
 /// (P1-1 doesn't need a preopen — sockets are host-side — but we keep the
 /// pattern identical to vfs_conformance for consistency.)
-struct TmpDir(PathBuf);
+struct TmpDir(#[allow(dead_code)] PathBuf);
 impl TmpDir {
     fn new() -> Self {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -440,7 +440,7 @@ fn bind_listen_loopback_succeeds() -> Result<()> {
                 assert!(gs.is_listening(), "bind+listen -> is_listening");
             }
             Err(e) => panic!("fd {fd} was missing after bind+listen: {e}"),
-            Ok(other) => panic!(
+            Ok(_other) => panic!(
                 "fd {fd} was not a Socket resource: found {} variant",
                 std::any::type_name::<Resource>()
             ),
@@ -581,22 +581,6 @@ const ACCEPT4_WAT: &str = r#"
     )
 "#;
 
-/// `accept(fd, addr_ptr, addrlen_ptr)` — legacy shim.
-const ACCEPT_WAT: &str = r#"
-    (module
-      (import "kernel" "syscall"
-        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
-      (memory (export "memory") 1)
-      (func (export "go") (param $fd i64) (result i64)
-        (call $syscall
-          (i64.const 43)              ;; NR_ACCEPT
-          (local.get $fd)
-          (i64.const 4096)
-          (i64.const 4112)
-          (i64.const 0) (i64.const 0) (i64.const 0)))
-    )
-"#;
-
 async fn call_accept4(
     linker: &wasmtime::Linker<Kernel>,
     store: &mut wasmtime::Store<Kernel>,
@@ -610,20 +594,6 @@ async fn call_accept4(
     }
     let f = inst.get_typed_func::<(i64, i64), i64>(&mut *store, "go")?;
     Ok(f.call_async(&mut *store, (fd, flags)).await?)
-}
-
-async fn call_accept(
-    linker: &wasmtime::Linker<Kernel>,
-    store: &mut wasmtime::Store<Kernel>,
-    module: &wasmtime::Module,
-    fd: i64,
-) -> Result<i64> {
-    let inst = linker.instantiate_async(&mut *store, module).await?;
-    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
-        store.data_mut().attach_memory(mem);
-    }
-    let f = inst.get_typed_func::<i64, i64>(&mut *store, "go")?;
-    Ok(f.call_async(&mut *store, fd).await?)
 }
 
 /// `accept4` on an fd that isn't a Socket returns -EBADF.
@@ -680,7 +650,7 @@ fn accept4_after_host_connect_returns_valid_fd() -> Result<()> {
     drop(host_listener_std);
 
     let sock = common::compile_wat(&engine, SOCKET_WAT)?;
-    let bind = common::compile_wat(&engine, BIND_WAT)?;
+    let _bind = common::compile_wat(&engine, BIND_WAT)?;
     let listen = common::compile_wat(&engine, LISTEN_WAT)?;
     let acc = common::compile_wat(&engine, ACCEPT4_WAT)?;
     let close = common::compile_wat(&engine, CLOSE_WAT)?;
@@ -688,7 +658,7 @@ fn accept4_after_host_connect_returns_valid_fd() -> Result<()> {
     // Custom BIND_WAT that takes a port (16-bit) in addition to fd:
     // builds sockaddr_in at offset 4096 with the guest-supplied port.
     // Family = AF_INET(2), addr = 127.0.0.1.
-    let bind_param_wat = format!(
+    let bind_param_wat = String::from(
         r#"
         (module
           (import "kernel" "syscall"
@@ -709,7 +679,7 @@ fn accept4_after_host_connect_returns_valid_fd() -> Result<()> {
               (i64.const 4096)
               (i64.const 16)
               (i64.const 0) (i64.const 0) (i64.const 0))))
-    "#
+    "#,
     );
     let port_be = port.to_be_bytes();
     let bind_param_wat = bind_param_wat.replace(
@@ -851,26 +821,10 @@ async fn call_connect(
     Ok(f.call_async(&mut *store, fd).await?)
 }
 
-async fn call_sendto(
-    linker: &wasmtime::Linker<Kernel>,
-    store: &mut wasmtime::Store<Kernel>,
-    module: &wasmtime::Module,
-    fd: i64,
-    len: i64,
-) -> Result<i64> {
-    let inst = linker.instantiate_async(&mut *store, module).await?;
-    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
-        store.data_mut().attach_memory(mem);
-    }
-    let f = inst.get_typed_func::<(i64, i64), i64>(&mut *store, "go")?;
-    Ok(f.call_async(&mut *store, (fd, len)).await?)
-}
-
 /// Variant of call_sendto that reuses an existing instance — needed when
 /// the test has written payload bytes into the guest memory after the
 /// instance was created (each `instantiate_async` creates a fresh memory).
 async fn call_sendto_reuse(
-    linker: &wasmtime::Linker<Kernel>,
     store: &mut wasmtime::Store<Kernel>,
     instance: &wasmtime::Instance,
     fd: i64,
@@ -884,26 +838,10 @@ async fn call_sendto_reuse(
     Ok(f.call_async(&mut *store, (fd, len)).await?)
 }
 
-async fn call_recvfrom(
-    linker: &wasmtime::Linker<Kernel>,
-    store: &mut wasmtime::Store<Kernel>,
-    module: &wasmtime::Module,
-    fd: i64,
-    len: i64,
-) -> Result<i64> {
-    let inst = linker.instantiate_async(&mut *store, module).await?;
-    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
-        store.data_mut().attach_memory(mem);
-    }
-    let f = inst.get_typed_func::<(i64, i64), i64>(&mut *store, "go")?;
-    Ok(f.call_async(&mut *store, (fd, len)).await?)
-}
-
 /// Variant of call_recvfrom that reuses an existing instance — needed
 /// when the test wants to read the bytes back from the same memory the
 /// recvfrom wrote into.
 async fn call_recvfrom_reuse(
-    linker: &wasmtime::Linker<Kernel>,
     store: &mut wasmtime::Store<Kernel>,
     instance: &wasmtime::Instance,
     fd: i64,
@@ -936,7 +874,7 @@ fn connect_on_non_socket_returns_ebadf() -> Result<()> {
 
 /// `connect` to a closed port returns -ECONNREFUSED.
 #[test]
-fn connect_to_closed_port_returns_ECONNREFUSED() -> Result<()> {
+fn connect_to_closed_port_returns_econnrefused() -> Result<()> {
     let _d = TmpDir::new();
     let (engine, linker) = common::engine_and_linker()?;
     let sock = common::compile_wat(&engine, SOCKET_WAT)?;
@@ -997,7 +935,7 @@ fn sendto_then_recvfrom_roundtrips_over_loopback() -> Result<()> {
 
     let (engine, linker) = common::engine_and_linker()?;
     let sock = common::compile_wat(&engine, SOCKET_WAT)?;
-    let bind = common::compile_wat(&engine, BIND_WAT)?;
+    let _bind = common::compile_wat(&engine, BIND_WAT)?;
     let listen = common::compile_wat(&engine, LISTEN_WAT)?;
     let acc = common::compile_wat(&engine, ACCEPT4_WAT)?;
     let sendto = common::compile_wat(&engine, SENDTO_WAT)?;
@@ -1006,7 +944,7 @@ fn sendto_then_recvfrom_roundtrips_over_loopback() -> Result<()> {
 
     // Build a bind WAT for the specific port.
     let port_be = port.to_be_bytes();
-    let bind_wat = format!(
+    let bind_wat = String::from(
         r#"
         (module
           (import "kernel" "syscall"
@@ -1022,7 +960,7 @@ fn sendto_then_recvfrom_roundtrips_over_loopback() -> Result<()> {
               (i64.const 4096)
               (i64.const 16)
               (i64.const 0) (i64.const 0) (i64.const 0))))
-    "#
+    "#,
     );
     let bind_wat = bind_wat.replace(
         "PATCH_PORT",
@@ -1080,7 +1018,7 @@ fn sendto_then_recvfrom_roundtrips_over_loopback() -> Result<()> {
         }
         let n = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            call_recvfrom_reuse(&linker, &mut store, &recv_inst, accepted, 16),
+            call_recvfrom_reuse(&mut store, &recv_inst, accepted, 16),
         )
         .await
         .map_err(|_| anyhow::anyhow!("recvfrom timed out"))??;
@@ -1107,7 +1045,7 @@ fn sendto_then_recvfrom_roundtrips_over_loopback() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("no memory"))?;
         let to_send = b"world";
         mem.write(&mut store, 4096, to_send)?;
-        let sent = call_sendto_reuse(&linker, &mut store, &send_inst, accepted, 5).await?;
+        let sent = call_sendto_reuse(&mut store, &send_inst, accepted, 5).await?;
         assert_eq!(sent, 5, "sendto should write 5 bytes");
 
         // Give tokio a moment to flush the bytes through the kernel stream.
@@ -1219,24 +1157,7 @@ const POLL_WAT: &str = r#"
     )
 "#;
 
-async fn call_getsockopt(
-    linker: &wasmtime::Linker<Kernel>,
-    store: &mut wasmtime::Store<Kernel>,
-    module: &wasmtime::Module,
-    fd: i64,
-    level: i64,
-    optname: i64,
-) -> Result<i64> {
-    let inst = linker.instantiate_async(&mut *store, module).await?;
-    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
-        store.data_mut().attach_memory(mem);
-    }
-    let f = inst.get_typed_func::<(i64, i64, i64), i64>(&mut *store, "go")?;
-    Ok(f.call_async(&mut *store, (fd, level, optname)).await?)
-}
-
 async fn call_getsockopt_reuse(
-    linker: &wasmtime::Linker<Kernel>,
     store: &mut wasmtime::Store<Kernel>,
     instance: &wasmtime::Instance,
     fd: i64,
@@ -1250,22 +1171,7 @@ async fn call_getsockopt_reuse(
     Ok(f.call_async(&mut *store, (fd, level, optname)).await?)
 }
 
-async fn call_getsockname(
-    linker: &wasmtime::Linker<Kernel>,
-    store: &mut wasmtime::Store<Kernel>,
-    module: &wasmtime::Module,
-    fd: i64,
-) -> Result<i64> {
-    let inst = linker.instantiate_async(&mut *store, module).await?;
-    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
-        store.data_mut().attach_memory(mem);
-    }
-    let f = inst.get_typed_func::<i64, i64>(&mut *store, "go")?;
-    Ok(f.call_async(&mut *store, fd).await?)
-}
-
 async fn call_getsockname_reuse(
-    linker: &wasmtime::Linker<Kernel>,
     store: &mut wasmtime::Store<Kernel>,
     instance: &wasmtime::Instance,
     fd: i64,
@@ -1288,19 +1194,6 @@ async fn call_getpeername(
         store.data_mut().attach_memory(mem);
     }
     let f = inst.get_typed_func::<i64, i64>(&mut *store, "go")?;
-    Ok(f.call_async(&mut *store, fd).await?)
-}
-
-async fn call_getpeername_reuse(
-    linker: &wasmtime::Linker<Kernel>,
-    store: &mut wasmtime::Store<Kernel>,
-    instance: &wasmtime::Instance,
-    fd: i64,
-) -> Result<i64> {
-    if let Some(mem) = instance.get_memory(&mut *store, "memory") {
-        store.data_mut().attach_memory(mem);
-    }
-    let f = instance.get_typed_func::<i64, i64>(&mut *store, "go")?;
     Ok(f.call_async(&mut *store, fd).await?)
 }
 
@@ -1335,7 +1228,6 @@ async fn call_poll(
 }
 
 async fn call_poll_reuse(
-    linker: &wasmtime::Linker<Kernel>,
     store: &mut wasmtime::Store<Kernel>,
     instance: &wasmtime::Instance,
     ptr: i64,
@@ -1365,7 +1257,7 @@ fn getsockopt_so_type_and_domain() -> Result<()> {
         if let Some(mem) = inst.get_memory(&mut store, "memory") {
             store.data_mut().attach_memory(mem);
         }
-        let rc = call_getsockopt_reuse(&linker, &mut store, &inst, fd, 1, 3).await?;
+        let rc = call_getsockopt_reuse(&mut store, &inst, fd, 1, 3).await?;
         assert_eq!(rc, 0, "getsockopt rc");
         let gs_mem = inst
             .get_memory(&mut store, "memory")
@@ -1378,7 +1270,7 @@ fn getsockopt_so_type_and_domain() -> Result<()> {
             "SO_TYPE should be 1 (SOCK_STREAM)"
         );
 
-        let rc = call_getsockopt_reuse(&linker, &mut store, &inst, fd, 1, 39).await?;
+        let rc = call_getsockopt_reuse(&mut store, &inst, fd, 1, 39).await?;
         assert_eq!(rc, 0);
         gs_mem.read(&mut store, 4096, &mut got)?;
         assert_eq!(
@@ -1399,11 +1291,10 @@ fn getsockopt_so_error_records_connect_failure() -> Result<()> {
     let (engine, linker) = common::engine_and_linker()?;
     let sock = common::compile_wat(&engine, SOCKET_WAT)?;
     let gs = common::compile_wat(&engine, GETSOCKOPT_WAT)?;
-    let conn = common::compile_wat(&engine, CONNECT_WAT)?;
+    let _conn = common::compile_wat(&engine, CONNECT_WAT)?;
 
     // Patch CONNECT_WAT to use port 1 (almost certainly closed).
-    let conn_p1 = format!(
-        r#"
+    let conn_p1 = r#"
         (module
           (import "kernel" "syscall"
             (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
@@ -1420,9 +1311,8 @@ fn getsockopt_so_error_records_connect_failure() -> Result<()> {
               (i64.const 4096)
               (i64.const 16)
               (i64.const 0) (i64.const 0) (i64.const 0))))
-    "#
-    );
-    let conn_p1 = common::compile_wat(&engine, &conn_p1)?;
+    "#;
+    let conn_p1 = common::compile_wat(&engine, conn_p1)?;
 
     block_on(async {
         let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
@@ -1433,7 +1323,7 @@ fn getsockopt_so_error_records_connect_failure() -> Result<()> {
         }
 
         // SO_ERROR on a fresh socket = 0.
-        let rc = call_getsockopt_reuse(&linker, &mut store, &gs_inst, fd, 1, 4).await?;
+        let rc = call_getsockopt_reuse(&mut store, &gs_inst, fd, 1, 4).await?;
         assert_eq!(rc, 0);
         let gs_mem = gs_inst
             .get_memory(&mut store, "memory")
@@ -1445,7 +1335,7 @@ fn getsockopt_so_error_records_connect_failure() -> Result<()> {
         // Connect to a closed port — should fail and record the error.
         let _ = call_connect(&linker, &mut store, &conn_p1, fd).await?;
         // Read SO_ERROR now.
-        let rc = call_getsockopt_reuse(&linker, &mut store, &gs_inst, fd, 1, 4).await?;
+        let rc = call_getsockopt_reuse(&mut store, &gs_inst, fd, 1, 4).await?;
         assert_eq!(rc, 0);
         let gs_mem = gs_inst
             .get_memory(&mut store, "memory")
@@ -1463,7 +1353,7 @@ fn getsockopt_so_error_records_connect_failure() -> Result<()> {
         );
 
         // Re-read SO_ERROR — should be cleared to 0.
-        let rc = call_getsockopt_reuse(&linker, &mut store, &gs_inst, fd, 1, 4).await?;
+        let rc = call_getsockopt_reuse(&mut store, &gs_inst, fd, 1, 4).await?;
         assert_eq!(rc, 0);
         gs_mem.read(&mut store, 4096, &mut got)?;
         assert_eq!(
@@ -1495,7 +1385,7 @@ fn getsockname_after_bind_returns_loopback() -> Result<()> {
         if let Some(mem) = inst.get_memory(&mut store, "memory") {
             store.data_mut().attach_memory(mem);
         }
-        let rc = call_getsockname_reuse(&linker, &mut store, &inst, fd).await?;
+        let rc = call_getsockname_reuse(&mut store, &inst, fd).await?;
         assert_eq!(rc, 0, "getsockname rc");
 
         let gs_mem = inst
@@ -1542,7 +1432,7 @@ fn shutdown_rd_then_recvfrom_returns_eof() -> Result<()> {
 
     let (engine, linker) = common::engine_and_linker()?;
     let sock = common::compile_wat(&engine, SOCKET_WAT)?;
-    let bind = common::compile_wat(&engine, BIND_WAT)?;
+    let _bind = common::compile_wat(&engine, BIND_WAT)?;
     let listen = common::compile_wat(&engine, LISTEN_WAT)?;
     let acc = common::compile_wat(&engine, ACCEPT4_WAT)?;
     let sd = common::compile_wat(&engine, SHUTDOWN_WAT)?;
@@ -1551,7 +1441,7 @@ fn shutdown_rd_then_recvfrom_returns_eof() -> Result<()> {
 
     // Patch BIND_WAT for the dynamic port.
     let port_be = port.to_be_bytes();
-    let bind_wat = format!(
+    let bind_wat = String::from(
         r#"
         (module
           (import "kernel" "syscall"
@@ -1567,7 +1457,7 @@ fn shutdown_rd_then_recvfrom_returns_eof() -> Result<()> {
               (i64.const 4096)
               (i64.const 16)
               (i64.const 0) (i64.const 0) (i64.const 0))))
-    "#
+    "#,
     );
     let bind_wat = bind_wat.replace(
         "PATCH_PORT",
@@ -1611,7 +1501,7 @@ fn shutdown_rd_then_recvfrom_returns_eof() -> Result<()> {
         if let Some(mem) = recv_inst.get_memory(&mut store, "memory") {
             store.data_mut().attach_memory(mem);
         }
-        let n = call_recvfrom_reuse(&linker, &mut store, &recv_inst, accepted, 16).await?;
+        let n = call_recvfrom_reuse(&mut store, &recv_inst, accepted, 16).await?;
         assert_eq!(
             n, 0,
             "recvfrom after SHUT_RD should return 0 (EOF), got {n}"
@@ -1634,7 +1524,7 @@ fn shutdown_wr_then_sendto_returns_epipe() -> Result<()> {
 
     let (engine, linker) = common::engine_and_linker()?;
     let sock = common::compile_wat(&engine, SOCKET_WAT)?;
-    let bind = common::compile_wat(&engine, BIND_WAT)?;
+    let _bind = common::compile_wat(&engine, BIND_WAT)?;
     let listen = common::compile_wat(&engine, LISTEN_WAT)?;
     let acc = common::compile_wat(&engine, ACCEPT4_WAT)?;
     let sd = common::compile_wat(&engine, SHUTDOWN_WAT)?;
@@ -1642,7 +1532,7 @@ fn shutdown_wr_then_sendto_returns_epipe() -> Result<()> {
     let close = common::compile_wat(&engine, CLOSE_WAT)?;
 
     let port_be = port.to_be_bytes();
-    let bind_wat = format!(
+    let bind_wat = String::from(
         r#"
         (module
           (import "kernel" "syscall"
@@ -1658,7 +1548,7 @@ fn shutdown_wr_then_sendto_returns_epipe() -> Result<()> {
               (i64.const 4096)
               (i64.const 16)
               (i64.const 0) (i64.const 0) (i64.const 0))))
-    "#
+    "#,
     );
     let bind_wat = bind_wat.replace(
         "PATCH_PORT",
@@ -1704,7 +1594,7 @@ fn shutdown_wr_then_sendto_returns_epipe() -> Result<()> {
             .memory
             .ok_or_else(|| anyhow::anyhow!("no memory"))?;
         mem.write(&mut store, 4096, b"hello")?;
-        let n = call_sendto_reuse(&linker, &mut store, &send_inst, accepted, 5).await?;
+        let n = call_sendto_reuse(&mut store, &send_inst, accepted, 5).await?;
         assert_eq!(
             n,
             -edge_libos::errno::EPIPE,
@@ -1772,7 +1662,7 @@ fn poll_unknown_fd_marks_pollnval() -> Result<()> {
         entry[0..4].copy_from_slice(&9999u32.to_le_bytes());
         entry[4..6].copy_from_slice(&1u16.to_le_bytes()); // POLLIN
         mem.write(&mut store, 4096, &entry)?;
-        let rc = call_poll_reuse(&linker, &mut store, &inst, 4096, 1).await?;
+        let rc = call_poll_reuse(&mut store, &inst, 4096, 1).await?;
         assert!(rc >= 1, "poll on unknown fd should report >=1 ready");
         let poll_mem = inst
             .get_memory(&mut store, "memory")
@@ -1824,7 +1714,7 @@ fn poll_ready_pipe_marks_pollin() -> Result<()> {
         entry[0..4].copy_from_slice(&(pipe_fd).to_le_bytes());
         entry[4..6].copy_from_slice(&1u16.to_le_bytes()); // POLLIN
         mem.write(&mut store, 4096, &entry)?;
-        let rc = call_poll_reuse(&linker, &mut store, &inst, 4096, 1).await?;
+        let rc = call_poll_reuse(&mut store, &inst, 4096, 1).await?;
         assert_eq!(rc, 1, "ready pipe should report 1 fd with revents");
         let poll_mem = inst
             .get_memory(&mut store, "memory")
@@ -1956,7 +1846,6 @@ async fn call_epoll_ctl(
 }
 
 async fn call_epoll_ctl_reuse(
-    linker: &wasmtime::Linker<Kernel>,
     store: &mut wasmtime::Store<Kernel>,
     instance: &wasmtime::Instance,
     epfd: i64,
@@ -1992,7 +1881,6 @@ async fn call_epoll_wait(
 }
 
 async fn call_epoll_wait_reuse(
-    linker: &wasmtime::Linker<Kernel>,
     store: &mut wasmtime::Store<Kernel>,
     instance: &wasmtime::Instance,
     epfd: i64,
@@ -2095,11 +1983,11 @@ fn epoll_ctl_add_del_roundtrip() -> Result<()> {
         }
 
         // ADD STDOUT(1) with EPOLLIN.
-        let rc = call_epoll_ctl_reuse(&linker, &mut store, &inst, epfd, 1, 1, 4096).await?;
+        let rc = call_epoll_ctl_reuse(&mut store, &inst, epfd, 1, 1, 4096).await?;
         assert_eq!(rc, 0, "ADD should return 0");
 
         // ADD again → -EEXIST.
-        let rc = call_epoll_ctl_reuse(&linker, &mut store, &inst, epfd, 1, 1, 4096).await?;
+        let rc = call_epoll_ctl_reuse(&mut store, &inst, epfd, 1, 1, 4096).await?;
         assert_eq!(
             rc,
             -edge_libos::errno::EEXIST,
@@ -2107,11 +1995,11 @@ fn epoll_ctl_add_del_roundtrip() -> Result<()> {
         );
 
         // DEL → 0.
-        let rc = call_epoll_ctl_reuse(&linker, &mut store, &inst, epfd, 2, 1, 0).await?;
+        let rc = call_epoll_ctl_reuse(&mut store, &inst, epfd, 2, 1, 0).await?;
         assert_eq!(rc, 0, "DEL should return 0");
 
         // DEL again → -ENOENT.
-        let rc = call_epoll_ctl_reuse(&linker, &mut store, &inst, epfd, 2, 1, 0).await?;
+        let rc = call_epoll_ctl_reuse(&mut store, &inst, epfd, 2, 1, 0).await?;
         assert_eq!(
             rc,
             -edge_libos::errno::ENOENT,
@@ -2169,7 +2057,7 @@ fn epoll_wait_wakes_on_accept4() -> Result<()> {
 
     let (engine, linker) = common::engine_and_linker()?;
     let sock = common::compile_wat(&engine, SOCKET_WAT)?;
-    let bind = common::compile_wat(&engine, BIND_WAT)?;
+    let _bind = common::compile_wat(&engine, BIND_WAT)?;
     let listen = common::compile_wat(&engine, LISTEN_WAT)?;
     let ec1 = common::compile_wat(&engine, EPOLL_CREATE1_WAT)?;
     let ec = common::compile_wat(&engine, EPOLL_CTL_WAT)?;
@@ -2179,7 +2067,7 @@ fn epoll_wait_wakes_on_accept4() -> Result<()> {
 
     // Patch BIND for the dynamic port.
     let port_be = port.to_be_bytes();
-    let bind_wat = format!(
+    let bind_wat = String::from(
         r#"
         (module
           (import "kernel" "syscall"
@@ -2195,7 +2083,7 @@ fn epoll_wait_wakes_on_accept4() -> Result<()> {
               (i64.const 4096)
               (i64.const 16)
               (i64.const 0) (i64.const 0) (i64.const 0))))
-    "#
+    "#,
     );
     let bind_wat = bind_wat.replace(
         "PATCH_PORT",
@@ -2229,7 +2117,7 @@ fn epoll_wait_wakes_on_accept4() -> Result<()> {
         ev[0..4].copy_from_slice(&0x001u32.to_le_bytes()); // EPOLLIN
         ev[4..12].copy_from_slice(&0xcafef00du64.to_le_bytes());
         ec_mem.write(&mut store, 4096, &ev)?;
-        let rc = call_epoll_ctl_reuse(&linker, &mut store, &ec_inst, epfd, 1, fd, 4096).await?;
+        let rc = call_epoll_ctl_reuse(&mut store, &ec_inst, epfd, 1, fd, 4096).await?;
         assert_eq!(rc, 0, "epoll_ctl ADD");
 
         // Synchronous read of epoll_wait should already report >=1 because
@@ -2240,7 +2128,7 @@ fn epoll_wait_wakes_on_accept4() -> Result<()> {
         }
         // First epoll_wait — listener is "always ready" in P1-7's simple
         // model, so this returns >=1 immediately.
-        let n = call_epoll_wait_reuse(&linker, &mut store, &ew_inst, epfd, 4096, 4, 1000).await?;
+        let n = call_epoll_wait_reuse(&mut store, &ew_inst, epfd, 4096, 4, 1000).await?;
         assert!(
             n >= 1,
             "epoll_wait on a listening socket should return >=1, got {n}"
@@ -2265,11 +2153,11 @@ fn epoll_wait_wakes_on_accept4() -> Result<()> {
 
         // Now do a real accept4 race + epoll_wait to confirm the kernel's
         // notify mechanism is wired up.
-        let _ = call_epoll_ctl_reuse(&linker, &mut store, &ec_inst, epfd, 2, fd, 0).await?;
+        let _ = call_epoll_ctl_reuse(&mut store, &ec_inst, epfd, 2, fd, 0).await?;
         // Re-write the event struct into ec_inst's memory (it was preserved
         // above but be defensive).
         ec_mem.write(&mut store, 4096, &ev)?;
-        let _ = call_epoll_ctl_reuse(&linker, &mut store, &ec_inst, epfd, 1, fd, 4096).await?;
+        let _ = call_epoll_ctl_reuse(&mut store, &ec_inst, epfd, 1, fd, 4096).await?;
 
         let connect_fut = async move {
             for _ in 0..20 {
@@ -2292,7 +2180,7 @@ fn epoll_wait_wakes_on_accept4() -> Result<()> {
         assert!(accepted >= 3, "accept4 returned {accepted}");
 
         // After accept4, epoll_wait should still see the listener as ready.
-        let n2 = call_epoll_wait_reuse(&linker, &mut store, &ew_inst, epfd, 4096, 4, 50).await?;
+        let n2 = call_epoll_wait_reuse(&mut store, &ew_inst, epfd, 4096, 4, 50).await?;
         assert!(
             n2 >= 1,
             "post-accept4 epoll_wait should still report >=1, got {n2}"

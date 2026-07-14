@@ -43,6 +43,7 @@ if [[ ! -d "$CPYTHON" ]]; then
     exit 1
 fi
 
+# shellcheck disable=SC2034  # consumed by generated Makefile recipe (line 63)
 CC="$ZIG cc -target wasm32-freestanding -O2"
 # zig 0.16.0 musl sysroot (headers only — we provide our own shim, no libc).
 MUSL_HEADERS="$("$ZIG" env 2>/dev/null | grep -oE 'lib_dir=.*' | head -1 | cut -d= -f2-)"
@@ -50,7 +51,6 @@ if [[ -z "$MUSL_HEADERS" ]]; then
     # Fallback for older zig without `env` JSON.
     MUSL_HEADERS="/opt/homebrew/Cellar/zig/0.16.0_1/lib/zig/libc/wasi/libc-top-half/headers"
 fi
-CC_INC="-I$MUSL_HEADERS/musl/include -I$MUSL_HEADERS/headers/private"
 
 # 1. Stage our syscall shim into Modules/. CPython's Setup.local picks it up.
 SHIM_SRC="$GUEST/syscall_shim/musl_syscall.c"
@@ -115,18 +115,10 @@ mkdir -p "$(dirname "$OUT")"
     -o "$OUT"
 
 # 6. Verify the output imports kernel.syscall.
-if "$WAT2WASM" --version >/dev/null 2>&1; then
-    if "$WAT2WASM" --version >/dev/null 2>&1; then
-        if "$WAT2WASM"-objdump 2>/dev/null || true; then
-            HAS_OBJDUMP=true
-        fi
-    fi
-fi
-
 echo
 echo "WASM -> $OUT"
 echo "Verifying kernel.syscall import..."
-if grep -q "kernel.syscall" "$OUT" 2>/dev/null || true; then
+if grep -q "kernel.syscall" "$OUT" 2>/dev/null; then
     echo "  ✓ kernel.syscall found in $OUT"
 else
     echo "  ✗ kernel.syscall NOT found in $OUT — link failed?"

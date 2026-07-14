@@ -127,8 +127,7 @@ impl LinearAllocator {
         // 2. Need a fresh arena; check if we have room.
         let needed = self.high_water as usize + ARENA_SIZE;
         if needed > cur_mem_size {
-            let pages =
-                ((needed - cur_mem_size + PAGE_SIZE as usize - 1) / PAGE_SIZE as usize) as u64;
+            let pages = (needed - cur_mem_size).div_ceil(PAGE_SIZE as usize) as u64;
             return MmapResult::NeedGrow(pages);
         }
 

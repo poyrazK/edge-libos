@@ -10,14 +10,6 @@ use std::process::Command;
 
 use anyhow::Result;
 
-fn block_on<F: std::future::Future>(f: F) -> F::Output {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio current_thread runtime");
-    rt.block_on(f)
-}
-
 #[test]
 fn guest_shim_links_with_kernel_syscall_import() -> Result<()> {
     // Skip if zig not available.

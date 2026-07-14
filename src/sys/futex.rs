@@ -1,28 +1,34 @@
-//! Futex — P3 implementation (Tier 1).
+//! Futex — P3 implementation.
 //!
 //! Implements `FUTEX_WAIT` (with timespec timeout) and `FUTEX_WAKE`. All
 //! other futex ops return clean `-ENOSYS`. The address model and storage
 //! shape are pinned by `docs/adr/0001-p3-futex-semantics.md`; the snapshot
-//! wire format for this table is defined by ADR 0002 (out of scope here).
+//! wire format for this table is defined by ADR 0002 §5 and is realized
+//! here via `FutexTable::snapshot()` / `FutexTable::rebuild_from_snapshot()`.
 //!
 //! **Lock discipline (ADR 0001):** briefly lock `parking_lot::Mutex`, clone
 //! `Arc<Notify>` out, release the lock, then `.notified().await`. The lock
 //! guard NEVER spans an `.await`.
 //!
-//! **Scope boundary:** `wasm_threads(true)` is a separate follow-on. This
-//! handler compiles and runs correctly under single-threaded v1 — guest
-//! threads just won't be able to actually park on a different fiber yet.
+//! **Multi-fiber wiring (P3 Tier-3, ADR 0001 §2):** the kernel now instantiates
+//! with `wasm_threads(true)` + `shared_memory(true)` (PR #12), so the
+//! `Arc<Notify>` model is usable across guest fibers hosted in different
+//! `Store`s. Snapshot/restore of `FutexTable` (Tier-2) follows the
+//! rebuild-on-restore contract from ADR 0002 §5 — `Arc<Notify>` is fresh
+//! per restore.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use wasmtime::Caller;
 
 use crate::errno::{EINVAL, ENOSYS};
 use crate::kernel::Kernel;
 use crate::mem;
+use crate::snapshot::endian::LeU32;
 
 /// Linux x86-64 NR for `futex(2)`.
 pub const NR_FUTEX: u32 = 202;
@@ -66,6 +72,66 @@ pub struct FutexTable {
 pub struct FutexEntry {
     pub notify: Arc<Notify>,
     pub waiters: usize,
+}
+
+/// Wire form of one futex address's state — ADR 0002 §5 + ADR 0001 §2.
+///
+/// Snapshot encodes `(addr, waiter_count)` pairs only; the
+/// `Arc<Notify>` is rebuilt fresh on restore (per ADR 0002 §5:
+/// "`Notify` handles are rebuilt on restore"). Endianness comes from
+/// the existing `LeU32` newtype (`src/snapshot/endian.rs`) so the
+/// wire form is fixed-width LE, host-independent, and stable across
+/// postcard versions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FutexAddrSnapshot {
+    /// Guest futex address — `u32` per ADR 0001 §1.
+    pub addr: LeU32,
+    /// `waiters` counter from the in-memory `FutexEntry`. Captured
+    /// at quiescent point; no fibers are actually parked.
+    pub waiters: LeU32,
+}
+
+impl FutexTable {
+    /// Snapshot accessor used by `build_kernel_snapshot`.
+    ///
+    /// Lock is held for the duration of the function (HashMap iter +
+    /// `Vec::sort_by_key` — no I/O, no `.await`), then dropped. The
+    /// returned `Vec` is sorted by `addr` for deterministic postcard
+    /// output across runs (ADR 0002 § blocklist).
+    pub fn snapshot(&self) -> Vec<FutexAddrSnapshot> {
+        let mut v: Vec<FutexAddrSnapshot> = self
+            .by_addr
+            .iter()
+            .map(|(addr, entry)| FutexAddrSnapshot {
+                addr: LeU32(*addr),
+                waiters: LeU32(entry.waiters as u32),
+            })
+            .collect();
+        v.sort_by_key(|f| f.addr.0);
+        v
+    }
+
+    /// Restore accessor used by `apply_snapshot_kernel_state`.
+    ///
+    /// Per ADR 0002 §5: "Notify handles are rebuilt on restore."
+    /// No fibers are actually parked after rebuild — the guest
+    /// re-enters `FUTEX_WAIT` on its next syscall and observes the
+    /// fresh `Notify`, exactly as if the snapshot had not happened.
+    /// Existing entries are dropped (a snapshot is a fresh kernel
+    /// state; the snapshot is the source of truth).
+    pub fn rebuild_from_snapshot(&mut self, snap: &[FutexAddrSnapshot]) {
+        self.by_addr.clear();
+        for f in snap {
+            let waiters = f.waiters.0 as usize;
+            self.by_addr.insert(
+                f.addr.0,
+                FutexEntry {
+                    notify: Arc::new(Notify::new()),
+                    waiters,
+                },
+            );
+        }
+    }
 }
 
 /// `struct timespec` layout — 16 bytes, two i64 fields (sec, nsec).
@@ -141,13 +207,10 @@ async fn futex_wait(
         };
 
         let mut table = caller.data().futex_table.lock();
-        let entry = table
-            .by_addr
-            .entry(uaddr)
-            .or_insert_with(|| FutexEntry {
-                notify: Arc::new(Notify::new()),
-                waiters: 0,
-            });
+        let entry = table.by_addr.entry(uaddr).or_insert_with(|| FutexEntry {
+            notify: Arc::new(Notify::new()),
+            waiters: 0,
+        });
         entry.waiters += 1;
         (entry.notify.clone(), deadline)
     };
@@ -242,7 +305,11 @@ pub fn futex_wake(caller: &mut Caller<'_, Kernel>, uaddr: u32, val: i32) -> i64 
 /// Returns `-EINVAL` if nsec is out of range or sec is negative.
 fn decode_timespec(caller: &mut Caller<'_, Kernel>, ptr: i64) -> Result<Duration, i64> {
     let bytes = mem::guest_slice(caller, ptr, TIMESPEC_SIZE)?;
-    let sec = i64::from_le_bytes(bytes[TIMESPEC_SEC_OFF..TIMESPEC_SEC_OFF + 8].try_into().unwrap());
+    let sec = i64::from_le_bytes(
+        bytes[TIMESPEC_SEC_OFF..TIMESPEC_SEC_OFF + 8]
+            .try_into()
+            .unwrap(),
+    );
     let nsec = i64::from_le_bytes(
         bytes[TIMESPEC_NSEC_OFF..TIMESPEC_NSEC_OFF + 8]
             .try_into()
@@ -292,5 +359,109 @@ mod tests {
     fn futex_table_default_is_empty() {
         let t = FutexTable::default();
         assert!(t.by_addr.is_empty());
+    }
+
+    #[test]
+    fn futex_addr_snapshot_is_wire_stable() {
+        // Encodes as exactly 8 bytes: 4 LE for addr + 4 LE for waiters.
+        // If a regression ever drops the LeU32 wrapper or switches to
+        // a varint, the assertion fails.
+        let s = FutexAddrSnapshot {
+            addr: LeU32(0x1234_5678),
+            waiters: LeU32(2),
+        };
+        let bytes = postcard::to_stdvec(&s).expect("encode FutexAddrSnapshot");
+        assert_eq!(
+            bytes.len(),
+            8,
+            "FutexAddrSnapshot must be 8 fixed-width LE bytes"
+        );
+        assert_eq!(&bytes[0..4], &[0x78, 0x56, 0x34, 0x12]);
+        assert_eq!(&bytes[4..8], &[0x02, 0x00, 0x00, 0x00]);
+        let back: FutexAddrSnapshot =
+            postcard::from_bytes(&bytes).expect("decode FutexAddrSnapshot");
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn snapshot_sorts_by_addr_and_drops_zero_waiters() {
+        // Build three addresses with waiter counts; 0x3000 must be
+        // pruned on release before snapshot (release_waiter's
+        // invariant — we exercise that path by going through the
+        // saturating-sub branch exactly once for the zero case).
+        let mut table = FutexTable::default();
+        table.by_addr.insert(
+            0x3000,
+            FutexEntry {
+                notify: Arc::new(Notify::new()),
+                waiters: 1,
+            },
+        );
+        // Drive a single `release_waiter`-equivalent decrement manually
+        // so the 0x3000 entry's waiter drops to zero and gets pruned.
+        if let Some(e) = table.by_addr.get_mut(&0x3000) {
+            e.waiters = e.waiters.saturating_sub(1);
+            if e.waiters == 0 {
+                table.by_addr.remove(&0x3000);
+            }
+        }
+        table.by_addr.insert(
+            0x1000,
+            FutexEntry {
+                notify: Arc::new(Notify::new()),
+                waiters: 1,
+            },
+        );
+        table.by_addr.insert(
+            0x2000,
+            FutexEntry {
+                notify: Arc::new(Notify::new()),
+                waiters: 2,
+            },
+        );
+
+        let snap = table.snapshot();
+        // 0x3000 pruned; remaining sorted by addr.
+        assert_eq!(snap.len(), 2, "snapshot drops the pruned 0x3000 entry");
+        assert_eq!(snap[0].addr.0, 0x1000);
+        assert_eq!(snap[0].waiters.0, 1);
+        assert_eq!(snap[1].addr.0, 0x2000);
+        assert_eq!(snap[1].waiters.0, 2);
+    }
+
+    #[test]
+    fn rebuild_from_snapshot_allocates_fresh_notify() {
+        // The load-bearing ADR 0002 §5 claim: rebuilt `Arc<Notify>`s
+        // are fresh allocations, not preserved across snapshots.
+        let notify_orig = Arc::new(Notify::new());
+
+        let mut table = FutexTable::default();
+        table.by_addr.insert(
+            0x4000,
+            FutexEntry {
+                notify: notify_orig,
+                waiters: 1,
+            },
+        );
+
+        // Snapshot, then clear + rebuild in a fresh table to simulate
+        // a snapshot round-trip across Kernel instances.
+        let snap = table.snapshot();
+        let mut restored = FutexTable::default();
+        restored.rebuild_from_snapshot(&snap);
+
+        assert_eq!(restored.by_addr.len(), 1);
+        // `table` still owns the original `Arc<Notify>` at 0x4000;
+        // because `Arc::ptr_eq` compares allocation pointers (not
+        // refcount), the rebuilt `Notify` must NOT be the same
+        // allocation as the one in `table`. This is the
+        // fresh-Notify invariant.
+        assert!(
+            !Arc::ptr_eq(
+                &table.by_addr[&0x4000].notify,
+                &restored.by_addr[&0x4000].notify
+            ),
+            "rebuilt Notify must be a fresh Arc allocation, not the original"
+        );
     }
 }

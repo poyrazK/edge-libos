@@ -13,6 +13,10 @@ use wasmtime::{Engine, Instance, Linker, Module, Store};
 use edge_libos::{add_to_linker, build_engine, build_store, Kernel};
 
 /// Build a fresh Engine + Linker pre-registered with the dispatch.
+// Shared helper: each test target compiles this module independently, and
+// a test binary that doesn't reach every helper trips `dead_code`. Allow
+// per-fn rather than module-wide so genuine dead code in callers still fires.
+#[allow(dead_code)]
 pub fn engine_and_linker() -> Result<(Engine, Linker<Kernel>)> {
     let engine = build_engine()?;
     let mut linker = Linker::new(&engine);
@@ -21,6 +25,7 @@ pub fn engine_and_linker() -> Result<(Engine, Linker<Kernel>)> {
 }
 
 /// Compile a WAT string into a Module on the given engine.
+#[allow(dead_code)]
 pub fn compile_wat(engine: &Engine, wat: &str) -> Result<Module> {
     let bytes = wat::parse_str(wat)?;
     Ok(Module::new(engine, &bytes)?)
@@ -32,6 +37,7 @@ pub fn compile_wat(engine: &Engine, wat: &str) -> Result<Module> {
 /// **Async note:** wasmtime 45.0.3 has `Config::async_support` always on,
 /// so `Linker::instantiate` becomes `instantiate_async`. The harness is
 /// async; callers wrap with `tokio::runtime::Runtime::block_on`.
+#[allow(dead_code)]
 pub async fn instantiate_async(
     engine: &Engine,
     linker: &Linker<Kernel>,
@@ -47,6 +53,7 @@ pub async fn instantiate_async(
 
 /// Build a Kernel rooted at `preopen`. Use this for VFS tests that need to
 /// read/write real files on disk.
+#[allow(dead_code)]
 pub fn kernel_with_preopen(preopen: impl AsRef<Path>) -> Kernel {
     Kernel::new_with_preopen(vec![], vec![], preopen.as_ref())
 }

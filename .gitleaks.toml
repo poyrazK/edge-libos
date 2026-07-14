@@ -1,0 +1,19 @@
+# .gitleaks.toml — secret-leak scan configuration.
+# https://github.com/gitleaks/gitleaks
+
+title = "edge-libos secret scan"
+
+# Inherit gitleaks's built-in ruleset (AWS keys, GitHub tokens,
+# OpenAI/Anthropic keys, etc.) plus our repo-local rules below.
+[extend]
+useDefault = true
+
+# Empty allowlist — repo has no real secrets today. If a future fixture
+# (e.g. a pre-baked test token) trips a false positive, add a targeted
+# entry here with a comment explaining the intent.
+[allowlist]
+description = "No production secrets; no fake-test-tokens in tree."
+paths = []
+commits = []
+regexes = []
+stopwords = []

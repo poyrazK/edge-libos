@@ -24,9 +24,7 @@ pub const SS_DISABLE: i32 = 2;
 
 // `struct sigaltstack` on wasm32-musl: ss_sp(8) + ss_flags(4) + pad(4) + ss_size(8) = 24
 pub const SIGALTSTACK_SIZE: i64 = 24;
-const SS_SP_OFF: usize = 0;
 const SS_FLAGS_OFF: usize = 8;
-const SS_SIZE_OFF: usize = 16;
 
 /// `rt_sigaction`'s `how` argument values.
 const SIG_BLOCK: i64 = 0;
@@ -97,7 +95,7 @@ pub fn rt_sigaction(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 
     if oldact != 0 {
         let mem = match caller.data().memory() {
-            Ok(m) => m.clone(),
+            Ok(m) => *m,
             Err(e) => return e,
         };
         let bytes = match mem::guest_slice_mut_via(&mem, caller, oldact, SIGACTION_SIZE) {
@@ -165,7 +163,7 @@ pub fn rt_sigprocmask(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 
     if oldset != 0 {
         let mem = match caller.data().memory() {
-            Ok(m) => m.clone(),
+            Ok(m) => *m,
             Err(e) => return e,
         };
         let bytes = match mem::guest_slice_mut_via(&mem, caller, oldset, 8) {
@@ -218,9 +216,7 @@ pub fn sigaltstack(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
             }
         } else {
             // SS_DISABLE: clear the record.
-            for i in 0..SIGALTSTACK_SIZE as usize {
-                bytes[i] = 0;
-            }
+            bytes[..SIGALTSTACK_SIZE as usize].fill(0);
         }
     }
 

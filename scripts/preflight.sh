@@ -23,11 +23,10 @@
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-cd "$ROOT"
+cd "$ROOT" || exit 1
 
 PASS=0
 FAIL=0
-SKIPPED=0
 FAILED_STEPS=()
 
 # Run a step: print its number + name, run the command, record exit.
@@ -79,17 +78,54 @@ if [[ -n "$EXPECTED_TOOLCHAIN" && "$EXPECTED_TOOLCHAIN" != "$ACTUAL_TOOLCHAIN" ]
 fi
 
 # --- 2. Run the same steps as the CI workflow ---
-run_step 1 "cargo build --release trace-host + edge-python" \
-    bash -c 'cargo build --release --bin trace-host --bin edge-python'
 
-run_step 2 "cargo test --release" \
-    cargo test --release
+# --- 0. Static-analysis gates (mirror .github/workflows/ci.yml) ---
+# Steps 0a-0f are cargo-side; they share step 2's warm target/.
+# Steps 0g-0j are non-cargo; tools-side linters. Each non-cargo step
+# silently SKIPs when its binary isn't installed locally so a contributor
+# without all tools can still get a partial green signal.
+
+run_step 0a "NR-consistency check (Rust ↔ C ↔ dispatch)" \
+    bash scripts/check_nr_consistency.sh
+
+run_step 0b "cargo fmt --check" \
+    bash -c 'cargo fmt --all -- --check'
+
+run_step 0c "cargo clippy --all-targets (-D warnings)" \
+    bash -c 'cargo clippy --profile ci --all-targets -- -D warnings'
+
+run_step 0d "cargo doc --no-deps (broken-docs gate)" \
+    bash -c 'RUSTDOCFLAGS="-D warnings" cargo doc --profile ci --no-deps --document-private-items >/dev/null'
+
+run_step 0e "cargo-deny (advisories, licenses, sources, bans)" \
+    bash -c 'command -v cargo-deny >/dev/null 2>&1 || { echo "SKIP: cargo-deny not installed (cargo install --locked cargo-deny)"; exit 0; }; cargo deny check'
+
+run_step 0f "cargo-machete (unused dependency detection)" \
+    bash -c 'command -v cargo-machete >/dev/null 2>&1 || { echo "SKIP: cargo-machete not installed (cargo install --locked cargo-machete)"; exit 0; }; cargo machete'
+
+run_step 0g "actionlint (GitHub Actions syntax check)" \
+    bash -c 'command -v actionlint >/dev/null 2>&1 || { echo "SKIP: actionlint not installed (brew install actionlint or grab GitHub release tarball)"; exit 0; }; actionlint'
+
+run_step 0h "shellcheck (shell-script lint)" \
+    bash -c 'command -v shellcheck >/dev/null 2>&1 || { echo "SKIP: shellcheck not installed (apt install shellcheck / brew install shellcheck)"; exit 0; }; shellcheck scripts/*.sh tests/*.sh tests/conformance/runner.sh tests/strace_baselines/*.sh guest/build.sh'
+
+run_step 0i "gitleaks (secret-leak scan)" \
+    bash -c 'command -v gitleaks >/dev/null 2>&1 || { echo "SKIP: gitleaks not installed (brew install gitleaks or grab GitHub release tarball)"; exit 0; }; gitleaks detect --source . --config .gitleaks.toml --no-banner --redact'
+
+run_step 0j "wat2wasm validation (WAT syntax check)" \
+    bash -c 'command -v wat2wasm >/dev/null 2>&1 || { echo "SKIP: wabt not installed (apt install wabt)"; exit 0; }; while IFS= read -r -d "" wat; do echo "==> $wat"; wat2wasm "$wat" -o /tmp/check.wasm || { echo "FAIL: $wat"; exit 1; }; done < <(find tests guests -name "*.wat" -not -path "*/target/*" -print0 2>/dev/null || true)'
+
+run_step 1 "cargo build --profile ci (trace-host + edge-python)" \
+    bash -c 'cargo build --profile ci --bin trace-host --bin edge-python'
+
+run_step 2 "cargo test --profile ci (full Rust suite)" \
+    cargo test --profile ci
 
 run_step 3 "C conformance (marker-enforced)" \
     bash tests/conformance/runner.sh
 
 run_step 4 "strace baseline diff" \
-    bash -c 'cargo test --release --test strace_baseline_diff'
+    bash -c 'cargo test --profile ci --test strace_baseline_diff'
 
 run_step 5 "scripts/reproduce_dod.sh (8 steps)" \
     bash scripts/reproduce_dod.sh

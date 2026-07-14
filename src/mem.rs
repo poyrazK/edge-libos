@@ -27,7 +27,7 @@ pub fn guest_slice<'a>(
     let end = p.checked_add(l).ok_or(-(crate::errno::EFAULT))?;
     // `Memory` is a `Copy` handle into the store, so we can clone it and
     // drop the `&Kernel` borrow before using it.
-    let mem = caller.data().memory()?.clone();
+    let mem = *caller.data().memory()?;
     let base = mem.data(caller);
     base.get(p..end).ok_or(-(crate::errno::EFAULT))
 }
@@ -45,7 +45,7 @@ pub fn guest_slice_mut<'a>(
     let end = p.checked_add(l).ok_or(-(crate::errno::EFAULT))?;
     // Same Copy-handle trick: clone the `Memory` handle so the `&Kernel`
     // borrow ends before we re-borrow `caller` mutably.
-    let mem = caller.data().memory()?.clone();
+    let mem = *caller.data().memory()?;
     let base = mem.data_mut(caller);
     base.get_mut(p..end).ok_or(-(crate::errno::EFAULT))
 }

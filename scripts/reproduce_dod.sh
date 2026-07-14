@@ -22,7 +22,7 @@
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-cd "$ROOT"
+cd "$ROOT" || exit 1
 
 # CI fan-out hooks — let parallel jobs in .github/workflows/ci.yml avoid
 # duplicating work. Set any/all to "1" to skip the corresponding step.

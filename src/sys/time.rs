@@ -162,7 +162,7 @@ pub async fn clock_nanosleep(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i6
     };
     let sec = i64::from_le_bytes(req_bytes[0..8].try_into().unwrap());
     let nsec = i64::from_le_bytes(req_bytes[8..16].try_into().unwrap());
-    if nsec < 0 || nsec >= 1_000_000_000 || sec < 0 {
+    if nsec < 0 || !(0..1_000_000_000).contains(&nsec) || sec < 0 {
         return -EINVAL;
     }
 
@@ -230,7 +230,7 @@ pub async fn nanosleep(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     };
     let sec = i64::from_le_bytes(req_bytes[0..8].try_into().unwrap());
     let nsec = i64::from_le_bytes(req_bytes[8..16].try_into().unwrap());
-    if nsec < 0 || nsec >= 1_000_000_000 || sec < 0 {
+    if nsec < 0 || !(0..1_000_000_000).contains(&nsec) || sec < 0 {
         return -EINVAL;
     }
     let dur = Duration::from_nanos((sec as u64).saturating_mul(1_000_000_000) + nsec as u64);
@@ -302,7 +302,6 @@ pub async fn times(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 }
 
 /// Re-export errno helper for unit tests below.
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,12 +338,12 @@ mod tests {
     fn sysinfo_struct_size_covers_x86_64() {
         // x86-64 native layout is 11×u64 + u32 + pad = 96 bytes. Our
         // buffer is sized generously to cover both x86-64 and 32-bit.
-        assert!(SYSINFO_SIZE >= 96, "SYSINFO_SIZE={SYSINFO_SIZE} < 96");
+        const _: () = assert!(SYSINFO_SIZE >= 96);
     }
 
     #[test]
     fn tms_struct_size_covers_x86_64() {
         // x86-64 native: 4 × clock_t(u64) = 32 bytes.
-        assert!(TMS_SIZE >= 32, "TMS_SIZE={TMS_SIZE} < 32");
+        const _: () = assert!(TMS_SIZE >= 32);
     }
 }

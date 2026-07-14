@@ -27,6 +27,13 @@
 #
 # Required checks (branch protection): tools, build, c-conformance, reproduce.
 # Local mirror: scripts/preflight.sh.
+#
+# This file is layered with 10 static-analysis linters (fmt, clippy, doc,
+# deny, machete, NR-consistency, actionlint, shellcheck, gitleaks, wat2wasm
+# validation) wired as additional steps inside the existing `tools` and
+# `build` jobs — see the "Why linters live inside build / tools" section
+# in docs/branch-protection.md for the rationale (fan-out jobs must NOT
+# invoke cargo because they have no warm `target/ci/` cache).
 
 name: verify
 
@@ -55,7 +62,9 @@ jobs:
   tools:
     name: toolchain + version pins
     runs-on: ubuntu-22.04
-    timeout-minutes: 6
+    # Bumped 6 -> 8 to absorb the four new static-analysis steps added in
+    # commit 8 (actionlint, shellcheck, gitleaks, wat2wasm validation).
+    timeout-minutes: 8
 
     steps:
       - name: 1. Checkout
@@ -92,6 +101,58 @@ jobs:
           wat2wasm --version
           strace --version 2>&1 | head -1
 
+      - name: 5. actionlint (GitHub Actions syntax check)
+        # Pure Go static analysis of .github/workflows/*.yml — catches
+        # syntax errors, missing needs, malformed ${{ }} expressions.
+        # GitHub release tarball (~2 s install vs ~60 s for cargo install).
+        run: |
+          set -euo pipefail
+          VER="1.7.7"
+          URL="https://github.com/rhysd/actionlint/releases/download/v${VER}/actionlint_${VER}_linux_amd64.tar.gz"
+          curl -fSL --retry 3 -o /tmp/actionlint.tar.gz "$URL"
+          sudo tar -xzf /tmp/actionlint.tar.gz -C /usr/local/bin actionlint
+          rm -f /tmp/actionlint.tar.gz
+          actionlint -version
+          actionlint
+
+      - name: 6. shellcheck (lint all shell scripts)
+        # Reads .shellcheckrc automatically from the repo root to
+        # silence intentional patterns (SC2317 / SC2154).
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq shellcheck
+          shellcheck --version
+          shellcheck scripts/*.sh tests/*.sh tests/conformance/runner.sh \
+                     tests/strace_baselines/*.sh guest/build.sh
+
+      - name: 7. gitleaks (secret-leak scan)
+        # Uses .gitleaks.toml with an empty allowlist (no real secrets
+        # in the repo today). The `detect` subcommand (vs `protect`)
+        # doesn't write a baseline file.
+        run: |
+          set -euo pipefail
+          VER="8.18.4"
+          URL="https://github.com/gitleaks/gitleaks/releases/download/v${VER}/gitleaks_${VER}_linux_x64.tar.gz"
+          curl -fSL --retry 3 -o /tmp/gitleaks.tar.gz "$URL"
+          sudo tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
+          rm -f /tmp/gitleaks.tar.gz
+          gitleaks version
+          gitleaks detect --source . --config .gitleaks.toml --no-banner --redact
+
+      - name: 8. wat2wasm validation (WAT syntax check)
+        # Loop survives future WAT additions; today there's exactly
+        # one (tests/guests/serve_one_request.wat). wabt is already
+        # installed by step 4.
+        # Uses `find -exec` (not `for x in $(find ...)`) because
+        # actionlint's embedded shellcheck flags SC2044 on the latter
+        # (paths with whitespace / newlines would be split).
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' wat; do
+              echo "==> $wat"
+              wat2wasm "$wat" -o /tmp/check.wasm
+          done < <(find tests guests -name '*.wat' -not -path '*/target/*' -print0 2>/dev/null || true)
+
   # ─── The ONLY job that runs cargo ──────────────────────────────────
   # Compiles once under the `ci` profile, runs the full Rust suite, and
   # uploads the two binaries the fan-out children need. `cargo test`
@@ -101,7 +162,11 @@ jobs:
   build:
     name: cargo build + test (single ci-profile compile)
     runs-on: ubuntu-22.04
-    timeout-minutes: 12
+    # Bumped 12 -> 18 to absorb the cargo-side linters added in
+    # commits 4-7 (NR-consistency, fmt, clippy, doc, deny, machete).
+    # They all share `build`'s warm `target/ci/` cache; marginal cost is
+    # ~30-60 s on warm cache, ~3-6 min on cold.
+    timeout-minutes: 18
 
     steps:
       - name: 1. Checkout
@@ -126,7 +191,33 @@ jobs:
             ~/.cargo/git
             target
 
-      - name: 4. cargo test --profile ci (full Rust suite, one compile)
+      - name: 4. NR-consistency check (Rust ↔ C ↔ dispatch)
+        # Cheap (no cargo), fail-fast gate that catches silent NR-table
+        # drift across the three sources of truth. See
+        # scripts/check_nr_consistency.sh for details.
+        run: |
+          set -euo pipefail
+          bash scripts/check_nr_consistency.sh
+
+      - name: 5. cargo fmt --check (formatting drift gate)
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+
+      - name: 6. cargo clippy --all-targets (lint gate, -D warnings)
+        # Shares build's warm target/ci/ — marginal cost is ~30-60 s on
+        # warm cache, ~3-6 min on cold. The lint config lives in
+        # Cargo.toml [lints.clippy] / [lints.rust].
+        run: |
+          set -euo pipefail
+          cargo clippy --profile ci --all-targets -- -D warnings
+
+      - name: 7. cargo doc --no-deps (broken-docs gate)
+        run: |
+          set -euo pipefail
+          RUSTDOCFLAGS="-D warnings" cargo doc --profile ci --no-deps --document-private-items
+
+      - name: 8. cargo test --profile ci (full Rust suite, one compile)
         # Compiles the whole graph ONCE (unwind + no LTO). Includes the
         # strace_baseline_diff and edge_python_* integration tests, so
         # they don't need separate invocations.
@@ -134,7 +225,7 @@ jobs:
           set -euo pipefail
           cargo test --profile ci
 
-      - name: 5. cargo build --profile ci binaries (reuses step 4)
+      - name: 9. cargo build --profile ci binaries (reuses step 8)
         run: |
           set -euo pipefail
           cargo build --profile ci --bin trace-host --bin edge-python
@@ -144,7 +235,24 @@ jobs:
           cp target/ci/trace-host target/ci/edge-python target/release/
           ls -la target/release/trace-host target/release/edge-python
 
-      - name: 6. Upload binaries (7-day retention)
+      - name: 10. cargo-deny (advisories, licenses, sources, bans)
+        # Cheap (no codegen) but needs `cargo install cargo-deny`. The
+        # `cargo install --locked` guarantees deterministic builds.
+        run: |
+          set -euo pipefail
+          cargo install --locked cargo-deny
+          cargo deny check
+
+      - name: 11. cargo-machete (unused dependency detection)
+        # Walks the dep graph; cheap but needs cargo-machete installed.
+        # The `wasi-delegate` feature stub (Cargo.toml:39-43) is off
+        # by default and won't be flagged.
+        run: |
+          set -euo pipefail
+          cargo install --locked cargo-machete
+          cargo machete
+
+      - name: 12. Upload binaries (7-day retention)
         uses: actions/upload-artifact@v4
         with:
           name: release-binaries

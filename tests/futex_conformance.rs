@@ -156,14 +156,10 @@ fn futex_wake_empty_addr_returns_zero() -> Result<()> {
 #[test]
 fn futex_wait_value_mismatch_returns_eagain() -> Result<()> {
     let (engine, linker) = common::engine_and_linker()?;
-    let ret = block_on(run_noargs(
-        &engine,
-        &linker,
-        WAIT_VALUE_MISMATCH_WAT,
-        "go",
-    ))?;
+    let ret = block_on(run_noargs(&engine, &linker, WAIT_VALUE_MISMATCH_WAT, "go"))?;
     assert_eq!(
-        ret, -edge_libos::errno::EAGAIN,
+        ret,
+        -edge_libos::errno::EAGAIN,
         "FUTEX_WAIT with mismatched value must return -EAGAIN, got {ret}"
     );
     Ok(())
@@ -174,7 +170,8 @@ fn futex_wait_unrecognized_op_returns_enosys() -> Result<()> {
     let (engine, linker) = common::engine_and_linker()?;
     let ret = block_on(run_noargs(&engine, &linker, UNRECOGNIZED_OP_WAT, "go"))?;
     assert_eq!(
-        ret, -edge_libos::errno::ENOSYS,
+        ret,
+        -edge_libos::errno::ENOSYS,
         "FUTEX_FD must return -ENOSYS, got {ret}"
     );
     Ok(())
@@ -185,7 +182,8 @@ fn futex_wait_sentinel_addr_returns_einval() -> Result<()> {
     let (engine, linker) = common::engine_and_linker()?;
     let ret = block_on(run_noargs(&engine, &linker, SENTINEL_ADDR_WAT, "go"))?;
     assert_eq!(
-        ret, -edge_libos::errno::EINVAL,
+        ret,
+        -edge_libos::errno::EINVAL,
         "0xFFFF_FFFF must return -EINVAL, got {ret}"
     );
     Ok(())
@@ -196,7 +194,8 @@ fn futex_wait_out_of_memory_returns_efault() -> Result<()> {
     let (engine, linker) = common::engine_and_linker()?;
     let ret = block_on(run_noargs(&engine, &linker, OUT_OF_MEMORY_WAT, "go"))?;
     assert_eq!(
-        ret, -edge_libos::errno::EFAULT,
+        ret,
+        -edge_libos::errno::EFAULT,
         "out-of-memory uaddr must return -EFAULT, got {ret}"
     );
     Ok(())
@@ -223,7 +222,8 @@ fn futex_wait_immediate_timeout_returns_etimedout() -> Result<()> {
         "go",
     ))?;
     assert_eq!(
-        ret, -edge_libos::errno::ETIMEDOUT,
+        ret,
+        -edge_libos::errno::ETIMEDOUT,
         "FUTEX_WAIT with timespec {{0,0}} must return -ETIMEDOUT, got {ret}"
     );
     Ok(())

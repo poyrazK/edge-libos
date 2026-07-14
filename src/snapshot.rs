@@ -54,7 +54,7 @@ use serde::{Deserialize, Serialize};
 use crate::fd::FdTable;
 use crate::fd::SockAddr;
 use crate::kernel::{Kernel, RngSeed};
-use crate::snapshot::endian::{LeI32, LeI64, LeU32, LeU64};
+use crate::snapshot::endian::{LeI32, LeU32, LeU64};
 use crate::sys::signal::SignalState;
 use crate::vfs::Vfs;
 
@@ -81,7 +81,7 @@ pub struct MemoryPageSnapshot {
 /// All snapshot types live in this module. They are independent of the
 /// runtime `Kernel` so the snapshot shape can evolve without disturbing
 /// live handler code.
-
+///
 /// An adapter that maps `VecDeque<u8>` ↔ `Vec<u8>` for serde.
 ///
 /// `std::collections::VecDeque` does not derive `Serialize`, but it does
@@ -174,6 +174,16 @@ pub struct KernelSnapshot {
     pub signals: SignalStateSnapshot,
     pub exit_code: Option<LeI32>,
     pub comm: [u8; 16],
+    /// ADR 0001 §2 + ADR 0002 §5 — futex address table.
+    ///
+    /// Sorted by `addr` for deterministic postcard output; the
+    /// in-memory `FutexTable` uses `HashMap` (ADR 0001 §2 — keyed
+    /// lookup), so the wire form is a `Vec` of `(addr, waiters)`
+    /// pairs, not a serde HashMap. `Arc<tokio::sync::Notify>` is NOT
+    /// persisted — see `FutexTable::rebuild_from_snapshot` for the
+    /// rebuild-on-restore contract. Append-only field: snapshot
+    /// format version stays at `SNAPSHOT_FORMAT_VERSION = 1`.
+    pub futex_table: Vec<crate::sys::futex::FutexAddrSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -247,14 +257,18 @@ impl ResourceSnapshot {
                 | ResourceKind::PipeRead
                 | ResourceKind::PipeWrite
         ));
-        let mut body = ResourceBody::default();
-        body.pipe = Some(pipe);
+        let body = ResourceBody {
+            pipe: Some(pipe),
+            ..Default::default()
+        };
         Self { kind, body }
     }
 
     pub fn from_file(file: FileSnapshot) -> Self {
-        let mut body = ResourceBody::default();
-        body.file = Some(file);
+        let body = ResourceBody {
+            file: Some(file),
+            ..Default::default()
+        };
         Self {
             kind: ResourceKind::File,
             body,
@@ -262,8 +276,10 @@ impl ResourceSnapshot {
     }
 
     pub fn from_socket(socket: SocketSnapshot) -> Self {
-        let mut body = ResourceBody::default();
-        body.socket = Some(socket);
+        let body = ResourceBody {
+            socket: Some(socket),
+            ..Default::default()
+        };
         Self {
             kind: ResourceKind::Socket,
             body,
@@ -271,8 +287,10 @@ impl ResourceSnapshot {
     }
 
     pub fn from_epoll(epoll: EpollSnapshot) -> Self {
-        let mut body = ResourceBody::default();
-        body.epoll = Some(epoll);
+        let body = ResourceBody {
+            epoll: Some(epoll),
+            ..Default::default()
+        };
         Self {
             kind: ResourceKind::Epoll,
             body,
@@ -280,8 +298,10 @@ impl ResourceSnapshot {
     }
 
     pub fn from_eventfd(eventfd: EventFdSnapshot) -> Self {
-        let mut body = ResourceBody::default();
-        body.eventfd = Some(eventfd);
+        let body = ResourceBody {
+            eventfd: Some(eventfd),
+            ..Default::default()
+        };
         Self {
             kind: ResourceKind::EventFd,
             body,
@@ -580,6 +600,14 @@ fn build_kernel_snapshot(kernel: &Kernel, pages: Vec<MemoryPageSnapshot>) -> Ker
         signals: crate::snapshot::SignalStateSnapshot::from(&kernel.signals),
         exit_code: kernel.exit_code.map(LeI32),
         comm: kernel.comm,
+        futex_table: {
+            // Lock-held for the snapshot walk + sort; no `.await`
+            // involved, so the lock-doesn't-cross-await rule from
+            // ADR 0001 §2 is preserved. The resulting `Vec` moves
+            // into the struct literal by ownership.
+            let table = kernel.futex_table.lock();
+            table.snapshot()
+        },
     }
 }
 
@@ -686,6 +714,17 @@ pub fn apply_snapshot_kernel_state(
         alt_stack: snap.signals.alt_stack.clone(),
     };
     kernel.mm.replace_from_snapshot(snap.mm.clone());
+
+    // ADR 0002 §5: rebuild the futex table from sorted (addr, waiters).
+    // The `Arc<Notify>` is fresh-allocated by `rebuild_from_snapshot`
+    // — in-flight waiters are dropped (the guest re-registers on its
+    // next syscall) per ADR 0001 §2's "shared per-address Notify"
+    // model. Lock is held only for the duration of the rebuild — no
+    // `.await` involved, matching the rest of this function.
+    {
+        let mut table = kernel.futex_table.lock();
+        table.rebuild_from_snapshot(&snap.futex_table);
+    }
 
     // ---- fd table ---------------------------------------------------------
     use crate::fd::{
@@ -923,15 +962,12 @@ fn apply_snapshot_to_memory_inner(
     // Clone the `Memory` handle out of kernel (it's `Copy` per
     // `src/mem.rs:28`). Drop the kernel borrow immediately so we can
     // re-borrow mutably through `store`.
-    let mem = kernel
-        .memory()
-        .map_err(|e| {
-            SnapshotError::IoError(
-                std::io::Error::other(format!("memory not attached: errno={e}")),
-                "kernel.memory()".into(),
-            )
-        })?
-        .clone();
+    let mem = *kernel.memory().map_err(|e| {
+        SnapshotError::IoError(
+            std::io::Error::other(format!("memory not attached: errno={e}")),
+            "kernel.memory()".into(),
+        )
+    })?;
     apply_snapshot_to_memory(snap, mem, store)
 }
 
@@ -960,7 +996,7 @@ pub fn apply_snapshot_to_memory(
         .max()
         .unwrap()
         + 1;
-    let cur_pages: usize = mem.data_size(&store.as_context()) / PAGE_SIZE_BYTES;
+    let cur_pages: usize = mem.data_size(store.as_context()) / PAGE_SIZE_BYTES;
     if target_pages > cur_pages {
         let delta: u64 = (target_pages - cur_pages) as u64;
         mem.grow(store.as_context_mut(), delta).map_err(|e| {
@@ -995,7 +1031,6 @@ pub fn apply_snapshot_to_memory(
 mod tests {
     use super::*;
     use crate::{build_engine, build_store};
-    use rand::RngCore;
     use std::sync::Arc;
     use wasmtime::{Linker, Store};
 
@@ -1030,6 +1065,7 @@ mod tests {
             signals: SignalStateSnapshot::default(),
             exit_code: None,
             comm: [0u8; 16],
+            futex_table: vec![],
         };
         let bytes = postcard::to_stdvec(&snap).expect("encode");
         let back: KernelSnapshot = postcard::from_bytes(&bytes).expect("decode");
@@ -1052,24 +1088,24 @@ mod tests {
         let bytes = postcard::to_stdvec(&snap).expect("encode");
         let back: PipeSnapshot = postcard::from_bytes(&bytes).expect("decode");
         assert_eq!(back.buf, dq);
-        assert_eq!(back.closed, false);
-        assert_eq!(back.nonblock, true);
+        assert!(!back.closed);
+        assert!(back.nonblock);
     }
 
     #[test]
     fn linear_allocator_snapshot_roundtrip() {
         // Build a snapshot directly and round-trip.
         let lsnap = LinearAllocatorSnapshot {
-            arenas: vec![crate::mm::Arena::new(0x1_000_0000)],
-            high_water: LeU32(0x1_001_0000),
+            arenas: vec![crate::mm::Arena::new(0x1000_0000)],
+            high_water: LeU32(0x1001_0000),
         };
         let bytes = postcard::to_stdvec(&lsnap).expect("encode");
         let back: LinearAllocatorSnapshot = postcard::from_bytes(&bytes).expect("decode");
         // Field-by-field checks; PartialEq was dropped to avoid Eq-bound
         // chains through SocketAddr-free paths.
-        assert_eq!(back.high_water, LeU32(0x1_001_0000));
+        assert_eq!(back.high_water, LeU32(0x1001_0000));
         assert_eq!(back.arenas.len(), 1);
-        assert_eq!(back.arenas[0].base, 0x1_000_0000);
+        assert_eq!(back.arenas[0].base, 0x1000_0000);
         assert_eq!(back.arenas[0].used, 0);
         assert!(back.arenas[0].free_list.is_empty());
     }
@@ -1163,7 +1199,6 @@ mod tests {
         // to store B; verify the pattern survives. The fresh
         // store's 1-page (64 KiB) memory is large enough for the 16
         // bytes; no grow needed.
-        use crate::snapshot::endian::LeU32;
         let (mut store_a, _mem) = fresh_store_with_mem();
         {
             let mem = kernel_memory(&store_a);
@@ -1179,7 +1214,7 @@ mod tests {
         // verifier checks memory bytes match.
         apply_with_store(snap, |_target, store_b| {
             let mem = kernel_memory(store_b);
-            let bytes = mem.data(&*store_b);
+            let bytes = mem.data(store_b);
             assert_eq!(
                 &bytes[0x100..0x110],
                 b"0123456789ABCDEF",
@@ -1217,10 +1252,10 @@ mod tests {
         apply_with_store(snap, |_target, store_b| {
             let mem = kernel_memory(store_b);
             assert!(
-                mem.data_size(&*store_b) >= 6 * PAGE_SIZE_BYTES,
+                mem.data_size(store_b) >= 6 * PAGE_SIZE_BYTES,
                 "memory must have grown to >= 6 pages"
             );
-            let bytes = mem.data(&*store_b);
+            let bytes = mem.data(store_b);
             let p5_start = 5 * PAGE_SIZE_BYTES;
             assert_eq!(
                 &bytes[p5_start..p5_start + 16],
@@ -1233,7 +1268,7 @@ mod tests {
 
     /// Extract the `Memory` handle out of a Store (Copy per `src/mem.rs:28`).
     fn kernel_memory(store: &Store<Kernel>) -> wasmtime::Memory {
-        store.data().memory().expect("memory attached").clone()
+        *store.data().memory().expect("memory attached")
     }
 
     #[test]
@@ -1508,8 +1543,8 @@ mod tests {
         // Partial tail (e.g. 70 KiB) — the first 64 KiB are zero,
         // the remaining 6144 bytes are non-zero.
         let mut data2 = vec![0u8; 64 * 1024 + 6144];
-        for i in (64 * 1024)..data2.len() {
-            data2[i] = ((i & 0xFF) as u8).wrapping_add(1);
+        for (i, byte) in data2.iter_mut().enumerate().skip(64 * 1024) {
+            *byte = ((i & 0xFF) as u8).wrapping_add(1);
         }
         let pages2 = collect_pages(&data2);
         assert_eq!(pages2.len(), 1, "partial-tail non-zero must be one entry");
@@ -1623,6 +1658,7 @@ mod tests {
             signals: SignalStateSnapshot::default(),
             exit_code: None,
             comm: [0u8; 16],
+            futex_table: vec![],
         }
     }
 

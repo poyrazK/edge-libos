@@ -41,9 +41,9 @@ the same job.
 3. **Branch name pattern**: `main`.
 4. Enable **Require a pull request before merging** (recommended).
 5. Enable **Require status checks to pass before merging**.
-6. Under **Status checks that are required**, search for and add **all four** job names:
-   - `tools`
-   - `build`
+6. Under **Status checks that are required**, search for and add **all four** job names (extended descriptions in the "Why linters live inside build / tools" section below):
+   - `tools` — `toolchain + version pins + non-cargo linters (actionlint + shellcheck + gitleaks + wat2wasm)`
+   - `build` — `cargo build + test + cargo linters (fmt + clippy + deny + machete + doc + NR-check) + upload`
    - `c-conformance`
    - `reproduce`
 7. Optional but recommended:
@@ -59,10 +59,32 @@ A failing or missing check on any one of these blocks the merge button:
 
 | Check | Catches |
 |-------|---------|
-| `tools` | Toolchain version drift (1.93.0 not pinned), zig install breakage, cache-key errors |
-| `build` | Compile errors, ALL Rust tests, strace-baseline subset — the single cargo gate |
-| `c-conformance` | C conformance regressions (44/44 marker-enforced, post-P1 fix) |
+| `tools` | Toolchain version drift (1.93.0 not pinned); zig / wabt install breakage; `actionlint` workflow-syntax errors; `shellcheck` shell-script warnings (with `.shellcheckrc` allow-list); `gitleaks` leaked secrets; `wat2wasm` WAT syntax errors |
+| `build` | Compile errors, ALL Rust tests, strace-baseline subset; plus 7 static checks: NR-table consistency (Rust ↔ C ↔ dispatch), `cargo fmt` formatting drift, `cargo clippy` lint regressions (`-D warnings`), `cargo doc` broken-doc warnings, `cargo-deny` advisory/license/source/bans violations, `cargo-machete` unused dependencies |
+| `c-conformance` | C conformance regressions (marker-enforced, post-P1 fix) |
 | `reproduce` | End-to-end integration regressions (dev_setup / guest build / DoD smokes / count totals) |
+
+### Why linters live inside build / tools (the 10-job revision)
+
+Per `HANDOFF.md §P2-CI-2`, the CI invariant is: **fan-out jobs MUST NOT invoke cargo** — each runner starts cold on its own `target/`, so an uncached cargo run in `c-conformance` or `reproduce` rebuilds the wasmtime dependency graph (~217 crates, ~3 min cold) for nothing. The same constraint shapes the linter layout:
+
+- **Cargo-required linters** (NR-check, `cargo fmt`, `cargo clippy`, `cargo doc`, `cargo-deny`, `cargo-machete`) live as **steps inside `build`**, which is the single job with a warm `target/ci/` cache. Marginal cost is ~30-60 s per linter on warm cache, ~3-6 min on cold — far cheaper than a separate runner that would cold-compile the whole graph.
+- **Non-cargo linters** (`actionlint`, `shellcheck`, `gitleaks`, `wat2wasm` validation) live as **steps inside `tools`** — they have no cache dependency, `tools` is already a toolchain smoke that installs `wabt` and apt packages, and the time budget there is otherwise small.
+
+The local mirror (`scripts/preflight.sh`) runs the same 10 linters in steps 0a-0j before the existing steps 1-5; a contributor who wants to know "will this CI-green?" runs `preflight.sh` locally.
+
+The 10 required checks today (counted as steps across the 4 jobs) are:
+
+1. `bash scripts/check_nr_consistency.sh` — three-way NR table mirror
+2. `cargo fmt --all -- --check` — formatting drift
+3. `cargo clippy --all-targets -- -D warnings` — lint regressions
+4. `cargo doc --no-deps --document-private-items` — broken docs
+5. `cargo deny check` — advisories, licenses, sources, bans
+6. `cargo machete` — unused dependencies
+7. `actionlint` — workflow syntax
+8. `shellcheck` scripts/**.sh tests/**.sh tests/conformance/runner.sh tests/strace_baselines/**.sh guest/build.sh
+9. `gitleaks detect` — secret leak scan
+10. `wat2wasm` validation over `find tests guests -name '*.wat'`
 
 ## Why this design
 
@@ -105,12 +127,14 @@ GitHub tracks checks by job name.
 
 ## Wall-clock target
 
-- **First run (cold cache)**: ≤ 6 min
-- **Subsequent runs (cache hit)**: ≤ 4 min
+- **First run (cold cache)**: ≤ 12 min
+- **Subsequent runs (cache hit)**: ≤ 7 min
 
-The 5-job fan-out predecessor shape took ~13 min on first run; the
-current 4-job shape with a single cargo run should hit ≤ 4 min on
-warm cache and ≤ 6 min cold.
+The 5-job fan-out predecessor shape took ~13 min cold. The current
+4-job shape with a single cargo run + 10 static-analysis linters
+absorbed ~6 min of additional cargo-linter overhead (clippy, deny,
+machete, doc; mostly on first compile — warm cache reuses target/ci/
+for nearly all of it).
 
 ## Rolling back
 
