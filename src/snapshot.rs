@@ -560,7 +560,25 @@ fn build_kernel_snapshot(kernel: &Kernel, pages: Vec<MemoryPageSnapshot>) -> Ker
             }
             Resource::Socket(shared) => {
                 let guard = shared.lock();
-                ResourceSnapshot::from_socket(guard.snapshot())
+                let mut sock_snap = guard.snapshot();
+                // P2-D3.5 ephemeral-port-drift fix: when the guest
+                // bound `0.0.0.0:0`, the kernel-assigned port lives only
+                // on the materialized `listener` (lazy-built by accept4
+                // or setsockopt). The `bound` field still says port=0.
+                // Overwrite the snapshot's port with the actual one so
+                // `apply_snapshot`'s reopen path binds to the right port.
+                // One-listener simplification: only rewrite the FIRST
+                // materialized listener's port. Future: extend to all.
+                if let (Some(l), Some(crate::fd::SockAddr::V4 { port, .. })) =
+                    (guard.listener.as_ref(), sock_snap.bound.as_mut())
+                {
+                    if *port == 0 {
+                        if let Ok(addr) = l.local_addr() {
+                            *port = addr.port();
+                        }
+                    }
+                }
+                ResourceSnapshot::from_socket(sock_snap)
             }
             Resource::Epoll(e) => ResourceSnapshot::from_epoll(e.snapshot()),
             Resource::EventFd(e) => ResourceSnapshot::from_eventfd(e.snapshot()),

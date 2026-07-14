@@ -37,6 +37,7 @@ pub mod serve;
 pub mod subcommand;
 pub mod trace;
 pub mod usage;
+pub mod util;
 
 use crate::cli::error::{CliError, CliResult};
 use crate::cli::subcommand::Subcommand;
