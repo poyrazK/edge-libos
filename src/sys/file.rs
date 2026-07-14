@@ -206,9 +206,10 @@ impl FilePos {
     /// P2-D1: snapshot form. Drops `inner: std::fs::File` (rebuilt from
     /// `path` on restore); records `pos`, `path`, `is_dir`, `dir_cache`.
     pub fn snapshot(&self) -> crate::snapshot::FileSnapshot {
+        use crate::snapshot::endian::LeU64;
         crate::snapshot::FileSnapshot {
             path: self.path.clone(),
-            pos: self.pos,
+            pos: LeU64(self.pos),
             is_dir: self.is_dir,
             dir_cache: self.dir_cache.clone(),
         }

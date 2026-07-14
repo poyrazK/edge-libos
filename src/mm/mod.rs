@@ -70,7 +70,7 @@ impl LinearAllocator {
     pub fn snapshot(&self) -> crate::snapshot::LinearAllocatorSnapshot {
         crate::snapshot::LinearAllocatorSnapshot {
             arenas: self.arenas.clone(),
-            high_water: self.high_water,
+            high_water: crate::snapshot::endian::LeU32(self.high_water),
         }
     }
 
@@ -78,7 +78,7 @@ impl LinearAllocator {
     /// `apply_snapshot` (D1.7).
     pub fn replace_from_snapshot(&mut self, snap: crate::snapshot::LinearAllocatorSnapshot) {
         self.arenas = snap.arenas;
-        self.high_water = snap.high_water;
+        self.high_water = snap.high_water.0;
     }
 
     /// Decide where to place an allocation. Pure: no memory writes happen

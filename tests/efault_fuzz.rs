@@ -720,6 +720,11 @@ fn fuzz_overflow_ptr_plus_len_every_pointer_syscall() -> Result<()> {
             "eventfd2",
             [0, 0, 0, 0, 0, 0],
         ),
+        (
+            edge_libos::sys::futex::NR_FUTEX,
+            "futex",
+            [100_000_000, 0, 0, 0, 0, 0],
+        ),
     ];
     for (nr, name, args) in cases {
         // epoll_create1 + eventfd2 have no pointer args; they always

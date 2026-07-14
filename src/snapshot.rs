@@ -54,6 +54,7 @@ use serde::{Deserialize, Serialize};
 use crate::fd::FdTable;
 use crate::fd::SockAddr;
 use crate::kernel::{Kernel, RngSeed};
+use crate::snapshot::endian::{LeI32, LeU32, LeU64};
 use crate::sys::signal::SignalState;
 use crate::vfs::Vfs;
 
@@ -61,9 +62,26 @@ use rand::SeedableRng;
 
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 
+/// ADR 0002 §3: snapshot linear memory in 64 KiB pages, sparse-encoded
+/// (`Vec<MemoryPageSnapshot>`). Untouched (all-zero) pages are omitted.
+pub const PAGE_SIZE_BYTES: usize = 64 * 1024;
+
+/// P2-D2 / ADR 0002 §3: one 64 KiB page of linear memory. Missing from
+/// the snapshot ⇒ that page is the wasmtime-grown zero-fill at restore
+/// time. Wire order per page: `LeU32 page_index, LeU32 page_len, Vec<u8>
+/// page_bytes`. We omit the redundant `page_len` (always
+/// `PAGE_SIZE_BYTES` when present) — see the §3 example header for the
+/// optional third field; we keep `Vec<u8>` always at PAGE_SIZE_BYTES.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryPageSnapshot {
+    pub page_index: LeU32,
+    pub bytes: Vec<u8>,
+}
+
 /// All snapshot types live in this module. They are independent of the
 /// runtime `Kernel` so the snapshot shape can evolve without disturbing
 /// live handler code.
+///
 /// An adapter that maps `VecDeque<u8>` ↔ `Vec<u8>` for serde.
 ///
 /// `std::collections::VecDeque` does not derive `Serialize`, but it does
@@ -87,6 +105,18 @@ pub mod vecdeque_bytes {
         Ok(VecDeque::from(v))
     }
 }
+
+/// P2-D2 / ADR 0002 §2 — explicit little-endian newtypes for every
+/// multi-byte integer in the snapshot wire format. See
+/// `crate::snapshot::endian` for the rationale + wire-format spec.
+pub mod endian;
+
+/// P2-D3.1 — postcard façade: thin wrappers over `postcard::{to_stdvec,
+/// from_bytes}` and `std::fs::{read, write}` so freeze/serve callers
+/// don't repeat the error-mapping boilerplate.
+pub mod io;
+
+pub use io::{decode_snapshot, encode_snapshot, read_snapshot_file, write_snapshot_file};
 
 /// Helper trait for the `Arc<parking_lot::Mutex<T>>` pattern used in fd.rs.
 ///
@@ -126,32 +156,48 @@ pub mod parking_lot_mutex_bytes {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KernelSnapshot {
-    pub format_version: u32,
+    /// ADR 0002 §3 + §4: first wire word is `LeU32(1)` (or
+    /// equivalent `u8` per §4 — LeU32 form subsumes it).
+    pub format_version: LeU32,
+    /// ADR 0002 §3: sparse per-page linear-memory overlay. Pages
+    /// untouched by the guest (all-zero) are omitted from the snapshot
+    /// and re-instated by wasmtime's grow on restore.
+    pub pages: Vec<MemoryPageSnapshot>,
     pub fds: FdSnapshot,
     pub mm: LinearAllocatorSnapshot,
     pub vfs: VfsSnapshot,
     pub clock: ClockStateSnapshot,
-    pub brk: u32,
+    pub brk: LeU32,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub rng_seed: RngSeed,
     pub signals: SignalStateSnapshot,
-    pub exit_code: Option<i32>,
+    pub exit_code: Option<LeI32>,
     pub comm: [u8; 16],
+    /// ADR 0001 §2 + ADR 0002 §5 — futex address table.
+    ///
+    /// Sorted by `addr` for deterministic postcard output; the
+    /// in-memory `FutexTable` uses `HashMap` (ADR 0001 §2 — keyed
+    /// lookup), so the wire form is a `Vec` of `(addr, waiters)`
+    /// pairs, not a serde HashMap. `Arc<tokio::sync::Notify>` is NOT
+    /// persisted — see `FutexTable::rebuild_from_snapshot` for the
+    /// rebuild-on-restore contract. Append-only field: snapshot
+    /// format version stays at `SNAPSHOT_FORMAT_VERSION = 1`.
+    pub futex_table: Vec<crate::sys::futex::FutexAddrSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FdSnapshot {
     /// Sorted by `(fd,)` for deterministic postcard output.
     pub entries: Vec<FdEntrySnapshot>,
-    pub next_fd: u32,
+    pub next_fd: LeU32,
     /// Sorted ascending.
-    pub cloexec: Vec<u32>,
+    pub cloexec: Vec<LeU32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FdEntrySnapshot {
-    pub fd: u32,
+    pub fd: LeU32,
     pub kind: ResourceSnapshot,
 }
 
@@ -274,7 +320,7 @@ pub struct PipeSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FileSnapshot {
     pub path: Option<PathBuf>,
-    pub pos: u64,
+    pub pos: LeU64,
     pub is_dir: bool,
     pub dir_cache: Option<Vec<u8>>,
 }
@@ -285,12 +331,12 @@ pub struct SocketSnapshot {
     pub nonblock: bool,
     pub bound: Option<SockAddr>,
     /// Recorded for fidelity; the OS picks the actual backlog on restore.
-    pub listen_backlog: Option<i32>,
+    pub listen_backlog: Option<LeI32>,
     pub so_reuseaddr: bool,
     pub so_keepalive: bool,
     pub tcp_nodelay: bool,
     pub peer_addr_present: bool,
-    pub last_error: i32,
+    pub last_error: LeI32,
     pub shutdown_flags: u8,
     pub is_acceptor: bool,
     #[serde(with = "vecdeque_bytes")]
@@ -313,19 +359,19 @@ pub struct UnixSockSnapshot {
 pub struct EpollSnapshot {
     /// Vec (sorted) because serde on HashMap is non-deterministic.
     pub entries: Vec<EpollEntrySnapshot>,
-    pub self_event_fd: Option<u32>,
+    pub self_event_fd: Option<LeU32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpollEntrySnapshot {
-    pub fd: u32,
-    pub events: u32,
-    pub data: u64,
+    pub fd: LeU32,
+    pub events: LeU32,
+    pub data: LeU64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EventFdSnapshot {
-    pub counter: u64,
+    pub counter: LeU64,
     pub nonblock: bool,
 }
 
@@ -334,7 +380,7 @@ pub struct LinearAllocatorSnapshot {
     /// Identical shape to `crate::mm::Arena`; we serialize the runtime
     /// type directly because `Arena` already derives the right traits.
     pub arenas: Vec<crate::mm::Arena>,
-    pub high_water: u32,
+    pub high_water: LeU32,
 }
 
 /// Identical-shape mirror of `crate::kernel::ClockState` so the runtime
@@ -342,14 +388,14 @@ pub struct LinearAllocatorSnapshot {
 /// from this into the kernel's `ClockState`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClockStateSnapshot {
-    pub boot_monotonic_ns: u64,
+    pub boot_monotonic_ns: LeU64,
 }
 
 /// Identical-shape mirror of `crate::sys::signal::SignalState`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SignalStateSnapshot {
     pub actions: std::collections::BTreeMap<i32, crate::sys::signal::SigAction>,
-    pub mask: u64,
+    pub mask: LeU64,
     pub alt_stack: Option<Vec<u8>>,
 }
 
@@ -379,7 +425,7 @@ impl From<&SignalState> for SignalStateSnapshot {
         }
         Self {
             actions,
-            mask: s.mask,
+            mask: LeU64(s.mask),
             alt_stack: s.alt_stack.clone(),
         }
     }
@@ -388,7 +434,7 @@ impl From<&SignalState> for SignalStateSnapshot {
 impl From<&crate::kernel::ClockState> for ClockStateSnapshot {
     fn from(c: &crate::kernel::ClockState) -> Self {
         Self {
-            boot_monotonic_ns: c.boot_monotonic_ns,
+            boot_monotonic_ns: LeU64(c.boot_monotonic_ns),
         }
     }
 }
@@ -451,13 +497,39 @@ impl std::error::Error for SnapshotError {
 /// Walk `Kernel` and assemble a `KernelSnapshot`.
 ///
 /// Locks briefly per resource, drops the guard, copies out the snapshot
-/// form. Runtime handles (`Arc<Notify>`, `Memory`, raw fds) are dropped
-/// from the snapshot — they will be rebuilt in `apply_snapshot` (D1.7)
-/// and the linear-memory in `apply_snapshot` (D2).
+/// form. Runtime handles (`Arc<Notify>`, raw fds) are dropped — they
+/// are rebuilt on `apply_snapshot`. The Wasmtime `Memory` handle is
+/// retained on the kernel but the bytes are read out into the snapshot's
+/// `pages` overlay here; `apply_snapshot` grows + chunk-copies them on
+/// restore.
+///
+/// **Concurrency:** the caller must serialize against guest execution —
+/// this runtime is single-threaded (`wasm_threads` is off and the tokio
+/// runtime is current-thread), so the freeze CLI's quiescent-point
+/// ordering is sufficient; if you ever change that, gate this function
+/// behind an explicit barrier.
 pub fn try_to_snapshot(
     kernel: &Kernel,
-    _mem_bytes: &[u8],
+    store: &impl wasmtime::AsContext,
 ) -> Result<KernelSnapshot, SnapshotError> {
+    // Read linear memory (sparse, only non-zero pages).
+    let pages = if let Ok(mem) = kernel.memory() {
+        let data = mem.data(store.as_context());
+        collect_pages(data)
+    } else {
+        // No memory attached yet — emit an empty pages list. `apply_snapshot`
+        // will refuse to restore an empty-pages snapshot onto a no-memory
+        // target; this is a host-construction error caught by the freeze CLI.
+        Vec::new()
+    };
+
+    Ok(build_kernel_snapshot(kernel, pages))
+}
+
+/// Build a `KernelSnapshot` *without* reading linear memory. Used by
+/// unit tests that don't have a `Store<Kernel>` to pass in. D2.4:
+/// `try_to_snapshot` calls this after collecting `pages` from memory.
+fn build_kernel_snapshot(kernel: &Kernel, pages: Vec<MemoryPageSnapshot>) -> KernelSnapshot {
     use crate::fd::Resource;
     use crate::snapshot::{FdEntrySnapshot, ResourceSnapshot};
 
@@ -481,7 +553,7 @@ pub fn try_to_snapshot(
                 let guard = shared.lock();
                 ResourceSnapshot::from_file(crate::snapshot::FileSnapshot {
                     path: guard.path.clone(),
-                    pos: guard.pos,
+                    pos: LeU64(guard.pos),
                     is_dir: guard.is_dir,
                     dir_cache: guard.dir_cache.clone(),
                 })
@@ -493,33 +565,85 @@ pub fn try_to_snapshot(
             Resource::Epoll(e) => ResourceSnapshot::from_epoll(e.snapshot()),
             Resource::EventFd(e) => ResourceSnapshot::from_eventfd(e.snapshot()),
         };
-        entries.push(FdEntrySnapshot { fd, kind });
+        entries.push(FdEntrySnapshot {
+            fd: LeU32(fd),
+            kind,
+        });
     }
 
-    let cloexec: Vec<u32> = {
-        let mut v: Vec<u32> = kernel.fds.iter_cloexec_for_snapshot();
+    let cloexec: Vec<LeU32> = {
+        let mut v: Vec<LeU32> = kernel
+            .fds
+            .iter_cloexec_for_snapshot()
+            .into_iter()
+            .map(LeU32)
+            .collect();
         v.sort();
         v
     };
 
-    Ok(KernelSnapshot {
-        format_version: SNAPSHOT_FORMAT_VERSION,
+    KernelSnapshot {
+        format_version: LeU32(SNAPSHOT_FORMAT_VERSION),
+        pages,
         fds: crate::snapshot::FdSnapshot {
             entries,
-            next_fd: kernel.fds.next_fd_for_snapshot(),
+            next_fd: LeU32(kernel.fds.next_fd_for_snapshot()),
             cloexec,
         },
         mm: kernel.mm.snapshot(),
         vfs: crate::snapshot::VfsSnapshot::from(&kernel.vfs),
         clock: crate::snapshot::ClockStateSnapshot::from(&kernel.clock),
-        brk: kernel.brk,
+        brk: LeU32(kernel.brk),
         args: kernel.args.clone(),
         env: kernel.env.clone(),
         rng_seed: kernel.rng_seed,
         signals: crate::snapshot::SignalStateSnapshot::from(&kernel.signals),
-        exit_code: kernel.exit_code,
+        exit_code: kernel.exit_code.map(LeI32),
         comm: kernel.comm,
-    })
+        futex_table: {
+            // Lock-held for the snapshot walk + sort; no `.await`
+            // involved, so the lock-doesn't-cross-await rule from
+            // ADR 0001 §2 is preserved. The resulting `Vec` moves
+            // into the struct literal by ownership.
+            let table = kernel.futex_table.lock();
+            table.snapshot()
+        },
+    }
+}
+
+/// P2-D2 / ADR 0002 §3: scan a linear-memory blob in 64 KiB page
+/// chunks and return a sparse `Vec<MemoryPageSnapshot>` containing
+/// only the pages whose bytes are not all zero. Untouched pages are
+/// restored on `apply_snapshot` by `Memory::grow` (which zero-fills
+/// new pages) and then optionally chunk-copied with the pages in
+/// the snapshot — the result is byte-identical to the pre-snapshot
+/// memory.
+pub fn collect_pages(data: &[u8]) -> Vec<MemoryPageSnapshot> {
+    let mut pages = Vec::new();
+    let mut chunks = data.chunks_exact(PAGE_SIZE_BYTES);
+    let mut page_index: u32 = 0;
+    for chunk in &mut chunks {
+        if !is_zero_page(chunk) {
+            pages.push(MemoryPageSnapshot {
+                page_index: LeU32(page_index),
+                bytes: chunk.to_vec(),
+            });
+        }
+        page_index += 1;
+    }
+    let remainder = chunks.remainder();
+    if !remainder.is_empty() && !is_zero_page(remainder) {
+        pages.push(MemoryPageSnapshot {
+            page_index: LeU32(page_index),
+            bytes: remainder.to_vec(),
+        });
+    }
+    pages
+}
+
+fn is_zero_page(page: &[u8]) -> bool {
+    // `iter().any(|b| *b != 0)` is faster than full equality for sparse non-zero pages.
+    !page.iter().any(|b| *b != 0)
 }
 
 /// Apply a `KernelSnapshot` to a target `Kernel`. The target kernel is
@@ -532,52 +656,75 @@ pub fn try_to_snapshot(
 /// - drains `Kernel.fds` (closes any stdio) and rebuilds it from the
 ///   snapshot: pipes (Stdin/Stdout/Stderr/PipeRead/PipeWrite), File
 ///   (reopened by path), EventFd (counter reset), Epoll (rebuilt
-///   freshly), and the linear-memory bytes via `mem`. Sockets, accepted
-///   streams, and abstract unix namespaces return
-///   `SnapshotError::{AcceptedStreamOnListener, AbstractUnixNamespace}`
-///   so the freeze CLI can abort cleanly.
+///   freshly);
+/// - grows the attached linear memory to fit the highest `page_index`
+///   in `snap.pages` (or stays at its current size if `pages` is empty)
+///   and chunk-copies each saved page's bytes into the right slot.
 ///
-/// `mem` is a `&mut Vec<u8>` for D1 (linear-memory blob is a
-/// pass-through placeholder). D2 will plug a `wasmtime::Memory`-backed
-/// buffer here without changing this signature.
+/// Sockets, accepted streams, and abstract unix namespaces return
+/// `SnapshotError::{AcceptedStreamOnListener, AbstractUnixNamespace}`
+/// so the freeze CLI can abort cleanly.
 pub fn apply_snapshot(
     snap: KernelSnapshot,
     kernel: &mut Kernel,
-    _mem: &mut Vec<u8>,
+    store: &mut impl wasmtime::AsContextMut<Data = Kernel>,
 ) -> Result<(), SnapshotError> {
-    if snap.format_version != SNAPSHOT_FORMAT_VERSION {
+    apply_snapshot_kernel_state(&snap, kernel)?;
+    apply_snapshot_to_memory_inner(&snap, kernel, store)
+}
+
+/// Step 1 of `apply_snapshot`: replace kernel-resident state (args,
+/// env, brk, fd-table, signals, vfs, clock, mm, rng). Takes only
+/// `&mut Kernel` — does NOT touch `Store<Kernel>`. Public for callers
+/// that want to drive the apply by hand (specifically: tests that
+/// hit Rust's borrow checker when holding both `&mut Kernel` (via
+/// `Store::data_mut`) and `&mut Store<Kernel>` at the same time).
+pub fn apply_snapshot_kernel_state(
+    snap: &KernelSnapshot,
+    kernel: &mut Kernel,
+) -> Result<(), SnapshotError> {
+    if snap.format_version.0 != SNAPSHOT_FORMAT_VERSION {
         return Err(SnapshotError::FormatVersionMismatch {
-            found: snap.format_version,
+            found: snap.format_version.0,
             supported: SNAPSHOT_FORMAT_VERSION,
         });
     }
-
-    // ---- trivial fields ---------------------------------------------------
-    kernel.args = snap.args;
-    kernel.env = snap.env;
+    kernel.args = snap.args.clone();
+    kernel.env = snap.env.clone();
     kernel.comm = snap.comm;
-    kernel.exit_code = snap.exit_code;
-    kernel.brk = snap.brk;
+    kernel.exit_code = snap.exit_code.map(|c| c.0);
+    kernel.brk = snap.brk.0;
     kernel.rng_seed = snap.rng_seed;
     kernel.rng = rand::rngs::SmallRng::from_seed(kernel.rng_seed);
     kernel.vfs = Vfs {
-        root: snap.vfs.root,
-        cwd: snap.vfs.cwd,
+        root: snap.vfs.root.clone(),
+        cwd: snap.vfs.cwd.clone(),
     };
     kernel.clock = crate::kernel::ClockState {
-        boot_monotonic_ns: snap.clock.boot_monotonic_ns,
+        boot_monotonic_ns: snap.clock.boot_monotonic_ns.0,
     };
     let mut actions: std::collections::HashMap<i32, crate::sys::signal::SigAction> =
         std::collections::HashMap::new();
-    for (k, v) in snap.signals.actions {
-        actions.insert(k, v);
+    for (k, v) in &snap.signals.actions {
+        actions.insert(*k, *v);
     }
     kernel.signals = SignalState {
         actions,
-        mask: snap.signals.mask,
-        alt_stack: snap.signals.alt_stack,
+        mask: snap.signals.mask.0,
+        alt_stack: snap.signals.alt_stack.clone(),
     };
-    kernel.mm.replace_from_snapshot(snap.mm);
+    kernel.mm.replace_from_snapshot(snap.mm.clone());
+
+    // ADR 0002 §5: rebuild the futex table from sorted (addr, waiters).
+    // The `Arc<Notify>` is fresh-allocated by `rebuild_from_snapshot`
+    // — in-flight waiters are dropped (the guest re-registers on its
+    // next syscall) per ADR 0001 §2's "shared per-address Notify"
+    // model. Lock is held only for the duration of the rebuild — no
+    // `.await` involved, matching the rest of this function.
+    {
+        let mut table = kernel.futex_table.lock();
+        table.rebuild_from_snapshot(&snap.futex_table);
+    }
 
     // ---- fd table ---------------------------------------------------------
     use crate::fd::{EpollInner, EventFdInner, PipeRead, PipeWrite, Resource, SharedFilePos};
@@ -590,7 +737,7 @@ pub fn apply_snapshot(
 
     // Sort entries by fd for deterministic rebuild order.
     let mut entries = snap.fds.entries.clone();
-    entries.sort_by_key(|e| e.fd);
+    entries.sort_by_key(|e| e.fd.0);
 
     // Track which fds become stdin/stdout/stderr so we can hydrate the
     // matching output buffers when the host driver queries them later.
@@ -660,40 +807,31 @@ pub fn apply_snapshot(
                     .open(&path)
                     .map_err(|e| SnapshotError::IoError(e, format!("open {}", path.display())))?;
                 use std::io::{Seek, SeekFrom};
-                f.seek(SeekFrom::Start(fsnap.pos))
+                f.seek(SeekFrom::Start(fsnap.pos.0))
                     .map_err(|e| SnapshotError::IoError(e, format!("seek {}", path.display())))?;
                 let mut fp = FilePos::new(f);
                 fp.path = Some(path);
-                fp.pos = fsnap.pos;
+                fp.pos = fsnap.pos.0;
                 fp.dir_cache = fsnap.dir_cache;
                 Resource::File(SharedFilePos::new(parking_lot::Mutex::new(fp)))
             }
             ResourceKind::Socket => {
-                // D1 deliberately does not rebuild Sockets: a snapshot
-                // captured mid-request may include accepted streams
-                // whose peer we cannot recreate, and AF_UNIX abstract
-                // namespace binds are not reproducible. D3 (the freeze
-                // CLI) either avoids freezing in those states or accepts
-                // the lost fd.
                 return Err(SnapshotError::Unsupported(
                     "Resource::Socket reopen on apply_snapshot (D3 freeze CLI decides policy)",
                 ));
             }
             ResourceKind::Epoll => {
                 let esnap = body.epoll.clone().ok_or(SnapshotError::UnknownResource)?;
-                // Build a fresh EpollInner. The `self_event_fd` slot is
-                // recreated lazily by the next epoll_wait if the guest
-                // asks for it; we don't pre-create it here.
                 let entries_map: HashMap<u32, crate::fd::EpollEntry> = esnap
                     .entries
                     .iter()
                     .map(|e| {
                         (
-                            e.fd,
+                            e.fd.0,
                             crate::fd::EpollEntry {
-                                fd: e.fd,
-                                events: e.events,
-                                data: e.data,
+                                fd: e.fd.0,
+                                events: e.events.0,
+                                data: e.data.0,
                                 wake: Arc::new(tokio::sync::Notify::new()),
                             },
                         )
@@ -702,43 +840,128 @@ pub fn apply_snapshot(
                 Resource::Epoll(EpollInner {
                     entries: parking_lot::Mutex::new(entries_map),
                     cancel: Arc::new(tokio::sync::Notify::new()),
-                    self_event_fd: esnap.self_event_fd,
+                    self_event_fd: esnap.self_event_fd.map(|f| f.0),
                 })
             }
             ResourceKind::EventFd => {
                 let esnap = body.eventfd.clone().ok_or(SnapshotError::UnknownResource)?;
                 Resource::EventFd(EventFdInner {
-                    counter: parking_lot::Mutex::new(esnap.counter),
+                    counter: parking_lot::Mutex::new(esnap.counter.0),
                     notify: Arc::new(tokio::sync::Notify::new()),
                     nonblock: AtomicBool::new(esnap.nonblock),
                 })
             }
         };
-        kernel.fds.insert_at(fd_num, resource).map_err(|e| {
+        kernel.fds.insert_at(fd_num.0, resource).map_err(|e| {
             SnapshotError::IoError(
-                std::io::Error::other(format!("fd {fd_num} conflict: {e}")),
+                std::io::Error::other(format!("fd {} conflict: {e}", fd_num.0)),
                 "fd insert_at".into(),
             )
         })?;
     }
 
-    // Re-bind cloexec bits.
     for fd in &snap.fds.cloexec {
-        kernel.fds.set_cloexec(*fd, true);
+        kernel.fds.set_cloexec(fd.0, true);
+    }
+    kernel.fds.set_next_fd_for_snapshot(snap.fds.next_fd.0);
+    Ok(())
+}
+
+/// Step 2 of `apply_snapshot`: grow the attached linear memory to
+/// fit the highest `page_index` in `snap.pages` (or stay at its
+/// current size if `pages` is empty) and chunk-copy each saved page's
+/// bytes into the right slot. Idempotent: if the snapshot carries no
+/// pages, this is a no-op (the memory remains at whatever size the
+/// target store was born with — sufficient for the roundtrip test
+/// fixture, which builds a 32-page module ahead of time).
+fn apply_snapshot_to_memory_inner(
+    snap: &KernelSnapshot,
+    kernel: &mut Kernel,
+    store: &mut impl wasmtime::AsContextMut<Data = Kernel>,
+) -> Result<(), SnapshotError> {
+    if snap.pages.is_empty() {
+        return Ok(());
+    }
+    // Clone the `Memory` handle out of kernel (it's `Copy` per
+    // `src/mem.rs:28`). Drop the kernel borrow immediately so we can
+    // re-borrow mutably through `store`.
+    let mem = *kernel.memory().map_err(|e| {
+        SnapshotError::IoError(
+            std::io::Error::other(format!("memory not attached: errno={e}")),
+            "kernel.memory()".into(),
+        )
+    })?;
+    apply_snapshot_to_memory(snap, mem, store)
+}
+
+/// Memory-only restore driver. Takes the cloned `Memory` handle
+/// instead of a `&mut Kernel` — disjoint borrow of `store`, no kernel
+/// reference. Use this directly from tests to avoid the
+/// `&mut kernel + &mut store` overlap that Rust's NLL rejects on
+/// inline expressions.
+///
+/// **Public** so integration tests can drive the apply by hand
+/// (also see [`apply_snapshot_kernel_state`] for the kernel-only
+/// half of the same operation).
+pub fn apply_snapshot_to_memory(
+    snap: &KernelSnapshot,
+    mem: wasmtime::Memory,
+    store: &mut impl wasmtime::AsContextMut<Data = Kernel>,
+) -> Result<(), SnapshotError> {
+    if snap.pages.is_empty() {
+        return Ok(());
+    }
+    // How many wasm pages does this snapshot need?
+    let target_pages = snap
+        .pages
+        .iter()
+        .map(|p| p.page_index.0 as usize)
+        .max()
+        .unwrap()
+        + 1;
+    let cur_pages: usize = mem.data_size(store.as_context()) / PAGE_SIZE_BYTES;
+    if target_pages > cur_pages {
+        let delta: u64 = (target_pages - cur_pages) as u64;
+        mem.grow(store.as_context_mut(), delta).map_err(|e| {
+            SnapshotError::IoError(
+                std::io::Error::other(format!("memory.grow failed: {e:?}")),
+                "mem.grow".into(),
+            )
+        })?;
     }
 
-    // Restore the "next available" pointer so subsequent allocations
-    // honor the snapshot's idea of fd space.
-    kernel.fds.set_next_fd_for_snapshot(snap.fds.next_fd);
-
+    // chunk-copy each page's bytes into the right slot.
+    let bytes = mem.data_mut(store.as_context_mut());
+    for page in &snap.pages {
+        let start = page.page_index.0 as usize * PAGE_SIZE_BYTES;
+        let end = start + page.bytes.len();
+        if end > bytes.len() {
+            return Err(SnapshotError::IoError(
+                std::io::Error::other(format!(
+                    "page {} out of bounds: {end} > {}",
+                    page.page_index.0,
+                    bytes.len()
+                )),
+                "page chunk-copy".into(),
+            ));
+        }
+        bytes[start..end].copy_from_slice(&page.bytes);
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::RngCore;
+    use crate::{build_engine, build_store};
     use std::sync::Arc;
+    use wasmtime::{Linker, Store};
+
+    /// Helper: parse + compile a WAT string with the kernel's test engine.
+    fn compile_wat(engine: &wasmtime::Engine, wat: &str) -> anyhow::Result<wasmtime::Module> {
+        let bytes = wat::parse_str(wat)?;
+        Ok(wasmtime::Module::new(engine, &bytes)?)
+    }
 
     #[test]
     fn format_version_constant_value() {
@@ -749,7 +972,8 @@ mod tests {
     fn smoke_postcard_roundtrip_of_format_version_only() {
         // Encode a minimal snapshot via postcard and decode it back.
         let snap = KernelSnapshot {
-            format_version: SNAPSHOT_FORMAT_VERSION,
+            format_version: LeU32(SNAPSHOT_FORMAT_VERSION),
+            pages: vec![],
             fds: FdSnapshot::default(),
             mm: LinearAllocatorSnapshot::default(),
             vfs: VfsSnapshot {
@@ -757,18 +981,20 @@ mod tests {
                 cwd: "/".into(),
             },
             clock: ClockStateSnapshot::default(),
-            brk: 0,
+            brk: LeU32(0),
             args: vec!["a".to_string()],
             env: vec![("K".to_string(), "V".to_string())],
             rng_seed: [7u8; 32],
             signals: SignalStateSnapshot::default(),
             exit_code: None,
             comm: [0u8; 16],
+            futex_table: vec![],
         };
         let bytes = postcard::to_stdvec(&snap).expect("encode");
         let back: KernelSnapshot = postcard::from_bytes(&bytes).expect("decode");
         // Field-by-field; KernelSnapshot doesn't derive PartialEq.
-        assert_eq!(back.format_version, 1);
+        assert_eq!(back.format_version, LeU32(1));
+        assert!(back.pages.is_empty());
     }
 
     #[test]
@@ -794,13 +1020,13 @@ mod tests {
         // Build a snapshot directly and round-trip.
         let lsnap = LinearAllocatorSnapshot {
             arenas: vec![crate::mm::Arena::new(0x1000_0000)],
-            high_water: 0x1001_0000,
+            high_water: LeU32(0x1001_0000),
         };
         let bytes = postcard::to_stdvec(&lsnap).expect("encode");
         let back: LinearAllocatorSnapshot = postcard::from_bytes(&bytes).expect("decode");
         // Field-by-field checks; PartialEq was dropped to avoid Eq-bound
         // chains through SocketAddr-free paths.
-        assert_eq!(back.high_water, 0x1001_0000);
+        assert_eq!(back.high_water, LeU32(0x1001_0000));
         assert_eq!(back.arenas.len(), 1);
         assert_eq!(back.arenas[0].base, 0x1000_0000);
         assert_eq!(back.arenas[0].used, 0);
@@ -839,11 +1065,11 @@ mod tests {
         assert_eq!(efd_fd, 3);
 
         // Capture the snapshot.
-        let snap = try_to_snapshot(&kernel, &[]).expect("snapshot succeeds");
+        let snap = build_kernel_snapshot(&kernel, vec![]);
 
         // Header.
-        assert_eq!(snap.format_version, SNAPSHOT_FORMAT_VERSION);
-        assert_eq!(snap.brk, 0x1000);
+        assert_eq!(snap.format_version, LeU32(SNAPSHOT_FORMAT_VERSION));
+        assert_eq!(snap.brk, LeU32(0x1000));
         assert_eq!(snap.rng_seed, [42u8; 32]);
         assert_eq!(
             snap.args,
@@ -854,18 +1080,18 @@ mod tests {
 
         // FDs: 0 (stdin), 1 (stdout), 2 (stderr), 3 (eventfd) all present.
         assert_eq!(snap.fds.entries.len(), 4);
-        let fds: Vec<u32> = snap.fds.entries.iter().map(|e| e.fd).collect();
+        let fds: Vec<u32> = snap.fds.entries.iter().map(|e| e.fd.0).collect();
         assert_eq!(fds, vec![0, 1, 2, 3]);
 
         // Specifically the EventFd entry has counter=7.
-        let efd_entry = snap.fds.entries.iter().find(|e| e.fd == 3).unwrap();
+        let efd_entry = snap.fds.entries.iter().find(|e| e.fd == LeU32(3)).unwrap();
         assert_eq!(efd_entry.kind.kind, ResourceKind::EventFd);
         let efd = efd_entry.kind.body.eventfd.as_ref().expect("eventfd body");
-        assert_eq!(efd.counter, 7);
+        assert_eq!(efd.counter, LeU64(7));
         assert!(!efd.nonblock);
 
         // next_fd should be ≥ 4.
-        assert!(snap.fds.next_fd >= 4);
+        assert!(snap.fds.next_fd.0 >= 4);
 
         // Round-trip the entire snapshot via postcard.
         let bytes = postcard::to_stdvec(&snap).expect("encode succeeds");
@@ -888,6 +1114,84 @@ mod tests {
         assert_eq!(back.env, snap.env);
         assert_eq!(back.fds.entries.len(), snap.fds.entries.len());
         assert_eq!(back.mm.high_water, snap.mm.high_water);
+    }
+
+    #[test]
+    fn apply_snapshot_restores_linear_memory() {
+        // Write a 16-byte pattern at offset 0x100 in store A; restore
+        // to store B; verify the pattern survives. The fresh
+        // store's 1-page (64 KiB) memory is large enough for the 16
+        // bytes; no grow needed.
+        let (mut store_a, _mem) = fresh_store_with_mem();
+        {
+            let mem = kernel_memory(&store_a);
+            let bytes = mem.data_mut(&mut store_a);
+            bytes[0x100..0x110].copy_from_slice(b"0123456789ABCDEF");
+        }
+        let snap = {
+            let kernel = store_a.data();
+            try_to_snapshot(kernel, &store_a).expect("snapshot")
+        };
+
+        // Apply to a fresh store B via apply_with_store; the
+        // verifier checks memory bytes match.
+        apply_with_store(snap, |_target, store_b| {
+            let mem = kernel_memory(store_b);
+            let bytes = mem.data(store_b);
+            assert_eq!(
+                &bytes[0x100..0x110],
+                b"0123456789ABCDEF",
+                "linear memory not restored byte-exact"
+            );
+            assert!(
+                bytes[..0x100].iter().all(|b| *b == 0),
+                "pre-pattern bytes must be zero"
+            );
+        })
+        .expect("apply_snapshot");
+    }
+
+    #[test]
+    fn apply_snapshot_grows_memory() {
+        // Fresh store has 1 page (64 KiB). Write a recognisable
+        // pattern at page index 5, snapshot, then apply onto a
+        // fresh 1-page store B. After apply, store must have grown
+        // to >= 6 pages and the bytes at page 5 must match.
+        let (mut store_a, _mem) = fresh_store_with_mem();
+        {
+            let mem = kernel_memory(&store_a);
+            mem.grow(&mut store_a, 5).expect("grow store_a");
+            let bytes = mem.data_mut(&mut store_a);
+            let p5_start = 5 * PAGE_SIZE_BYTES;
+            bytes[p5_start..p5_start + 16].copy_from_slice(b"GROW_GROWS_PAGE5");
+        }
+        let snap = {
+            let kernel = store_a.data();
+            try_to_snapshot(kernel, &store_a).expect("snapshot")
+        };
+        assert_eq!(snap.pages.len(), 1);
+        assert_eq!(snap.pages[0].page_index, LeU32(5));
+
+        apply_with_store(snap, |_target, store_b| {
+            let mem = kernel_memory(store_b);
+            assert!(
+                mem.data_size(store_b) >= 6 * PAGE_SIZE_BYTES,
+                "memory must have grown to >= 6 pages"
+            );
+            let bytes = mem.data(store_b);
+            let p5_start = 5 * PAGE_SIZE_BYTES;
+            assert_eq!(
+                &bytes[p5_start..p5_start + 16],
+                b"GROW_GROWS_PAGE5",
+                "page 5 contents must roundtrip"
+            );
+        })
+        .expect("apply_snapshot");
+    }
+
+    /// Extract the `Memory` handle out of a Store (Copy per `src/mem.rs:28`).
+    fn kernel_memory(store: &Store<Kernel>) -> wasmtime::Memory {
+        *store.data().memory().expect("memory attached")
     }
 
     #[test]
@@ -916,60 +1220,50 @@ mod tests {
         }));
         assert_eq!(efd_fd, 3);
 
-        let snap = try_to_snapshot(&kernel, &[]).expect("snapshot");
+        let snap = build_kernel_snapshot(&kernel, vec![]);
 
-        // Build a fresh target kernel.
-        let mut target = Kernel::new_without_stdio(vec![], vec![]);
-        let mut mem_buf: Vec<u8> = Vec::new();
-        apply_snapshot(snap, &mut target, &mut mem_buf).expect("apply succeeds");
+        // D2.5: apply needs a real Store<Kernel> with attached linear
+        // memory. `apply_with_store` runs apply_snapshot, then hands
+        // back immutable `&Kernel` + `&Store<Kernel>` to the verify
+        // closure — once the closure returns, both refs are dropped.
+        let expected_comm = kernel.comm;
+        let expected_args = vec!["edge-python".to_string(), "main.py".to_string()];
+        let expected_env = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        apply_with_store(snap, |target, _store| {
+            // Trivial fields restored.
+            assert_eq!(target.brk, 0x2000);
+            assert_eq!(target.rng_seed, [9u8; 32]);
+            assert_eq!(target.args, expected_args);
+            assert_eq!(target.env, expected_env);
+            assert_eq!(target.comm, expected_comm);
+            assert_eq!(target.exit_code, None);
 
-        // Trivial fields restored.
-        assert_eq!(target.brk, 0x2000);
-        assert_eq!(target.rng_seed, [9u8; 32]);
-        assert_eq!(
-            target.args,
-            vec!["edge-python".to_string(), "main.py".to_string()]
-        );
-        assert_eq!(
-            target.env,
-            vec![("PATH".to_string(), "/usr/bin".to_string())]
-        );
-        assert_eq!(target.comm, kernel.comm);
-        assert_eq!(target.exit_code, kernel.exit_code);
+            // fd table: 0/1/2 stdio + 3 eventfd all present.
+            assert!(target.fds.contains(0));
+            assert!(target.fds.contains(1));
+            assert!(target.fds.contains(2));
+            assert!(target.fds.contains(3));
 
-        // The rng built from rng_seed must produce the same output as
-        // a freshly-seeded RNG with that same seed.
-        let mut from_seed = rand::rngs::SmallRng::from_seed([9u8; 32]);
-        let mut buf_target = [0u8; 8];
-        let mut buf_seed = [0u8; 8];
-        target.rng.fill_bytes(&mut buf_target);
-        from_seed.fill_bytes(&mut buf_seed);
-        assert_eq!(buf_target, buf_seed, "rng seed playback mismatch");
-
-        // fd table: 0/1/2 stdio + 3 eventfd all present.
-        assert!(target.fds.contains(0));
-        assert!(target.fds.contains(1));
-        assert!(target.fds.contains(2));
-        assert!(target.fds.contains(3));
-
-        // Verify the EventFd counter survived.
-        match target.fds.get(3).expect("fd 3 present") {
-            Resource::EventFd(e) => {
-                assert_eq!(*e.counter.lock(), 11);
-                assert!(e.nonblock.load(std::sync::atomic::Ordering::Relaxed));
+            // Verify the EventFd counter survived.
+            match target.fds.get(3).expect("fd 3 present") {
+                Resource::EventFd(e) => {
+                    assert_eq!(*e.counter.lock(), 11);
+                    assert!(e.nonblock.load(std::sync::atomic::Ordering::Relaxed));
+                }
+                Resource::Stdin(_) => panic!("expected EventFd at fd 3, got Stdin"),
+                Resource::Stdout(_) => panic!("expected EventFd at fd 3, got Stdout"),
+                Resource::Stderr(_) => panic!("expected EventFd at fd 3, got Stderr"),
+                Resource::PipeRead(_) => panic!("expected EventFd at fd 3, got PipeRead"),
+                Resource::PipeWrite(_) => panic!("expected EventFd at fd 3, got PipeWrite"),
+                Resource::File(_) => panic!("expected EventFd at fd 3, got File"),
+                Resource::Socket(_) => panic!("expected EventFd at fd 3, got Socket"),
+                Resource::Epoll(_) => panic!("expected EventFd at fd 3, got Epoll"),
             }
-            Resource::Stdin(_) => panic!("expected EventFd at fd 3, got Stdin"),
-            Resource::Stdout(_) => panic!("expected EventFd at fd 3, got Stdout"),
-            Resource::Stderr(_) => panic!("expected EventFd at fd 3, got Stderr"),
-            Resource::PipeRead(_) => panic!("expected EventFd at fd 3, got PipeRead"),
-            Resource::PipeWrite(_) => panic!("expected EventFd at fd 3, got PipeWrite"),
-            Resource::File(_) => panic!("expected EventFd at fd 3, got File"),
-            Resource::Socket(_) => panic!("expected EventFd at fd 3, got Socket"),
-            Resource::Epoll(_) => panic!("expected EventFd at fd 3, got Epoll"),
-        }
 
-        // next_fd bumped to 4 (matching snapshot).
-        assert_eq!(target.fds.next_fd_for_snapshot(), 4);
+            // next_fd bumped to 4 (matching snapshot).
+            assert_eq!(target.fds.next_fd_for_snapshot(), 4);
+        })
+        .expect("apply_snapshot");
     }
 
     #[test]
@@ -978,27 +1272,140 @@ mod tests {
         // easily make a TcpListener here without binding a port). The
         // expected outcome: apply_snapshot returns Unsupported.
         let snap = KernelSnapshot {
-            format_version: SNAPSHOT_FORMAT_VERSION,
+            format_version: LeU32(SNAPSHOT_FORMAT_VERSION),
             fds: FdSnapshot {
                 entries: vec![FdEntrySnapshot {
-                    fd: 3,
+                    fd: LeU32(3),
                     kind: ResourceSnapshot::from_socket(SocketSnapshot::default()),
                 }],
-                next_fd: 4,
+                next_fd: LeU32(4),
                 cloexec: vec![],
             },
             ..make_test_snapshot()
         };
-        let mut target = Kernel::new_without_stdio(vec![], vec![]);
-        let mut mem_buf: Vec<u8> = Vec::new();
-        let err = apply_snapshot(snap, &mut target, &mut mem_buf)
+        let err = apply_with_store(snap, |_target, _store| ())
             .expect_err("apply_snapshot should reject Socket variant");
         assert!(matches!(err, SnapshotError::Unsupported(_)), "got {err:?}");
     }
 
+    #[test]
+    fn collect_pages_skips_zero_pages() {
+        // Build a 128 KiB buffer: page 0 all-zero, page 1 has bytes
+        // [b'x', 0, 0, ...]. collect_pages must return exactly one entry
+        // at LeU32(1). The remainder branch is exercised by the partial-
+        // page case below.
+        let mut data = vec![0u8; 2 * PAGE_SIZE_BYTES];
+        // Page 1: byte 0 = b'x'; the rest stays zero.
+        data[PAGE_SIZE_BYTES] = b'x';
+        let pages = collect_pages(&data);
+        assert_eq!(pages.len(), 1, "page 0 (zero) must be omitted");
+        assert_eq!(pages[0].page_index, LeU32(1));
+        assert_eq!(pages[0].bytes[0], b'x');
+
+        // Partial tail (e.g. 70 KiB) — the first 64 KiB are zero,
+        // the remaining 6144 bytes are non-zero.
+        let mut data2 = vec![0u8; 64 * 1024 + 6144];
+        for (i, byte) in data2.iter_mut().enumerate().skip(64 * 1024) {
+            *byte = ((i & 0xFF) as u8).wrapping_add(1);
+        }
+        let pages2 = collect_pages(&data2);
+        assert_eq!(pages2.len(), 1, "partial-tail non-zero must be one entry");
+        assert_eq!(pages2[0].page_index, LeU32(1));
+        assert_eq!(pages2[0].bytes.len(), 6144);
+    }
+
+    /// Build a 1-page linear-memory WAT module, instantiate it via a
+    /// fresh `Store<Kernel>`, attach memory, and return the store. Used
+    /// by the D2.5 `apply_snapshot_*` tests that need a real
+    /// `wasmtime::Memory` for grow + chunk-copy.
+    ///
+    /// Synchronous: drives the wasmtime async instantiate via
+    /// `futures::executor::block_on` — fine for tests; never used at
+    /// runtime.
+    fn fresh_store_with_mem() -> (Store<Kernel>, wasmtime::Memory) {
+        use wasmtime::AsContextMut;
+        let engine = build_engine().expect("engine");
+        let wat = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "_start") (nop))
+            )
+        "#;
+        let module = compile_wat(&engine, wat).expect("compile wat");
+        let mut store = build_store(&engine, Kernel::new_without_stdio(vec![], vec![]));
+        let instance = futures::executor::block_on(
+            Linker::<Kernel>::new(&engine).instantiate_async(store.as_context_mut(), &module),
+        )
+        .expect("instantiate");
+        let mem = instance
+            .get_memory(&mut store, "memory")
+            .expect("memory export");
+        store.data_mut().attach_memory(mem);
+        (store, mem)
+    }
+
+    /// Helper: run `apply_snapshot(snap, ...)` against a fresh
+    /// `Store<Kernel>` (1-page WAT module attached). Returns the
+    /// `Result` from `apply_snapshot`. The caller passes a verifying
+    /// closure that runs assertions against the now-loaded kernel +
+    /// store; that closure takes `&Kernel, &Store<Kernel>` and
+    /// borrows both immutably (so the kernel + store are not aliased
+    /// mutably while assertions run).
+    fn apply_with_store<R>(
+        snap: KernelSnapshot,
+        verify: impl FnOnce(&Kernel, &Store<Kernel>) -> R,
+    ) -> Result<R, SnapshotError> {
+        // Step 1: kernel-state only (no Store borrow needed).
+        let (mut store, mem) = fresh_store_with_mem();
+        {
+            let kernel = store.data_mut();
+            apply_snapshot_kernel_state(&snap, kernel)?;
+        }
+        // Step 2: linear memory via the cloned `Memory` handle. No
+        // `&mut Kernel` borrow active — only `&mut store` and the
+        // Memory handle, which is `Copy`.
+        apply_snapshot_to_memory(&snap, mem, &mut store)?;
+        Ok(verify(store.data(), &store))
+    }
+
+    #[test]
+    fn memory_page_snapshot_roundtrip() {
+        // Build a Vec<MemoryPageSnapshot> with 2 entries, encode/decode,
+        // verify page_index and bytes match exactly. Confirms ADR 0002 §3
+        // wire framing: LeU32 page_index, then 64 KiB of bytes per entry.
+        let entry_a = MemoryPageSnapshot {
+            page_index: LeU32(3),
+            bytes: vec![0xAB; PAGE_SIZE_BYTES],
+        };
+        let mut bytes_b = vec![0u8; PAGE_SIZE_BYTES];
+        for (i, b) in bytes_b.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        let entry_b = MemoryPageSnapshot {
+            page_index: LeU32(17),
+            bytes: bytes_b,
+        };
+        let pages = vec![entry_a.clone(), entry_b.clone()];
+
+        let bytes = postcard::to_stdvec(&pages).expect("encode pages");
+        let back: Vec<MemoryPageSnapshot> = postcard::from_bytes(&bytes).expect("decode pages");
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].page_index, LeU32(3));
+        assert_eq!(back[0].bytes.len(), PAGE_SIZE_BYTES);
+        assert_eq!(back[0].bytes[0], 0xAB);
+        assert_eq!(back[0].bytes[PAGE_SIZE_BYTES - 1], 0xAB);
+        assert_eq!(back[1].page_index, LeU32(17));
+        assert_eq!(back[1].bytes.len(), PAGE_SIZE_BYTES);
+        assert_eq!(back[1].bytes[123], 123);
+        // Bytes match exactly (whole-buffer equality).
+        assert_eq!(back[0].bytes, entry_a.bytes);
+        assert_eq!(back[1].bytes, entry_b.bytes);
+    }
+
     fn make_test_snapshot() -> KernelSnapshot {
         KernelSnapshot {
-            format_version: SNAPSHOT_FORMAT_VERSION,
+            format_version: LeU32(SNAPSHOT_FORMAT_VERSION),
+            pages: vec![],
             fds: FdSnapshot::default(),
             mm: LinearAllocatorSnapshot::default(),
             vfs: VfsSnapshot {
@@ -1006,23 +1413,22 @@ mod tests {
                 cwd: "/".into(),
             },
             clock: ClockStateSnapshot::default(),
-            brk: 0,
+            brk: LeU32(0),
             args: vec![],
             env: vec![],
             rng_seed: [0u8; 32],
             signals: SignalStateSnapshot::default(),
             exit_code: None,
             comm: [0u8; 16],
+            futex_table: vec![],
         }
     }
 
     #[test]
     fn apply_snapshot_rejects_format_mismatch() {
         let mut snap = make_test_snapshot();
-        snap.format_version = 99;
-        let mut target = Kernel::new_without_stdio(vec![], vec![]);
-        let mut mem_buf: Vec<u8> = Vec::new();
-        let err = apply_snapshot(snap, &mut target, &mut mem_buf)
+        snap.format_version = LeU32(99);
+        let err = apply_with_store(snap, |_target, _store| ())
             .expect_err("apply should reject mismatched format_version");
         match err {
             SnapshotError::FormatVersionMismatch { found, supported } => {
