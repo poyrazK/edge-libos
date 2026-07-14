@@ -615,18 +615,110 @@ fn is_zero_page(page: &[u8]) -> bool {
 /// - drains `Kernel.fds` (closes any stdio) and rebuilds it from the
 ///   snapshot: pipes (Stdin/Stdout/Stderr/PipeRead/PipeWrite), File
 ///   (reopened by path), EventFd (counter reset), Epoll (rebuilt
-///   freshly), and the linear-memory bytes via `mem`. Sockets, accepted
-///   streams, and abstract unix namespaces return
-///   `SnapshotError::{AcceptedStreamOnListener, AbstractUnixNamespace}`
-///   so the freeze CLI can abort cleanly.
+///   freshly);
+/// - grows the attached linear memory to fit the highest `page_index`
+///   in `snap.pages` (or stays at its current size if `pages` is empty)
+///   and chunk-copies each saved page's bytes into the right slot.
 ///
-/// `mem` is a `&mut Vec<u8>` for D1 (linear-memory blob is a
-/// pass-through placeholder). D2 will plug a `wasmtime::Memory`-backed
-/// buffer here without changing this signature.
+/// Sockets, accepted streams, and abstract unix namespaces return
+/// `SnapshotError::{AcceptedStreamOnListener, AbstractUnixNamespace}`
+/// so the freeze CLI can abort cleanly.
 pub fn apply_snapshot(
     snap: KernelSnapshot,
     kernel: &mut Kernel,
-    _mem: &mut Vec<u8>,
+    store: &mut impl wasmtime::AsContextMut<Data = Kernel>,
+) -> Result<(), SnapshotError> {
+    apply_snapshot_kernel_state(&snap, kernel)?;
+    apply_snapshot_linear_memory(&snap, kernel, store)
+}
+
+/// Step 2 of `apply_snapshot`: grow the attached linear memory to
+/// fit the highest `page_index` in `snap.pages` (or stay at its
+/// current size if `pages` is empty) and chunk-copy each saved page's
+/// bytes into the right slot. Idempotent: if the snapshot carries no
+/// pages, this is a no-op (the memory remains at whatever size the
+/// target store was born with — sufficient for the roundtrip test
+/// fixture, which builds a 32-page module ahead of time).
+fn apply_snapshot_linear_memory(
+    snap: &KernelSnapshot,
+    kernel: &mut Kernel,
+    store: &mut impl wasmtime::AsContextMut<Data = Kernel>,
+) -> Result<(), SnapshotError> {
+    if snap.pages.is_empty() {
+        return Ok(());
+    }
+    // Clone the `Memory` handle out of kernel (it's `Copy` per
+    // `src/mem.rs:28`). Drop the kernel borrow immediately so we can
+    // re-borrow mutably through `store`.
+    let mem = kernel
+        .memory()
+        .map_err(|e| {
+            SnapshotError::IoError(
+                std::io::Error::other(format!("memory not attached: errno={e}")),
+                "kernel.memory()".into(),
+            )
+        })?
+        .clone();
+    apply_snapshot_linear_memory_via(snap, mem, store)
+}
+
+/// Memory-only restore driver. Takes the cloned `Memory` handle
+/// instead of a `&mut Kernel` — disjoint borrow of `store`, no kernel
+/// reference. Use this directly from tests to avoid the
+/// `&mut kernel + &mut store` overlap that Rust's NLL rejects on
+/// inline expressions.
+fn apply_snapshot_linear_memory_via(
+    snap: &KernelSnapshot,
+    mem: wasmtime::Memory,
+    store: &mut impl wasmtime::AsContextMut<Data = Kernel>,
+) -> Result<(), SnapshotError> {
+    if snap.pages.is_empty() {
+        return Ok(());
+    }
+    // How many wasm pages does this snapshot need?
+    let target_pages = snap
+        .pages
+        .iter()
+        .map(|p| p.page_index.0 as usize)
+        .max()
+        .unwrap()
+        + 1;
+    let cur_pages: usize = mem.data_size(&store.as_context()) / PAGE_SIZE_BYTES;
+    if target_pages > cur_pages {
+        let delta: u64 = (target_pages - cur_pages) as u64;
+        mem.grow(store.as_context_mut(), delta).map_err(|e| {
+            SnapshotError::IoError(
+                std::io::Error::other(format!("memory.grow failed: {e:?}")),
+                "mem.grow".into(),
+            )
+        })?;
+    }
+
+    // chunk-copy each page's bytes into the right slot.
+    let bytes = mem.data_mut(store.as_context_mut());
+    for page in &snap.pages {
+        let start = page.page_index.0 as usize * PAGE_SIZE_BYTES;
+        let end = start + page.bytes.len();
+        if end > bytes.len() {
+            return Err(SnapshotError::IoError(
+                std::io::Error::other(format!(
+                    "page {} out of bounds: {end} > {}",
+                    page.page_index.0,
+                    bytes.len()
+                )),
+                "page chunk-copy".into(),
+            ));
+        }
+        bytes[start..end].copy_from_slice(&page.bytes);
+    }
+    Ok(())
+}
+
+/// Step 1 of `apply_snapshot`: write the kernel's non-memory state
+/// fields. Independent of `Store`; takes only `&mut Kernel`.
+fn apply_snapshot_kernel_state(
+    snap: &KernelSnapshot,
+    kernel: &mut Kernel,
 ) -> Result<(), SnapshotError> {
     if snap.format_version.0 != SNAPSHOT_FORMAT_VERSION {
         return Err(SnapshotError::FormatVersionMismatch {
@@ -634,33 +726,31 @@ pub fn apply_snapshot(
             supported: SNAPSHOT_FORMAT_VERSION,
         });
     }
-
-    // ---- trivial fields ---------------------------------------------------
-    kernel.args = snap.args;
-    kernel.env = snap.env;
+    kernel.args = snap.args.clone();
+    kernel.env = snap.env.clone();
     kernel.comm = snap.comm;
     kernel.exit_code = snap.exit_code.map(|c| c.0);
     kernel.brk = snap.brk.0;
     kernel.rng_seed = snap.rng_seed;
     kernel.rng = rand::rngs::SmallRng::from_seed(kernel.rng_seed);
     kernel.vfs = Vfs {
-        root: snap.vfs.root,
-        cwd: snap.vfs.cwd,
+        root: snap.vfs.root.clone(),
+        cwd: snap.vfs.cwd.clone(),
     };
     kernel.clock = crate::kernel::ClockState {
         boot_monotonic_ns: snap.clock.boot_monotonic_ns.0,
     };
     let mut actions: std::collections::HashMap<i32, crate::sys::signal::SigAction> =
         std::collections::HashMap::new();
-    for (k, v) in snap.signals.actions {
-        actions.insert(k, v);
+    for (k, v) in &snap.signals.actions {
+        actions.insert(*k, *v);
     }
     kernel.signals = SignalState {
         actions,
         mask: snap.signals.mask.0,
-        alt_stack: snap.signals.alt_stack,
+        alt_stack: snap.signals.alt_stack.clone(),
     };
-    kernel.mm.replace_from_snapshot(snap.mm);
+    kernel.mm.replace_from_snapshot(snap.mm.clone());
 
     // ---- fd table ---------------------------------------------------------
     use crate::fd::{EpollInner, EventFdInner, PipeRead, PipeWrite, Resource, SharedFilePos};
@@ -673,7 +763,7 @@ pub fn apply_snapshot(
 
     // Sort entries by fd for deterministic rebuild order.
     let mut entries = snap.fds.entries.clone();
-    entries.sort_by_key(|e| e.fd);
+    entries.sort_by_key(|e| e.fd.0);
 
     // Track which fds become stdin/stdout/stderr so we can hydrate the
     // matching output buffers when the host driver queries them later.
@@ -820,8 +910,16 @@ pub fn apply_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{build_engine, build_store};
     use rand::RngCore;
     use std::sync::Arc;
+    use wasmtime::{Linker, Store};
+
+    /// Helper: parse + compile a WAT string with the kernel's test engine.
+    fn compile_wat(engine: &wasmtime::Engine, wat: &str) -> anyhow::Result<wasmtime::Module> {
+        let bytes = wat::parse_str(wat)?;
+        Ok(wasmtime::Module::new(engine, &bytes)?)
+    }
 
     #[test]
     fn format_version_constant_value() {
@@ -976,6 +1074,85 @@ mod tests {
     }
 
     #[test]
+    fn apply_snapshot_restores_linear_memory() {
+        // Write a 16-byte pattern at offset 0x100 in store A; restore
+        // to store B; verify the pattern survives. The fresh
+        // store's 1-page (64 KiB) memory is large enough for the 16
+        // bytes; no grow needed.
+        use crate::snapshot::endian::LeU32;
+        let (mut store_a, _mem) = fresh_store_with_mem();
+        {
+            let mem = kernel_memory(&store_a);
+            let bytes = mem.data_mut(&mut store_a);
+            bytes[0x100..0x110].copy_from_slice(b"0123456789ABCDEF");
+        }
+        let snap = {
+            let kernel = store_a.data();
+            try_to_snapshot(kernel, &store_a).expect("snapshot")
+        };
+
+        // Apply to a fresh store B via apply_with_store; the
+        // verifier checks memory bytes match.
+        apply_with_store(snap, |_target, store_b| {
+            let mem = kernel_memory(store_b);
+            let bytes = mem.data(&*store_b);
+            assert_eq!(
+                &bytes[0x100..0x110],
+                b"0123456789ABCDEF",
+                "linear memory not restored byte-exact"
+            );
+            assert!(
+                bytes[..0x100].iter().all(|b| *b == 0),
+                "pre-pattern bytes must be zero"
+            );
+        })
+        .expect("apply_snapshot");
+    }
+
+    #[test]
+    fn apply_snapshot_grows_memory() {
+        // Fresh store has 1 page (64 KiB). Write a recognisable
+        // pattern at page index 5, snapshot, then apply onto a
+        // fresh 1-page store B. After apply, store must have grown
+        // to >= 6 pages and the bytes at page 5 must match.
+        let (mut store_a, _mem) = fresh_store_with_mem();
+        {
+            let mem = kernel_memory(&store_a);
+            mem.grow(&mut store_a, 5).expect("grow store_a");
+            let bytes = mem.data_mut(&mut store_a);
+            let p5_start = 5 * PAGE_SIZE_BYTES;
+            bytes[p5_start..p5_start + 16].copy_from_slice(b"GROW_GROWS_PAGE5");
+        }
+        let snap = {
+            let kernel = store_a.data();
+            try_to_snapshot(kernel, &store_a).expect("snapshot")
+        };
+        assert_eq!(snap.pages.len(), 1);
+        assert_eq!(snap.pages[0].page_index, LeU32(5));
+
+        apply_with_store(snap, |_target, store_b| {
+            let mem = kernel_memory(store_b);
+            assert!(
+                mem.data_size(&*store_b) >= 6 * PAGE_SIZE_BYTES,
+                "memory must have grown to >= 6 pages"
+            );
+            let bytes = mem.data(&*store_b);
+            let p5_start = 5 * PAGE_SIZE_BYTES;
+            assert_eq!(
+                &bytes[p5_start..p5_start + 16],
+                b"GROW_GROWS_PAGE5",
+                "page 5 contents must roundtrip"
+            );
+        })
+        .expect("apply_snapshot");
+    }
+
+    /// Extract the `Memory` handle out of a Store (Copy per `src/mem.rs:28`).
+    fn kernel_memory(store: &Store<Kernel>) -> wasmtime::Memory {
+        store.data().memory().expect("memory attached").clone()
+    }
+
+    #[test]
     fn apply_snapshot_rebuilds_eventfd_and_stdio() {
         // Build a kernel with stdio + an EventFd at fd 3, snapshot it,
         // apply to a fresh kernel, and verify trivial fields plus the
@@ -1003,58 +1180,48 @@ mod tests {
 
         let snap = build_kernel_snapshot(&kernel, vec![]);
 
-        // Build a fresh target kernel.
-        let mut target = Kernel::new_without_stdio(vec![], vec![]);
-        let mut mem_buf: Vec<u8> = Vec::new();
-        apply_snapshot(snap, &mut target, &mut mem_buf).expect("apply succeeds");
+        // D2.5: apply needs a real Store<Kernel> with attached linear
+        // memory. `apply_with_store` runs apply_snapshot, then hands
+        // back immutable `&Kernel` + `&Store<Kernel>` to the verify
+        // closure — once the closure returns, both refs are dropped.
+        let expected_comm = kernel.comm;
+        let expected_args = vec!["edge-python".to_string(), "main.py".to_string()];
+        let expected_env = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        apply_with_store(snap, |target, _store| {
+            // Trivial fields restored.
+            assert_eq!(target.brk, 0x2000);
+            assert_eq!(target.rng_seed, [9u8; 32]);
+            assert_eq!(target.args, expected_args);
+            assert_eq!(target.env, expected_env);
+            assert_eq!(target.comm, expected_comm);
+            assert_eq!(target.exit_code, None);
 
-        // Trivial fields restored.
-        assert_eq!(target.brk, 0x2000);
-        assert_eq!(target.rng_seed, [9u8; 32]);
-        assert_eq!(
-            target.args,
-            vec!["edge-python".to_string(), "main.py".to_string()]
-        );
-        assert_eq!(
-            target.env,
-            vec![("PATH".to_string(), "/usr/bin".to_string())]
-        );
-        assert_eq!(target.comm, kernel.comm);
-        assert_eq!(target.exit_code, kernel.exit_code);
+            // fd table: 0/1/2 stdio + 3 eventfd all present.
+            assert!(target.fds.contains(0));
+            assert!(target.fds.contains(1));
+            assert!(target.fds.contains(2));
+            assert!(target.fds.contains(3));
 
-        // The rng built from rng_seed must produce the same output as
-        // a freshly-seeded RNG with that same seed.
-        let mut from_seed = rand::rngs::SmallRng::from_seed([9u8; 32]);
-        let mut buf_target = [0u8; 8];
-        let mut buf_seed = [0u8; 8];
-        target.rng.fill_bytes(&mut buf_target);
-        from_seed.fill_bytes(&mut buf_seed);
-        assert_eq!(buf_target, buf_seed, "rng seed playback mismatch");
-
-        // fd table: 0/1/2 stdio + 3 eventfd all present.
-        assert!(target.fds.contains(0));
-        assert!(target.fds.contains(1));
-        assert!(target.fds.contains(2));
-        assert!(target.fds.contains(3));
-
-        // Verify the EventFd counter survived.
-        match target.fds.get(3).expect("fd 3 present") {
-            Resource::EventFd(e) => {
-                assert_eq!(*e.counter.lock(), 11);
-                assert!(e.nonblock.load(std::sync::atomic::Ordering::Relaxed));
+            // Verify the EventFd counter survived.
+            match target.fds.get(3).expect("fd 3 present") {
+                Resource::EventFd(e) => {
+                    assert_eq!(*e.counter.lock(), 11);
+                    assert!(e.nonblock.load(std::sync::atomic::Ordering::Relaxed));
+                }
+                Resource::Stdin(_) => panic!("expected EventFd at fd 3, got Stdin"),
+                Resource::Stdout(_) => panic!("expected EventFd at fd 3, got Stdout"),
+                Resource::Stderr(_) => panic!("expected EventFd at fd 3, got Stderr"),
+                Resource::PipeRead(_) => panic!("expected EventFd at fd 3, got PipeRead"),
+                Resource::PipeWrite(_) => panic!("expected EventFd at fd 3, got PipeWrite"),
+                Resource::File(_) => panic!("expected EventFd at fd 3, got File"),
+                Resource::Socket(_) => panic!("expected EventFd at fd 3, got Socket"),
+                Resource::Epoll(_) => panic!("expected EventFd at fd 3, got Epoll"),
             }
-            Resource::Stdin(_) => panic!("expected EventFd at fd 3, got Stdin"),
-            Resource::Stdout(_) => panic!("expected EventFd at fd 3, got Stdout"),
-            Resource::Stderr(_) => panic!("expected EventFd at fd 3, got Stderr"),
-            Resource::PipeRead(_) => panic!("expected EventFd at fd 3, got PipeRead"),
-            Resource::PipeWrite(_) => panic!("expected EventFd at fd 3, got PipeWrite"),
-            Resource::File(_) => panic!("expected EventFd at fd 3, got File"),
-            Resource::Socket(_) => panic!("expected EventFd at fd 3, got Socket"),
-            Resource::Epoll(_) => panic!("expected EventFd at fd 3, got Epoll"),
-        }
 
-        // next_fd bumped to 4 (matching snapshot).
-        assert_eq!(target.fds.next_fd_for_snapshot(), 4);
+            // next_fd bumped to 4 (matching snapshot).
+            assert_eq!(target.fds.next_fd_for_snapshot(), 4);
+        })
+        .expect("apply_snapshot");
     }
 
     #[test]
@@ -1074,10 +1241,9 @@ mod tests {
             },
             ..make_test_snapshot()
         };
-        let mut target = Kernel::new_without_stdio(vec![], vec![]);
-        let mut mem_buf: Vec<u8> = Vec::new();
-        let err = apply_snapshot(snap, &mut target, &mut mem_buf)
-            .expect_err("apply_snapshot should reject Socket variant");
+        let err = apply_with_store(snap, |_target, _store| ()).expect_err(
+            "apply_snapshot should reject Socket variant",
+        );
         assert!(matches!(err, SnapshotError::Unsupported(_)), "got {err:?}");
     }
 
@@ -1105,6 +1271,60 @@ mod tests {
         assert_eq!(pages2.len(), 1, "partial-tail non-zero must be one entry");
         assert_eq!(pages2[0].page_index, LeU32(1));
         assert_eq!(pages2[0].bytes.len(), 6144);
+    }
+
+    /// Build a 1-page linear-memory WAT module, instantiate it via a
+    /// fresh `Store<Kernel>`, attach memory, and return the store. Used
+    /// by the D2.5 `apply_snapshot_*` tests that need a real
+    /// `wasmtime::Memory` for grow + chunk-copy.
+    ///
+    /// Synchronous: drives the wasmtime async instantiate via
+    /// `futures::executor::block_on` — fine for tests; never used at
+    /// runtime.
+    fn fresh_store_with_mem() -> (Store<Kernel>, wasmtime::Memory) {
+        use wasmtime::AsContextMut;
+        let engine = build_engine().expect("engine");
+        let wat = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "_start") (nop))
+            )
+        "#;
+        let module = compile_wat(&engine, wat).expect("compile wat");
+        let mut store = build_store(&engine, Kernel::new_without_stdio(vec![], vec![]));
+        let instance = futures::executor::block_on(
+            Linker::<Kernel>::new(&engine).instantiate_async(store.as_context_mut(), &module),
+        )
+        .expect("instantiate");
+        let mem = instance
+            .get_memory(&mut store, "memory")
+            .expect("memory export");
+        store.data_mut().attach_memory(mem);
+        (store, mem)
+    }
+
+    /// Helper: run `apply_snapshot(snap, ...)` against a fresh
+    /// `Store<Kernel>` (1-page WAT module attached). Returns the
+    /// `Result` from `apply_snapshot`. The caller passes a verifying
+    /// closure that runs assertions against the now-loaded kernel +
+    /// store; that closure takes `&Kernel, &Store<Kernel>` and
+    /// borrows both immutably (so the kernel + store are not aliased
+    /// mutably while assertions run).
+    fn apply_with_store<R>(
+        snap: KernelSnapshot,
+        verify: impl FnOnce(&Kernel, &Store<Kernel>) -> R,
+    ) -> Result<R, SnapshotError> {
+        // Step 1: kernel-state only (no Store borrow needed).
+        let (mut store, mem) = fresh_store_with_mem();
+        {
+            let kernel = store.data_mut();
+            apply_snapshot_kernel_state(&snap, kernel)?;
+        }
+        // Step 2: linear memory via the cloned `Memory` handle. No
+        // `&mut Kernel` borrow active — only `&mut store` and the
+        // Memory handle, which is `Copy`.
+        apply_snapshot_linear_memory_via(&snap, mem, &mut store)?;
+        Ok(verify(store.data(), &store))
     }
 
     #[test]
@@ -1166,9 +1386,7 @@ mod tests {
     fn apply_snapshot_rejects_format_mismatch() {
         let mut snap = make_test_snapshot();
         snap.format_version = LeU32(99);
-        let mut target = Kernel::new_without_stdio(vec![], vec![]);
-        let mut mem_buf: Vec<u8> = Vec::new();
-        let err = apply_snapshot(snap, &mut target, &mut mem_buf)
+        let err = apply_with_store(snap, |_target, _store| ())
             .expect_err("apply should reject mismatched format_version");
         match err {
             SnapshotError::FormatVersionMismatch { found, supported } => {
