@@ -636,7 +636,14 @@ async fn accept4_unix(
                     None => return -EINVAL,
                 };
                 let std_l = l.into_std().expect("listener into_std");
-                let cloned = std_l.try_clone().expect("std listener try_clone");
+                // `UnixListener::try_clone` *can* return Err on host-side resource
+                // exhaustion (per stdlib docs). Return -ENOMEM instead of
+                // panicking (spec §8 / §9: handlers must surface errnos, not
+                // panic on host state).
+                let cloned = match std_l.try_clone() {
+                    Ok(c) => c,
+                    Err(_) => return -crate::errno::ENOMEM,
+                };
                 let tokio_cloned = tokio::net::UnixListener::from_std(cloned).expect("from_std");
                 // Put the original back so the next accept finds it.
                 unix.listener = Some(tokio::net::UnixListener::from_std(std_l).expect("from_std"));
