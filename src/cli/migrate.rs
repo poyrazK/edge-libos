@@ -120,9 +120,9 @@ pub async fn run_main(args: &[String]) -> CliResult<i32> {
 
 fn parse_migrate_args(args: &[String]) -> CliResult<(std::path::PathBuf, Vec<String>)> {
     let mut it = args.iter();
-    let wasm = it
-        .next()
-        .ok_or_else(|| CliError::Args("usage: edge-cli migrate <wasm> [--] [args...]".to_string()))?;
+    let wasm = it.next().ok_or_else(|| {
+        CliError::Args("usage: edge-cli migrate <wasm> [--] [args...]".to_string())
+    })?;
     let wasm_path = std::path::PathBuf::from(wasm);
 
     let mut guest_args: Vec<String> = Vec::new();

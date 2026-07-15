@@ -308,10 +308,7 @@ async fn wait4_parked_specific_pid_reaps_when_already_exited() -> Result<()> {
     }
     mem_write_i64(&mut store, 0x200, 0);
     let r = call_wait4(&mut store, &instance, 11, 0x200, 0).await;
-    assert_eq!(
-        r, 11,
-        "blocking wait4(11) with reaped child must return 11"
-    );
+    assert_eq!(r, 11, "blocking wait4(11) with reaped child must return 11");
     let wstatus = mem_read_i64(&store, 0x200);
     assert_eq!(wstatus, 0x0400, "wstatus = (4 << 8)");
     let children = store.data().children.lock();

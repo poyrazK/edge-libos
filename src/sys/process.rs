@@ -170,7 +170,6 @@ pub fn set_robust_list() -> i64 {
 /// starting at 2 (PID 1 is reserved for the init kernel — `getpid()` returns
 /// 1). Ordering is `Relaxed`; no other field is gated on PID order.
 pub async fn clone_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
-
     let flags = a[0];
     // a[1] = child_stack (unused — guest passes 0; v1 has no stack model).
     let ptid_ptr = a[2];

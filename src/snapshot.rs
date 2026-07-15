@@ -984,9 +984,7 @@ fn dispatch_memory_apply(
             let mem = *mem;
             apply_snapshot_to_memory(snap, mem, store)
         }
-        crate::kernel::MemoryKind::Shared(mem) => {
-            apply_snapshot_to_shared_memory(snap, mem)
-        }
+        crate::kernel::MemoryKind::Shared(mem) => apply_snapshot_to_shared_memory(snap, mem),
     }
 }
 
@@ -1027,9 +1025,8 @@ pub fn apply_snapshot_to_shared_memory(
         })?;
     }
     // Chunk-copy each page's bytes into the right slot.
-    let bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(mem.data().as_ptr() as *mut u8, mem.data_size())
-    };
+    let bytes: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(mem.data().as_ptr() as *mut u8, mem.data_size()) };
     for page in &snap.pages {
         let start = page.page_index.0 as usize * PAGE_SIZE_BYTES;
         let end = start + page.bytes.len();

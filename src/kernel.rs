@@ -148,10 +148,7 @@ impl MemoryKind {
     /// construction (the freeze CLI is at a quiescent point;
     /// restore is on a fresh kernel with no live guest), so
     /// non-atomic access is safe there.
-    pub fn data<'a, T: 'static>(
-        &self,
-        store: impl Into<StoreContext<'a, T>>,
-    ) -> &'a [u8] {
+    pub fn data<'a, T: 'static>(&self, store: impl Into<StoreContext<'a, T>>) -> &'a [u8] {
         match self {
             Self::Owned(m) => m.data(store),
             Self::Shared(m) => unsafe {

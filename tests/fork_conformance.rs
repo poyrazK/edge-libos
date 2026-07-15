@@ -61,7 +61,6 @@ async fn call_fork(
     store: &mut wasmtime::Store<edge_libos::Kernel>,
     instance: &wasmtime::Instance,
 ) -> i64 {
-
     let start = instance
         .get_typed_func::<(), i64>(&mut *store, "_start")
         .expect("_start export");

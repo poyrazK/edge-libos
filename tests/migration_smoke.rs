@@ -134,7 +134,10 @@ fn migration_in_process_via_edge_cli_migrate() -> Result<()> {
     std::fs::write(tmp.path(), &bytes)?;
 
     // Invoke run_main_from(["migrate", "<tmp>"]) and assert 0.
-    let args = vec!["migrate".to_string(), tmp.path().to_string_lossy().to_string()];
+    let args = vec![
+        "migrate".to_string(),
+        tmp.path().to_string_lossy().to_string(),
+    ];
     let code = edge_libos::cli::run_main_from(args);
     assert_eq!(code, 0, "edge-cli migrate must return 0 on success");
     Ok(())
@@ -173,7 +176,10 @@ async fn migration_smoke_subprocess_roundtrip() -> Result<()> {
         .arg(tmp.path())
         .status()
         .map_err(|e| anyhow::anyhow!("failed to spawn {bin}: {e}"))?;
-    assert!(status.success(), "edge-cli migrate exited non-zero: {status}");
+    assert!(
+        status.success(),
+        "edge-cli migrate exited non-zero: {status}"
+    );
     Ok(())
 }
 
@@ -217,10 +223,7 @@ fn migration_roundtrip_preserves_shared_memory_state() -> Result<()> {
 
         // Verify the kernel routed to MemoryKind::Shared.
         {
-            let kind = store
-                .data()
-                .memory_kind()
-                .expect("memory must be attached");
+            let kind = store.data().memory_kind().expect("memory must be attached");
             assert!(
                 kind.as_shared_memory().is_some(),
                 "kernel must store the SharedMemory, not a regular Memory"
@@ -280,7 +283,10 @@ fn migration_roundtrip_preserves_shared_memory_state() -> Result<()> {
             .as_shared_memory()
             .unwrap();
         let restored_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(fresh_shared_ref.data().as_ptr() as *const u8, fresh_shared_ref.data_size())
+            std::slice::from_raw_parts(
+                fresh_shared_ref.data().as_ptr() as *const u8,
+                fresh_shared_ref.data_size(),
+            )
         };
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&restored_bytes[0x1000..0x1008]);

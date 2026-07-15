@@ -343,10 +343,7 @@ async fn memory_kind_shared_atomic_wait32_not_equal() -> Result<()> {
 
     let (engine, linker) = common::engine_and_linker()?;
     let module = common::compile_wat(&engine, SHARED_MEM_WAT)?;
-    let mut store = edge_libos::build_store(
-        &engine,
-        Kernel::new_without_stdio(vec![], vec![]),
-    );
+    let mut store = edge_libos::build_store(&engine, Kernel::new_without_stdio(vec![], vec![]));
     let instance = linker.instantiate_async(&mut store, &module).await?;
     // Attach the shared memory. wasmtime returns a `SharedMemory`
     // handle for any `(memory … shared)` export.
@@ -359,10 +356,7 @@ async fn memory_kind_shared_atomic_wait32_not_equal() -> Result<()> {
     // `MemoryKind::Owned` (the `as_memory()` accessor returns
     // `None` on the Shared variant).
     {
-        let kind = store
-            .data()
-            .memory_kind()
-            .expect("memory must be attached");
+        let kind = store.data().memory_kind().expect("memory must be attached");
         assert!(
             kind.as_shared_memory().is_some(),
             "kernel.memory_kind() must be MemoryKind::Shared, got Owned"
