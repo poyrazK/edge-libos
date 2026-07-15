@@ -567,14 +567,19 @@ fn build_kernel_snapshot(kernel: &Kernel, pages: Vec<MemoryPageSnapshot>) -> Ker
                 // or setsockopt). The `bound` field still says port=0.
                 // Overwrite the snapshot's port with the actual one so
                 // `apply_snapshot`'s reopen path binds to the right port.
-                // One-listener simplification: only rewrite the FIRST
-                // materialized listener's port. Future: extend to all.
-                if let (Some(l), Some(crate::fd::SockAddr::V4 { port, .. })) =
-                    (guard.listener.as_ref(), sock_snap.bound.as_mut())
-                {
-                    if *port == 0 {
-                        if let Ok(addr) = l.local_addr() {
-                            *port = addr.port();
+                // A single Wasm module can legitimately open multiple
+                // listeners to `0.0.0.0:0` and rely on the kernel picking
+                // distinct ephemeral ports; rewrite every V4 listener
+                // that still reads port=0. Non-V4 listeners (Unix,
+                // abstract) are unaffected — their addressing doesn't go
+                // through the kernel-assigned-port model.
+                if let Some(l) = guard.listener.as_ref() {
+                    let actual = l.local_addr().ok().map(|a| a.port());
+                    if let (Some(actual), Some(crate::fd::SockAddr::V4 { port, .. })) =
+                        (actual, sock_snap.bound.as_mut())
+                    {
+                        if *port == 0 {
+                            *port = actual;
                         }
                     }
                 }
@@ -1693,5 +1698,88 @@ mod tests {
             }
             other => panic!("expected FormatVersionMismatch, got {other:?}"),
         }
+    }
+
+    /// P2-D3.5+review (F.2): the ephemeral-port-drift fix at lines 564-585
+    /// must rewrite `SocketSnapshot.bound.port` from 0 to the materialized
+    /// `TcpListener`'s `local_addr().port()` so `apply_snapshot`'s reopen
+    /// path binds the right port. Earlier versions tested this via a WAT
+    /// fixture (bind :0 → accept4 → snapshot), but `accept4`'s Phase 1b
+    /// (`src/sys/socket.rs:520-530`) takes the listener OUT before freeze
+    /// sees it, so the drift-fix `if let Some(l) = guard.listener.as_ref()`
+    /// branch never fires from a guest-driven subprocess test. A direct
+    /// unit test that constructs the snapshot shape by hand covers the
+    /// fix without needing a cooperating host client to put the listener
+    /// back. See the F.2 finding on PR #20.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ephemeral_port_drift_fix_rewrites_zero_to_materialized_port() {
+        use crate::fd::{Resource, SocketInner, SocketKind};
+        use parking_lot::Mutex;
+        use tokio::net::TcpListener;
+
+        // 1. Bind a real host listener on :0 so the kernel picks an
+        //    ephemeral port we can read back from `local_addr()`.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind 127.0.0.1:0");
+        let actual_port = listener
+            .local_addr()
+            .expect("listener has local_addr")
+            .port();
+        assert_ne!(actual_port, 0, "kernel should not hand back port 0");
+
+        // 2. Synthesize a SocketInner as `bind(0.0.0.0:0)` would leave
+        //    it post-listen: `listener` materialized (Phase 1a), but
+        //    `bound.port` still says 0 (the WAT never knew the kernel-
+        //    assigned port).
+        let mut inner = SocketInner::new(SocketKind::Stream, false);
+        inner.bound = Some(crate::fd::SockAddr::V4 {
+            port: 0,
+            addr: [127, 0, 0, 1],
+        });
+        inner.listen_backlog = Some(0); // so `is_listening()` is true
+        inner.listener = Some(listener);
+        inner.is_acceptor = true;
+
+        // 3. Drop it into a fresh kernel's fd table and snap it.
+        let mut kernel = Kernel::new_without_stdio(vec![], vec![]);
+        let fd = kernel
+            .fds
+            .insert(Resource::Socket(Arc::new(Mutex::new(inner))));
+        let snap = build_kernel_snapshot(&kernel, vec![]);
+
+        // 4. The drift fix must have rewritten bound.port from 0 to
+        //    `actual_port`. Assert via the snapshot's fds table.
+        let entry = snap
+            .fds
+            .entries
+            .iter()
+            .find(|e| e.fd.0 == fd)
+            .expect("snapshot has no entry for our fd");
+        assert_eq!(
+            entry.kind.kind,
+            crate::snapshot::ResourceKind::Socket,
+            "entry kind should be Socket"
+        );
+        let sock = entry
+            .kind
+            .body
+            .socket
+            .as_ref()
+            .expect("entry body.socket is None");
+        match &sock.bound {
+            Some(crate::fd::SockAddr::V4 { port, .. }) => {
+                assert_eq!(
+                    *port, actual_port,
+                    "ephemeral-port-drift fix did NOT rewrite bound.port \
+                     from 0 to the materialized listener's port"
+                );
+            }
+            other => panic!("expected V4 bound with rewritten port, got {other:?}"),
+        }
+        assert!(
+            sock.is_acceptor,
+            "is_acceptor must round-trip through snapshot"
+        );
     }
 }

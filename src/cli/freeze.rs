@@ -111,14 +111,11 @@ async fn freeze_snapshot(wasm_path: &str, guest_args: &[String]) -> CliResult<Ke
     // and never across `.await`) is the clean place to observe the
     // materialized port without racing the guest task.
     let timeout = Duration::from_secs(10);
-    let snap = match tokio::time::timeout(timeout, call_start(&instance, &mut store)).await {
-        Ok(_res) => try_to_snapshot(store.data(), &store)?,
-        Err(_elapsed) => {
-            // Server-style guest parked in accept4 / epoll_wait; the
-            // listener fd is in the table. Snapshot the (live) store.
-            try_to_snapshot(store.data(), &store)?
-        }
-    };
+    // Both arms (guest returned vs. outer timeout fired on a parked
+    // server-style guest) want the same snapshot of the live store, so
+    // we drop the timeout future's result and unconditionally snap.
+    let _ = tokio::time::timeout(timeout, call_start(&instance, &mut store)).await;
+    let snap = try_to_snapshot(store.data(), &store)?;
     Ok(snap)
 }
 

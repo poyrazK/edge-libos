@@ -82,15 +82,18 @@ pub async fn run_main(args: &[String]) -> CliResult<i32> {
 fn override_snapshot_port(snap: &mut KernelSnapshot, port: u16) -> CliResult<()> {
     let mut rewrote = false;
     for entry in &mut snap.fds.entries {
-        if entry.kind.kind == crate::snapshot::ResourceKind::Socket {
-            if let Some(sock) = entry.kind.body.socket.as_mut() {
-                if sock.is_acceptor {
-                    if let Some(SockAddr::V4 { port: p, .. }) = sock.bound.as_mut() {
-                        *p = port;
-                        rewrote = true;
-                    }
-                }
-            }
+        let Some(sock) = (entry.kind.kind == crate::snapshot::ResourceKind::Socket)
+            .then_some(entry.kind.body.socket.as_mut())
+            .flatten()
+        else {
+            continue;
+        };
+        let Some(SockAddr::V4 { port: p, .. }) = sock.bound.as_mut() else {
+            continue;
+        };
+        if sock.is_acceptor {
+            *p = port;
+            rewrote = true;
         }
     }
     if !rewrote {

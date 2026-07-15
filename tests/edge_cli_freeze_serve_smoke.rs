@@ -26,16 +26,12 @@
 //!
 //! What this file does NOT prove — deferred:
 //!
-//! - End-to-end HTTP request through `serve`. The current WAT
-//!   fixture (`serve_one_request.wat`) does socket/bind/listen/
-//!   epoll_create1/epoll_ctl in `_start`, then loops calling
-//!   accept4 → recvfrom → sendto → exit. After `apply_snapshot`,
-//!   re-invoking `_start` re-binds and re-listens on the WAT
-//!   fixture's hardcoded port (conflicting with the snapshot's
-//!   rebound port). A `_run_loop` export or a separate
-//!   `serve_forever.wat` fixture is needed for the round-trip
-//!   HTTP smoke; tracked as a follow-up. The bookkeeping for
-//!   that lives in the DoD step 10 driver.
+//! - Serve-loop re-accepts after the test client's first request.
+//!   The current fixture handles one connection, then hangs in
+//!   accept4 waiting for more (the host kills the subprocess to
+//!   tear it down). A stress test that loops N requests through
+//!   the same `serve` instance is a separate follow-up; this file
+//!   only proves the first-request path.
 //!
 //! Concurrency note: each test compiles its own wasm with a
 //! unique bind port. Four `cargo test` threads all spawn a
@@ -45,12 +41,16 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
 
 use edge_libos::snapshot::ResourceKind;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::process::Command;
 
 const EDGE_CLI: &str = env!("CARGO_BIN_EXE_edge-cli");
 const WAT_SRC: &str = "tests/guests/serve_one_request.wat";
+const WAT_FOREVER_SRC: &str = "tests/guests/serve_forever.wat";
 
 /// Compile a slightly-retuned WAT fixture to a fresh tmp wasm
 /// path. The retune rewrites the bind-port in
@@ -83,6 +83,27 @@ async fn run_edge_cli(args: &[&str]) -> std::process::ExitStatus {
         .status()
         .await
         .expect("spawn edge-cli")
+}
+
+/// Find the first V4-listener (`is_acceptor == true`) socket fd's
+/// `bound.port` in a list of `FdEntrySnapshot`. `None` when no
+/// acceptor V4 socket exists. Used by tests that decode a snapshot
+/// file written by `freeze` and need to assert what port the
+/// kernel rewrote into the V4 sockaddr blob (F.3 dedup).
+fn first_acceptor_v4_port(entries: &[edge_libos::snapshot::FdEntrySnapshot]) -> Option<u16> {
+    entries.iter().find_map(|e| {
+        if e.kind.kind != ResourceKind::Socket {
+            return None;
+        }
+        let s = e.kind.body.socket.as_ref()?;
+        if !s.is_acceptor {
+            return None;
+        }
+        match s.bound {
+            Some(edge_libos::fd::SockAddr::V4 { port, .. }) => Some(port),
+            _ => None,
+        }
+    })
 }
 
 /// Find a free TCP port by binding an OS-assigned listener
@@ -159,16 +180,7 @@ async fn port_override_rewrites_snapshot_bound_port() {
         .expect("decode before")
         .fds
         .entries;
-    let before_port = before
-        .iter()
-        .find_map(|e| match (&e.kind.kind, e.kind.body.socket.as_ref()) {
-            (ResourceKind::Socket, Some(s)) if s.is_acceptor => match s.bound {
-                Some(edge_libos::fd::SockAddr::V4 { port, .. }) => Some(port),
-                _ => None,
-            },
-            _ => None,
-        })
-        .expect("snapshot has no V4 listener port");
+    let before_port = first_acceptor_v4_port(&before).expect("snapshot has no V4 listener port");
 
     let override_port = pick_free_port();
     assert_ne!(
@@ -194,19 +206,13 @@ async fn port_override_rewrites_snapshot_bound_port() {
     let new_bytes = edge_libos::encode_snapshot(&snap).expect("encode");
     std::fs::write(&snap_path, &new_bytes).expect("rewrite");
 
-    let after_port = edge_libos::decode_snapshot(&new_bytes)
-        .expect("decode after")
-        .fds
-        .entries
-        .iter()
-        .find_map(|e| match (&e.kind.kind, e.kind.body.socket.as_ref()) {
-            (ResourceKind::Socket, Some(s)) if s.is_acceptor => match s.bound {
-                Some(edge_libos::fd::SockAddr::V4 { port, .. }) => Some(port),
-                _ => None,
-            },
-            _ => None,
-        })
-        .expect("post-snapshot listener disappeared");
+    let after_port = first_acceptor_v4_port(
+        &edge_libos::decode_snapshot(&new_bytes)
+            .expect("decode after")
+            .fds
+            .entries,
+    )
+    .expect("post-snapshot listener disappeared");
     assert_eq!(
         after_port, override_port,
         "port override did not stick: before={before_port} after={after_port}"
@@ -252,4 +258,90 @@ async fn serve_rejects_port_zero() {
     .await;
     // CliError::Args → exit 2 per `src/cli/mod.rs:95-97`.
     assert_eq!(status.code(), Some(2), "got {status:?}");
+}
+
+/// F.4: end-to-end HTTP smoke. Compiles `serve_forever.wat`, freezes
+/// it, serves with `--port <p>`, and asserts a TCP probe of `<p>`
+/// gets `HTTP/1.1 200 OK`.
+///
+/// Fixture mechanics: `serve_forever.wat` stores its listener fd at
+/// memory[300] on fresh boot. After `apply_snapshot`, the linear
+/// memory is restored, so the restored-boot branch of `_start` reads
+/// memory[300] and uses the inherited fd directly. The HTTP loop then
+/// accepts on the kernel-restored listener at `<p>`.
+///
+/// Drift-fix timing: the freeze snapshot may capture the listener
+/// either materialized or taken-out (depending on where the WAT was
+/// in its accept4 loop when freeze's 10s outer timeout fired). If
+/// materialized, `bound.port` is rewritten to the ephemeral; if
+/// taken-out, `bound.port` stays 0. Either way, `serve --port <p>`
+/// overrides the snapshot's port to a known value before apply, and
+/// `apply_snapshot` reopens a fresh TcpListener at `<p>`. The HTTP
+/// probe targets `<p>`, which is now the inherited listener.
+#[tokio::test(flavor = "current_thread")]
+async fn serve_handles_http_request_after_apply() {
+    let wasm_path = std::env::temp_dir().join("edge_d36_forever.wasm");
+    {
+        let src = std::fs::read_to_string(WAT_FOREVER_SRC)
+            .unwrap_or_else(|e| panic!("read {WAT_FOREVER_SRC}: {e}"));
+        let wasm =
+            wat::parse_str(&src).unwrap_or_else(|e| panic!("compile {WAT_FOREVER_SRC}: {e:?}"));
+        std::fs::write(&wasm_path, &wasm).unwrap_or_else(|e| panic!("write wasm: {e}"));
+    }
+    let snap_path = std::env::temp_dir().join("edge_d36_forever.snap");
+    let _ = std::fs::remove_file(&snap_path);
+
+    // 1. Freeze the fixture.
+    let freeze = run_edge_cli(&[
+        "freeze",
+        wasm_path.to_str().unwrap(),
+        "--out",
+        snap_path.to_str().unwrap(),
+    ])
+    .await;
+    assert!(freeze.success(), "freeze failed: {freeze:?}");
+
+    // 2. Serve on a free port.
+    let port = pick_free_port();
+    let mut serve = Command::new(EDGE_CLI)
+        .args([
+            "serve",
+            snap_path.to_str().unwrap(),
+            wasm_path.to_str().unwrap(),
+            "--port",
+            &port.to_string(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn serve");
+    // Brief settle so serve's listener is ready before we probe.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // 3. Probe HTTP/1.1 — expect 200 OK + "ok" body.
+    let mut s = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect to serve port");
+    s.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .expect("write request");
+    let mut buf = vec![0u8; 512];
+    let n = s.read(&mut buf).await.expect("read response");
+    let resp = std::str::from_utf8(&buf[..n]).expect("response is utf-8");
+    assert!(
+        resp.starts_with("HTTP/1.1 200 OK"),
+        "expected 200 OK, got: {resp:?}"
+    );
+    assert!(
+        resp.contains("Content-Length: 2"),
+        "expected Content-Length: 2, got: {resp:?}"
+    );
+    assert!(
+        resp.contains("\r\n\r\nok"),
+        "expected body 'ok', got: {resp:?}"
+    );
+
+    // 4. Tear down serve. The fixture never exits — the host must kill it.
+    let _ = serve.kill().await;
 }
