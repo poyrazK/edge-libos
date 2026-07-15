@@ -148,6 +148,7 @@ expected_syscall() {
         fork)                echo "fork" ;;
         wait4)               echo "wait4" ;;
         futex)               echo "futex" ;;
+        snapshot)            echo "snapshot" ;;
         *) echo "UNREGISTERED: $1" >&2; return 1 ;;
     esac
 }
