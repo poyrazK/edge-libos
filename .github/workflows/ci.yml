@@ -199,6 +199,18 @@ jobs:
           set -euo pipefail
           bash scripts/check_nr_consistency.sh
 
+      - name: 4.5. Handler hardening gate (no panic on host input, no lock across .await)
+        # P3-P0 hardening. Defense-in-depth pair behind
+        # `clippy::await_holding_lock` (lib.rs):
+        #   1. Fragile .unwrap()/.expect() deny-list (extensible hook).
+        #   2. parking_lot::Mutex::lock() within 5 lines of .await
+        #      (catches the obvious bug class; clippy catches the rest).
+        # Cheap (no cargo), fail-fast. See
+        # scripts/check_no_fragile_unwraps.sh for details and provenance.
+        run: |
+          set -euo pipefail
+          bash scripts/check_no_fragile_unwraps.sh
+
       - name: 5. cargo fmt --check (formatting drift gate)
         run: |
           set -euo pipefail

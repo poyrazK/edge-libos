@@ -397,9 +397,7 @@ fn apply_snapshot_to_shared_memory_rejects_empty_pages() -> Result<()> {
                     "error message must explain the cause, got: {reason}"
                 );
             }
-            other => panic!(
-                "expected SnapshotError::Invalid(\"empty pages ...\"), got {other:?}"
-            ),
+            other => panic!("expected SnapshotError::Invalid(\"empty pages ...\"), got {other:?}"),
         }
         Ok::<(), anyhow::Error>(())
     })

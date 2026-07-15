@@ -1253,7 +1253,7 @@ pub fn apply_snapshot_to_shared_memory(
             .iter()
             .map(|p| p.page_index.0 as usize)
             .max()
-            .ok_or_else(|| SnapshotError::Invalid("empty pages in snapshot"))?;
+            .ok_or(SnapshotError::Invalid("empty pages in snapshot"))?;
         max_idx + 1
     };
     let cur_pages: usize = mem.data_size() / PAGE_SIZE_BYTES;
@@ -1315,7 +1315,7 @@ pub fn apply_snapshot_to_memory(
             .iter()
             .map(|p| p.page_index.0 as usize)
             .max()
-            .ok_or_else(|| SnapshotError::Invalid("empty pages in snapshot"))?;
+            .ok_or(SnapshotError::Invalid("empty pages in snapshot"))?;
         max_idx + 1
     };
     let cur_pages: usize = mem.data_size(store.as_context()) / PAGE_SIZE_BYTES;
