@@ -343,6 +343,21 @@ pub struct SocketSnapshot {
     pub peek_buf: std::collections::VecDeque<u8>,
     pub family_unix: bool,
     pub unix_inner: Option<UnixSockSnapshot>,
+    /// P2-D3.5 (ADR 0004 §2): true if the listener fd was
+    /// **inherited from the parent** via the
+    /// `EDGE_SERVE_FD_<N>` env-var protocol — i.e. the host
+    /// process already has a bound fd and `apply_snapshot` MUST
+    /// NOT re-bind it. The apply path uses this flag to take the
+    /// "fd is already bound" branch (mirroring how the existing
+    /// reopen path handles a snapshot where the bound port was
+    /// already materialized by the kernel).
+    ///
+    /// `#[serde(default)]` keeps older snapshots — frozen before
+    /// the field was added — decoding cleanly. The field is
+    /// additive end-of-struct per ADR 0002 §4, so format
+    /// version stays at `SNAPSHOT_FORMAT_VERSION = 1`.
+    #[serde(default)]
+    pub inherited: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -701,6 +716,69 @@ pub fn apply_snapshot(
     dispatch_memory_apply(&snap, kernel, store)
 }
 
+/// P2-D3.5 (ADR 0004 §2): re-attach inherited listener fds
+/// AFTER `apply_snapshot_kernel_state`. The state-apply step
+/// rebuilds `kernel.fds = FdTable::empty()`, wiping anything
+/// we pre-attached, so the orchestration is:
+///
+/// ```ignore
+/// apply_snapshot_kernel_state(&snap, kernel)?;
+/// apply_snapshot_inherited_listeners(&snap, kernel, &listeners)?;
+/// apply_snapshot_to_memory(&snap, mem, store)?;
+/// ```
+///
+/// where `listeners` is a pre-built `Vec<(u32, SharedSocket)>`
+/// produced by the `serve` subcommand (via
+/// [`crate::kernel::Kernel::attach_inherited_listeners`])
+/// from the env-var protocol. The helper inserts each
+/// listener into `kernel.fds` at the snap-recorded fd
+/// number — i.e. at the same fd number the kernel recorded
+/// when freezing. We DO NOT verify against the snapshot's
+/// recorded `bound` addr (the parent process owns that — we
+/// trust the inherited fd). If the caller passes a listener
+/// whose fd doesn't appear in the snapshot as `inherited`,
+/// we silently drop it (defensive against drift).
+pub fn apply_snapshot_inherited_listeners(
+    snap: &KernelSnapshot,
+    kernel: &mut Kernel,
+    listeners: &[(u32, crate::fd::SharedSocket)],
+) -> Result<(), SnapshotError> {
+    use crate::fd::Resource;
+
+    // Build a quick `fd -> inherited` set from the snapshot.
+    let inherited_fds: std::collections::HashSet<u32> = snap
+        .fds
+        .entries
+        .iter()
+        .filter(|e| {
+            e.kind.kind == ResourceKind::Socket
+                && e.kind
+                    .body
+                    .socket
+                    .as_ref()
+                    .map(|s| s.inherited)
+                    .unwrap_or(false)
+        })
+        .map(|e| e.fd.0)
+        .collect();
+
+    for (fd_num, shared) in listeners {
+        if !inherited_fds.contains(fd_num) {
+            // Caller passed a listener that the snapshot says
+            // wasn't inherited — drift between the env var
+            // protocol and the snap. Skip it (don't crash).
+            continue;
+        }
+        // Idempotent: if the kernel already has a Socket at
+        // this fd (caller called attach_inherited_listeners
+        // BEFORE apply too), skip; otherwise insert.
+        let _ = kernel
+            .fds
+            .insert_at(*fd_num, Resource::Socket(shared.clone()));
+    }
+    Ok(())
+}
+
 /// Step 1 of `apply_snapshot`: replace kernel-resident state (args,
 /// env, brk, fd-table, signals, vfs, clock, mm, rng). Takes only
 /// `&mut Kernel` — does NOT touch `Store<Kernel>`. Public for callers
@@ -775,6 +853,24 @@ pub fn apply_snapshot_kernel_state(
     // matching output buffers when the host driver queries them later.
     for entry in &entries {
         let fd_num = entry.fd;
+        // P2-D3.5 (ADR 0004 §2): if the snapshot says this listener
+        // was inherited, SKIP the resource-rebuild step entirely.
+        // The `serve` subcommand is responsible for re-attaching
+        // the inherited listener via `apply_snapshot_inherited_listeners`
+        // AFTER `apply_snapshot_kernel_state` returns (this
+        // function rebuilds `kernel.fds = FdTable::empty()` at the
+        // top, which would otherwise wipe a pre-attached entry).
+        if entry.kind.kind == ResourceKind::Socket
+            && entry
+                .kind
+                .body
+                .socket
+                .as_ref()
+                .map(|s| s.inherited)
+                .unwrap_or(false)
+        {
+            continue;
+        }
         let kind = entry.kind.kind;
         let body = &entry.kind.body;
         let resource: Resource = match kind {
@@ -886,6 +982,12 @@ pub fn apply_snapshot_kernel_state(
                     Resource::Socket(inner)
                 } else {
                     // ---- TCP listener ----
+                    // P2-D3.5 inherited entries were short-circuited
+                    // in the loop pre-pass above (before this match
+                    // arm runs). Re-binding is the caller's job —
+                    // specifically `serve` calling
+                    // `apply_snapshot_inherited_listeners` AFTER
+                    // `apply_snapshot_kernel_state` returns.
                     if !sock.is_acceptor {
                         return Err(SnapshotError::Unsupported(
                             "unconnected TCP client not yet supported",

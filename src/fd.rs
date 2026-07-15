@@ -266,6 +266,14 @@ pub struct SocketInner {
     /// sendto/recvfrom (the bind step is explicit in CPython; we
     /// support `bind(AF_UNIX, SOCK_DGRAM)` separately).
     pub dgram_unix: Option<UnixDatagram>,
+    /// P2-D3.5 (ADR 0004 §2): true if this socket's listener fd
+    /// was inherited from the parent process via the
+    /// `EDGE_SERVE_FD_<N>` env-var protocol. The freeze CLI
+    /// propagates this into the snapshot's `inherited: bool`
+    /// field so `apply_snapshot`'s reopen path can take the
+    /// "don't re-bind" branch. Default `false` for
+    /// kernel-built sockets.
+    pub inherited: bool,
 }
 
 impl SocketInner {
@@ -292,6 +300,7 @@ impl SocketInner {
             stream_unix: None,
             peer_addr_unix: None,
             dgram_unix: None,
+            inherited: false,
         }
     }
 
@@ -336,6 +345,40 @@ impl SocketInner {
         s.listen_backlog = Some(0);
         s.so_reuseaddr = so_reuseaddr;
         s.is_acceptor = true;
+        s
+    }
+
+    /// P2-D3.5 (ADR 0004 §2): construct a SocketInner from a
+    /// **pre-opened inherited TCP listener fd** (systemd-style
+    /// socket activation via the `EDGE_SERVE_FD_<N>` env-var
+    /// protocol). The host process bound and listened on the fd
+    /// before exec'ing `edge-cli serve`; we take ownership and
+    /// wrap it in a `SocketInner` so the guest's `accept4` can
+    /// service it without re-binding.
+    ///
+    /// The caller (`Kernel::attach_inherited_listeners`) is
+    /// responsible for producing the `SockAddr` from
+    /// `listener.local_addr().map(SockAddr::from)`. The
+    /// `is_acceptor = true` flag is set so the existing
+    /// `accept4` path treats the socket as a server.
+    #[allow(dead_code)]
+    pub fn from_inherited_listener(
+        listener: tokio::net::TcpListener,
+        bound: SockAddr,
+    ) -> Self {
+        let mut s = Self::new(SocketKind::Stream, false);
+        s.listener = Some(listener);
+        s.bound = Some(bound);
+        s.listen_backlog = Some(0);
+        s.so_reuseaddr = true;
+        s.is_acceptor = true;
+        // P2-D3.5: propagate the inherited flag into the
+        // snapshot via `SocketInner::inherited`. The
+        // freeze CLI's `SocketInner::snapshot()` reads this
+        // field and writes it to the `SocketSnapshot.inherited`
+        // field, which the apply path uses to skip the
+        // re-bind step.
+        s.inherited = true;
         s
     }
 
@@ -384,6 +427,11 @@ impl SocketInner {
             peek_buf,
             family_unix: self.family_unix,
             unix_inner,
+            // P2-D3.5: propagate the per-socket `inherited`
+            // flag into the snapshot. The flag is set by
+            // `SocketInner::from_inherited_listener`; default
+            // `false` for kernel-built sockets.
+            inherited: self.inherited,
         }
     }
 

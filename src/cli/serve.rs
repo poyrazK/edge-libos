@@ -174,6 +174,7 @@ mod tests {
             peek_buf: std::collections::VecDeque::new(),
             family_unix: false,
             unix_inner: None,
+            inherited: false,
         };
         let entry = FdEntrySnapshot {
             fd: LeU32::from(4u32),
