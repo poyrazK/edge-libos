@@ -147,10 +147,12 @@ async fn drive_guest(wasm_path: &str, budget_ms: u64, _script_args: &[String]) -
     let stderr_buf = store.data().stderr_buf();
 
     // Call `_start`. Multiple signatures: () -> void (zig cc / CPython),
-    // () -> i32 (emscripten).
+    // () -> i32 (emscripten), () -> i64 (P2 metering WAT fixtures).
     let call_result = if let Ok(start) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
         start.call_async(&mut store, ()).await
     } else if let Ok(start) = instance.get_typed_func::<(), i32>(&mut store, "_start") {
+        start.call_async(&mut store, ()).await.map(|_| ())
+    } else if let Ok(start) = instance.get_typed_func::<(), i64>(&mut store, "_start") {
         start.call_async(&mut store, ()).await.map(|_| ())
     } else {
         return Err(CliError::Args(format!(
@@ -235,12 +237,8 @@ mod tests {
 
     #[test]
     fn parses_cpu_budget_ms() {
-        let (w, b, s) = parse_run_argv(&[
-            "foo.wasm".into(),
-            "--cpu-budget-ms".into(),
-            "500".into(),
-        ])
-        .unwrap();
+        let (w, b, s) =
+            parse_run_argv(&["foo.wasm".into(), "--cpu-budget-ms".into(), "500".into()]).unwrap();
         assert_eq!(w, "foo.wasm");
         assert_eq!(b, 500);
         assert!(s.is_empty());
@@ -255,9 +253,8 @@ mod tests {
 
     #[test]
     fn rejects_non_numeric_budget() {
-        let err =
-            parse_run_argv(&["foo.wasm".into(), "--cpu-budget-ms".into(), "abc".into()])
-                .unwrap_err();
+        let err = parse_run_argv(&["foo.wasm".into(), "--cpu-budget-ms".into(), "abc".into()])
+            .unwrap_err();
         assert!(matches!(err, CliError::Args(_)), "got {err:?}");
     }
 

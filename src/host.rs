@@ -67,9 +67,9 @@ pub fn build_engine() -> Result<Engine> {
 /// safety — see ADR 0003 §1 "what this ADR blocks".
 pub fn build_store(engine: &Engine, kernel: Kernel) -> Store<Kernel> {
     let mut store = Store::new(engine, kernel);
-    store.set_fuel(u64::MAX).expect(
-        "build_store: fuel is enabled at engine build; set_fuel should always succeed",
-    );
+    store
+        .set_fuel(u64::MAX)
+        .expect("build_store: fuel is enabled at engine build; set_fuel should always succeed");
     store
 }
 

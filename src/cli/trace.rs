@@ -220,6 +220,8 @@ async fn run_guest(
         let _ = start.call_async(&mut store, ()).await;
     } else if let Ok(start) = instance.get_typed_func::<(), i32>(&mut store, "_start") {
         let _ = start.call_async(&mut store, ()).await;
+    } else if let Ok(start) = instance.get_typed_func::<(), i64>(&mut store, "_start") {
+        let _ = start.call_async(&mut store, ()).await;
     }
 
     let entries = TRACE.with(|t| t.borrow().clone());
