@@ -40,6 +40,31 @@ pub const CLONE_PARENT_SETTID: i64 = 0x0800_0000;
 /// Mask of v1-supported clone flags. Any bits outside this set → -EINVAL.
 pub const CLONE_SUPPORTED_V1: i64 = CLONE_CHILD_SETTID | CLONE_PARENT_SETTID;
 
+// P3 Tier-8 v2 step 4 — additional clone flag bits and the v2
+// supported set. M4 makes `clone(CLONE_VM | CLONE_THREAD |
+// CLONE_CHILD_SETTID | CLONE_PARENT_SETTID)` work at the flag-
+// validation layer; the SharedMemory hand-off + child-thread
+// spawn under CLONE_VM lands in M7 alongside the WAT-based
+// integration test (which is the first place the engine +
+// module references are reachable through the dispatch path).
+//
+// `CLONE_FILES`, `CLONE_SIGHAND`, `CLONE_FS`, `CLONE_IO`,
+// `CLONE_VFORK`, and the `CLONE_NEW*` namespace flags remain
+// rejected with -EINVAL per ADR 0005 §6.
+pub const CLONE_VM: i64 = 0x0000_0100;
+pub const CLONE_THREAD: i64 = 0x0001_0000;
+pub const CLONE_SIGHAND: i64 = 0x0000_0800;
+pub const CLONE_FILES: i64 = 0x0000_0400;
+pub const CLONE_FS: i64 = 0x0000_0200;
+pub const CLONE_VFORK: i64 = 0x0000_4000;
+pub const CLONE_IO: i64 = 0x8000_0000;
+
+/// Mask of v2-supported clone flags. Rejecting any bit outside
+/// this set with -EINVAL keeps v1's "no surprise flags" contract
+/// while still enabling `CLONE_VM | CLONE_THREAD`. ADR 0005 §6.
+pub const CLONE_SUPPORTED_V2: i64 =
+    CLONE_CHILD_SETTID | CLONE_PARENT_SETTID | CLONE_VM | CLONE_THREAD;
+
 // Linux x86-64 syscall numbers (`unistd_64.h`).
 pub const NR_EXIT: u32 = 60;
 pub const NR_EXIT_GROUP: u32 = 231;
@@ -152,41 +177,62 @@ pub fn set_robust_list() -> i64 {
     0
 }
 
-/// `clone(flags, child_stack, ptid, ctid, tls) -> child_tid` — P3 Tier-4 v1.
+/// `clone(flags, child_stack, ptid, ctid, tls) -> child_tid` — P3 Tier-4 v2.
 ///
-/// v1 supports only the two TID-writeback flags (`CLONE_CHILD_SETTID` and
-/// `CLONE_PARENT_SETTID`). The child is **not actually executed** in v1 —
-/// v1 allocates a new PID and writes it to the requested `*_tidptr`
-/// locations; the child fiber's resumption is deferred to a follow-up
-/// PR (per the implementation plan §P3 Tier-4: "child enters `_start`
-/// on resume (deferred to PR 5+ when we wire the child fiber)").
+/// v2 supports the v1 TID-writeback flags plus `CLONE_VM` and
+/// `CLONE_THREAD`. The child fiber's resumption under `CLONE_VM`
+/// requires the SharedMemory hand-off documented in ADR 0005 §3
+/// — that part lands in M7 alongside the WAT-based integration
+/// test (the full child-thread spawn machinery is gated on the
+/// dispatch path being able to reach the `Arc<Engine>` +
+/// `Arc<Module>` references, which the runner/cli path wires up
+/// at module-instantiation time).
 ///
-/// Supported flags (only):
+/// In this M4 commit, `CLONE_VM` and `CLONE_THREAD` are accepted
+/// at the flag-validation layer and the new TID is allocated +
+/// written back exactly as in v1. The child is still not resumed;
+/// the supported flag set is broadened to mirror musl's
+/// `pthread_create` ABI. Rejected flags remain:
+/// `CLONE_FILES`, `CLONE_SIGHAND`, `CLONE_FS`, `CLONE_IO`,
+/// `CLONE_VFORK`, and the `CLONE_NEW*` namespace flags (ADR 0005
+/// §6 documents why these stay out of scope).
+///
+/// Supported flags:
 /// - `CLONE_CHILD_SETTID` (0x01000000): write the new TID to `ctid_ptr`.
 /// - `CLONE_PARENT_SETTID` (0x08000000): write the new TID to `ptid_ptr`.
+/// - `CLONE_VM` (0x100): accepted at validation; full SharedMemory
+///   hand-off lands in M7.
+/// - `CLONE_THREAD` (0x10000): accepted at validation; child joins
+///   parent's tgid via `Kernel::new_for_child` (M3).
 ///
-/// Any other flag bit → `-EINVAL`. Rejected flags include `CLONE_VM`,
-/// `CLONE_THREAD`, `CLONE_FILES`, `CLONE_SIGHAND`, `CLONE_FS`, `CLONE_IO`,
-/// `CLONE_VFORK` (they imply shared state the v1 kernel can't safely
-/// model — CoW pages, shared fd tables, etc.; see ADR 0001).
+/// Any flag outside `CLONE_SUPPORTED_V2` → `-EINVAL`. At least one
+/// of `CLONE_CHILD_SETTID | CLONE_PARENT_SETTID` must be requested
+/// — matches the v1 conformance expectation that `clone(0) ==
+/// -EINVAL` (no way to observe the result).
 ///
-/// Allocation: `Kernel.next_pid` is a monotonically-increasing `AtomicI32`,
-/// starting at 2 (PID 1 is reserved for the init kernel — `getpid()` returns
-/// 1). Ordering is `Relaxed`; no other field is gated on PID order.
+/// Allocation: `process_state.next_pid` is a monotonically-increasing
+/// `AtomicI32`, starting at 2 (PID 1 is reserved for the init kernel
+/// — `getpid()` returns 1). Ordering is `Relaxed`; no other field is
+/// gated on PID order.
 pub async fn clone_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let flags = a[0];
     // a[1] = child_stack (unused — guest passes 0; v1 has no stack model).
     let ptid_ptr = a[2];
     let ctid_ptr = a[3];
 
-    // Reject any flag outside the v1-supported set.
-    if flags & !CLONE_SUPPORTED_V1 != 0 {
+    // Reject any flag outside the v2-supported set.
+    if flags & !CLONE_SUPPORTED_V2 != 0 {
         return -EINVAL;
     }
     // At least one TID-writeback flag must be requested; otherwise the
     // guest is asking us to spawn a child without observing the result.
     // This matches the conformance expectation that `clone(0) == -EINVAL`.
-    if flags & CLONE_SUPPORTED_V1 == 0 {
+    // (Pure `CLONE_VM | CLONE_THREAD` without TID-writeback is also
+    // rejected here — it would require a return path that doesn't tell
+    // the guest where the TID landed. musl's pthread_create always
+    // passes a CLONE_CHILD_SETTID-style path.)
+    let tid_writeback = flags & (CLONE_CHILD_SETTID | CLONE_PARENT_SETTID);
+    if tid_writeback == 0 {
         return -EINVAL;
     }
 
@@ -196,9 +242,25 @@ pub async fn clone_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 
         .next_pid
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+    // Register the child in the parent's tgid registry so that
+    // `kill(pid, sig)` (PID == tgid) and `tgkill(tgid, tid, sig)`
+    // (M6) can route to this thread. The registry lives on
+    // `process_state` and is shared across threads.
+    {
+        let mut registry = caller.data().process_state.tgid_registry.lock();
+        registry.insert(child_tid);
+    }
+
     // Write the new TID to the requested pointers. We snapshot the
     // Memory handle first (it is `Copy`) so we can release the `&Kernel`
     // borrow before re-borrowing `caller` mutably.
+    //
+    // Under `CLONE_VM` the linear memory is shared with the child
+    // thread, so the parent's memory handle is the same handle the
+    // child will see on its fresh Store (post-M7 SharedMemory hand-off).
+    // For M4 we still go through the legacy `memory()` accessor; the
+    // Shared variant case returns `-EINVAL` here, which is fine —
+    // CLONE_VM writes back go through a different code path in M7.
     let mem_handle = match caller.data().memory() {
         Ok(m) => *m,
         Err(e) => return e,
@@ -276,6 +338,15 @@ pub async fn fork_syscall(caller: &mut Caller<'_, Kernel>, _a: [i64; 6]) -> i64 
     let mut children = caller.data().process_state.children.lock();
     children.insert(child_pid, ChildExitStatus::new(0));
     drop(children);
+
+    // M4: register the new child PID in the tgid registry so
+    // `kill(child_pid, sig)` / `tgkill(...)` can route to it
+    // (M6). fork() makes the child its own tgid leader, so the
+    // child's PID is also its tgid.
+    {
+        let mut registry = caller.data().process_state.tgid_registry.lock();
+        registry.insert(child_pid);
+    }
 
     child_pid as i64
 }

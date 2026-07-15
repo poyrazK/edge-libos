@@ -117,14 +117,63 @@ async fn clone_no_supported_flags_returns_einval() -> Result<()> {
 #[tokio::test]
 async fn clone_unsupported_flag_returns_einval() -> Result<()> {
     let (mut store, instance) = fresh_store_with_fixture().await?;
-    // CLONE_VM (0x100) + CLONE_CHILD_SETTID: the unsupported bit
-    // must override and force -EINVAL.
-    mem_write_i32(&mut store, 0x100, 0x100 | 0x0100_0000);
+    // CLONE_FILES (0x400) is in v1's reject set and remains rejected
+    // under v2 per ADR 0005 §6. Pairing it with a TID-writeback flag
+    // exercises the "any bit outside CLONE_SUPPORTED_V2 → -EINVAL"
+    // contract — the supported flag (CLONE_CHILD_SETTID) does NOT
+    // mask the unsupported one.
+    mem_write_i32(&mut store, 0x100, 0x400 | 0x0100_0000);
     mem_write_i32(&mut store, 0x110, 0x200); // ptid_ptr
     mem_write_i32(&mut store, 0x114, 0x204); // ctid_ptr
     call_start(&mut store, &instance).await;
     let ret = mem_read_i32(&store, 0x120);
-    assert_eq!(ret, -22, "clone(CLONE_VM | …) must return -EINVAL");
+    assert_eq!(
+        ret, -22,
+        "clone(CLONE_FILES | CLONE_CHILD_SETTID) must return -EINVAL"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn clone_vm_thread_flags_accepted_and_writes_tid() -> Result<()> {
+    // M4: `clone(CLONE_VM | CLONE_THREAD | CLONE_CHILD_SETTID |
+    // CLONE_PARENT_SETTID)` is accepted at the flag-validation layer.
+    // The full SharedMemory hand-off lands in M7; for M4 we only
+    // assert that the flag set is NOT rejected and that TID
+    // writeback works.
+    let (mut store, instance) = fresh_store_with_fixture().await?;
+    let flags = 0x100_i32 | 0x10000_i32 | 0x0100_0000 | 0x0800_0000;
+    mem_write_i32(&mut store, 0x100, flags);
+    mem_write_i32(&mut store, 0x110, 0x200); // ptid_ptr
+    mem_write_i32(&mut store, 0x114, 0x204); // ctid_ptr
+    mem_write_i32(&mut store, 0x200, 0xdead_beef_u32 as i32);
+    mem_write_i32(&mut store, 0x204, 0xcafe_babe_u32 as i32);
+    call_start(&mut store, &instance).await;
+    let child_pid = mem_read_i32(&store, 0x120);
+    assert!(
+        child_pid > 1,
+        "clone(CLONE_VM | CLONE_THREAD | …) must return child_pid > 1, got {child_pid}"
+    );
+    let ptid = mem_read_i32(&store, 0x200);
+    let ctid = mem_read_i32(&store, 0x204);
+    assert_eq!(ptid, child_pid, "CLONE_PARENT_SETTID must match child_pid");
+    assert_eq!(ctid, child_pid, "CLONE_CHILD_SETTID must match child_pid");
+    Ok(())
+}
+
+#[tokio::test]
+async fn clone_vm_without_tid_writeback_returns_einval() -> Result<()> {
+    // M4: a pure CLONE_VM | CLONE_THREAD (no TID-writeback flag)
+    // is rejected — the guest has no way to observe the child TID.
+    // This matches the v1 "clone(0) == -EINVAL" conformance rule.
+    let (mut store, instance) = fresh_store_with_fixture().await?;
+    mem_write_i32(&mut store, 0x100, 0x100 | 0x10000);
+    call_start(&mut store, &instance).await;
+    let ret = mem_read_i32(&store, 0x120);
+    assert_eq!(
+        ret, -22,
+        "clone(CLONE_VM | CLONE_THREAD) without TID-writeback must return -EINVAL"
+    );
     Ok(())
 }
 
