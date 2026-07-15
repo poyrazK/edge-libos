@@ -675,7 +675,7 @@ pub fn apply_snapshot(
     store: &mut impl wasmtime::AsContextMut<Data = Kernel>,
 ) -> Result<(), SnapshotError> {
     apply_snapshot_kernel_state(&snap, kernel)?;
-    apply_snapshot_to_memory_inner(&snap, kernel, store)
+    dispatch_memory_apply(&snap, kernel, store)
 }
 
 /// Step 1 of `apply_snapshot`: replace kernel-resident state (args,
@@ -956,7 +956,15 @@ pub fn apply_snapshot_kernel_state(
 /// pages, this is a no-op (the memory remains at whatever size the
 /// target store was born with — sufficient for the roundtrip test
 /// fixture, which builds a 32-page module ahead of time).
-fn apply_snapshot_to_memory_inner(
+/// Dispatch memory restore based on the kernel's [`MemoryKind`].
+///
+/// P3 Tier-3: the `Owned` variant goes through the public
+/// `apply_snapshot_to_memory` (which still takes `Memory` for
+/// backwards compatibility with the existing tests); the `Shared`
+/// variant goes through `apply_snapshot_to_shared_memory` because
+/// `SharedMemory::grow` / `SharedMemory::data` don't take a
+/// `Store` reference.
+fn dispatch_memory_apply(
     snap: &KernelSnapshot,
     kernel: &mut Kernel,
     store: &mut impl wasmtime::AsContextMut<Data = Kernel>,
@@ -964,12 +972,6 @@ fn apply_snapshot_to_memory_inner(
     if snap.pages.is_empty() {
         return Ok(());
     }
-    // P3 Tier-3: dispatch on `MemoryKind`. The `Owned` variant goes
-    // through the public `apply_snapshot_to_memory` (which still
-    // takes `Memory` for backwards compatibility with the existing
-    // tests); the `Shared` variant inlines the grow + chunk-copy
-    // here because there's no public `apply_snapshot_to_memory` for
-    // shared memory yet (it's only consumed by this inner driver).
     let mem_kind = kernel.memory_kind().map_err(|e| {
         SnapshotError::IoError(
             std::io::Error::other(format!("memory not attached: errno={e}")),
@@ -983,7 +985,7 @@ fn apply_snapshot_to_memory_inner(
             apply_snapshot_to_memory(snap, mem, store)
         }
         crate::kernel::MemoryKind::Shared(mem) => {
-            apply_snapshot_to_shared_memory(snap, mem, store)
+            apply_snapshot_to_shared_memory(snap, mem)
         }
     }
 }
@@ -998,15 +1000,14 @@ fn apply_snapshot_to_memory_inner(
 /// and `SharedMemory::data` returns `&[UnsafeCell<u8>]` (also no
 /// store). We unsafely project that to `&mut [u8]` for the
 /// chunk-copy — see the safety contract on [`MemoryKind::data_mut`].
-fn apply_snapshot_to_shared_memory(
+///
+/// Public for callers (notably `tests/migration_smoke.rs`) that
+/// want to drive the Shared-memory restore by hand — same
+/// split-phase pattern as `apply_snapshot_to_memory`.
+pub fn apply_snapshot_to_shared_memory(
     snap: &KernelSnapshot,
-    _mem: &wasmtime::SharedMemory,
-    _store: &mut impl wasmtime::AsContextMut<Data = Kernel>,
+    mem: &wasmtime::SharedMemory,
 ) -> Result<(), SnapshotError> {
-    // SharedMemory::grow / data don't take a store, so `_store` is
-    // unused. The parameter is kept to match the Owned-variant
-    // signature shape.
-    let _ = _store;
     // Grow the shared memory to fit the snapshot's largest page.
     let target_pages = snap
         .pages
@@ -1015,10 +1016,10 @@ fn apply_snapshot_to_shared_memory(
         .max()
         .unwrap()
         + 1;
-    let cur_pages: usize = _mem.data_size() / PAGE_SIZE_BYTES;
+    let cur_pages: usize = mem.data_size() / PAGE_SIZE_BYTES;
     if target_pages > cur_pages {
         let delta: u64 = (target_pages - cur_pages) as u64;
-        _mem.grow(delta).map_err(|e| {
+        mem.grow(delta).map_err(|e| {
             SnapshotError::IoError(
                 std::io::Error::other(format!("SharedMemory::grow failed: {e}")),
                 "shared mem.grow".into(),
@@ -1027,7 +1028,7 @@ fn apply_snapshot_to_shared_memory(
     }
     // Chunk-copy each page's bytes into the right slot.
     let bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(_mem.data().as_ptr() as *mut u8, _mem.data_size())
+        std::slice::from_raw_parts_mut(mem.data().as_ptr() as *mut u8, mem.data_size())
     };
     for page in &snap.pages {
         let start = page.page_index.0 as usize * PAGE_SIZE_BYTES;
