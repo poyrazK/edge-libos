@@ -222,9 +222,7 @@ mod tests {
     /// `tempfile` crate as a direct dep just for two tests.
     fn tempdir_in_target() -> std::path::PathBuf {
         let pid = std::process::id();
-        let dir = std::path::PathBuf::from(format!(
-            "target/ci/freeze-hash-tests-{pid}"
-        ));
+        let dir = std::path::PathBuf::from(format!("target/ci/freeze-hash-tests-{pid}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create tempdir");
         dir

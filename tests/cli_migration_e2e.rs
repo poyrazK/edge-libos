@@ -315,10 +315,8 @@ async fn cli_migration_e2e_rejects_mismatched_wasm() {
     //    fixture the happy-path test uses — and the serve-side
     //    wasm (a deliberately different module, `serve_one_request.wat`).
     //    They have DIFFERENT byte content so SHA-256 disagrees.
-    let freeze_wasm_path =
-        std::env::temp_dir().join("edge_d35_e2e_mismatch_freeze.wasm");
-    let serve_wasm_path =
-        std::env::temp_dir().join("edge_d35_e2e_mismatch_serve.wasm");
+    let freeze_wasm_path = std::env::temp_dir().join("edge_d35_e2e_mismatch_freeze.wasm");
+    let serve_wasm_path = std::env::temp_dir().join("edge_d35_e2e_mismatch_serve.wasm");
     let snap_path = std::env::temp_dir().join("edge_d35_e2e_mismatch.snap");
     let _ = std::fs::remove_file(&freeze_wasm_path);
     let _ = std::fs::remove_file(&serve_wasm_path);
@@ -360,8 +358,7 @@ async fn cli_migration_e2e_rejects_mismatched_wasm() {
     //    stderr; the dispatcher's exit-1 path for
     //    `CliError::Snapshot` will fire because the verify call
     //    rejects the wasm BEFORE any apply step runs.
-    let stderr_path =
-        std::env::temp_dir().join("edge_d35_e2e_mismatch_serve.stderr");
+    let stderr_path = std::env::temp_dir().join("edge_d35_e2e_mismatch_serve.stderr");
     let _ = std::fs::remove_file(&stderr_path);
     let stderr_file = std::fs::File::create(&stderr_path).expect("create stderr file");
     let mut serve = tokio::process::Command::new(&cli)
@@ -395,8 +392,7 @@ async fn cli_migration_e2e_rejects_mismatched_wasm() {
         "serve must exit with code 1 (the dispatcher maps Snapshot → exit 1)"
     );
     assert!(
-        stderr.contains("module hash mismatch")
-            || stderr.contains("ModuleHashMismatch"),
+        stderr.contains("module hash mismatch") || stderr.contains("ModuleHashMismatch"),
         "expected stderr to mention the module hash mismatch error; got: {stderr:?}"
     );
 

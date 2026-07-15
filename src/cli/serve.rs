@@ -515,9 +515,7 @@ mod tests {
         let wasm_bytes = wat::parse_str(wat_src).expect("compile WAT");
 
         let pid = std::process::id();
-        let dir = std::path::PathBuf::from(format!(
-            "target/ci/serve-hash-tests-{pid}"
-        ));
+        let dir = std::path::PathBuf::from(format!("target/ci/serve-hash-tests-{pid}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create tempdir");
         let wasm_path = dir.join("guest.wasm");

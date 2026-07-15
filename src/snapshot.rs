@@ -516,7 +516,10 @@ impl std::fmt::Display for SnapshotError {
                 f,
                 "snapshot format_version={found} does not match supported {supported}"
             ),
-            SnapshotError::ModuleHashMismatch { snap_hash, wasm_hash } => write!(
+            SnapshotError::ModuleHashMismatch {
+                snap_hash,
+                wasm_hash,
+            } => write!(
                 f,
                 "snapshot module hash mismatch: snap={} wasm={}; refusing to apply",
                 hex_lower32(snap_hash),
@@ -856,10 +859,7 @@ pub fn apply_snapshot_inherited_listeners(
 ///
 /// Wire cost on the apply path: one SHA-256 over `wasm_bytes`
 /// (cheap; <1 ms for any wasm of plausible size).
-pub fn verify_module_hash(
-    snap: &KernelSnapshot,
-    wasm_bytes: &[u8],
-) -> Result<(), SnapshotError> {
+pub fn verify_module_hash(snap: &KernelSnapshot, wasm_bytes: &[u8]) -> Result<(), SnapshotError> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(wasm_bytes);
@@ -2010,7 +2010,10 @@ mod tests {
         let err = verify_module_hash(&snap, &wasm_bytes)
             .expect_err("verify must reject mismatched wasm hash");
         match err {
-            SnapshotError::ModuleHashMismatch { snap_hash, wasm_hash } => {
+            SnapshotError::ModuleHashMismatch {
+                snap_hash,
+                wasm_hash,
+            } => {
                 assert_eq!(snap_hash, [0xAAu8; 32]);
                 // `wasm_hash` is the SHA-256 of the caller-side
                 // bytes, NOT the raw bytes themselves.
@@ -2032,8 +2035,7 @@ mod tests {
         let digest: [u8; 32] = hasher.finalize().into();
         let mut snap = make_test_snapshot();
         snap.module_sha256 = digest;
-        verify_module_hash(&snap, &wasm_bytes)
-            .expect("matching hash must verify cleanly");
+        verify_module_hash(&snap, &wasm_bytes).expect("matching hash must verify cleanly");
     }
 
     #[test]
