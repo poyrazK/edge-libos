@@ -236,7 +236,7 @@ fn futex_wait_immediate_timeout_returns_etimedout() -> Result<()> {
 ///   * wasmtime 45.0.3's `Store` is `!Send` and `!Sync`, so two
 ///     `Func::call_async` invocations cannot run in parallel on the
 ///     same Store with a regular (non-shared) `Memory`.
-///   * The follow-up test `pthread_mutex_two_fiber_wake_on_unlock`
+///   * The follow-up test `memory_kind_shared_atomic_wait32_not_equal`
 ///     exercises the wasm-to-wasm two-fiber case via
 ///     `wasmtime::SharedMemory` (enabled by PR #12's flip of
 ///     `shared_memory(true)` in `src/host.rs::build_engine` and the
@@ -321,7 +321,7 @@ fn nr_constants_match_linux_x86_64() {
 /// unit-test proof here is the `MemoryKind::Shared` wiring, which
 /// is the new surface added by sub-deliverable 2.
 #[tokio::test(flavor = "current_thread")]
-async fn pthread_mutex_two_fiber_wake_on_unlock() -> Result<()> {
+async fn memory_kind_shared_atomic_wait32_not_equal() -> Result<()> {
     // WAT: a module declaring shared memory with two exported
     // functions. `lock_path` waits on address 0 with `expected=1`
     // (mismatching the initial 0), so `i32.atomic.wait` returns

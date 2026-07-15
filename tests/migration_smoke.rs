@@ -14,13 +14,19 @@
 //!      and asserts exit 0. Skipped by default because it pays
 //!      for a subprocess spawn + Wasmtime compile; run with
 //!      `cargo test --profile ci -- --ignored`.
+//!   4. `migration_roundtrip_preserves_shared_memory_state` — same
+//!      freeze/encode/decode/apply roundtrip but on a guest that
+//!      declares `(memory … shared)`. Exercises the
+//!      `apply_snapshot_to_shared_memory` driver that
+//!      `dispatch_memory_apply` routes to for the `Shared` variant
+//!      of `MemoryKind` (sub-deliverable 2 + sub-deliverable 6).
 
 mod common;
 
 use anyhow::Result;
 use edge_libos::snapshot::{
-    apply_snapshot_kernel_state, apply_snapshot_to_memory, decode_snapshot, encode_snapshot,
-    try_to_snapshot,
+    apply_snapshot_kernel_state, apply_snapshot_to_memory, apply_snapshot_to_shared_memory,
+    decode_snapshot, encode_snapshot, try_to_snapshot,
 };
 use edge_libos::{build_store, Kernel};
 
@@ -149,17 +155,17 @@ async fn migration_smoke_subprocess_roundtrip() -> Result<()> {
     let bytes = wat::parse_str(MARKER_WAT)?;
     std::fs::write(tmp.path(), &bytes)?;
 
-    let exe = std::env::current_exe()?;
     // cargo test sets CARGO_BIN_EXE_<name> for the workspace's
-    // binaries; we use that if present, else fall back to the
-    // current_exe (which is the test binary, not edge-cli —
-    // this fallback exists for documentation only).
+    // binaries when running through `cargo test` / `cargo nextest`.
+    // We require it explicitly — guessing from `current_exe().parent()`
+    // produces a path that doesn't exist on most setups (the test
+    // binary and edge-cli are not siblings). If you see this panic,
+    // you're running the test binary directly instead of via cargo.
     let bin = std::env::var("CARGO_BIN_EXE_edge-cli").unwrap_or_else(|_| {
-        exe.parent()
-            .unwrap()
-            .join("edge-cli")
-            .to_string_lossy()
-            .to_string()
+        panic!(
+            "CARGO_BIN_EXE_edge-cli not set — run via \
+             `cargo test --profile ci -p edge-libos --test migration_smoke -- --ignored`"
+        )
     });
 
     let status = Command::new(&bin)
@@ -169,4 +175,120 @@ async fn migration_smoke_subprocess_roundtrip() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to spawn {bin}: {e}"))?;
     assert!(status.success(), "edge-cli migrate exited non-zero: {status}");
     Ok(())
+}
+
+/// Shared-memory variant of the migration roundtrip. The fixture
+/// declares `(memory 1 1 shared)` so wasmtime exposes the memory
+/// as a `SharedMemory`. We write a marker into the shared memory
+/// bytes (via `SharedMemory::data` + raw projection), then run the
+/// full freeze → encode → decode → apply cycle. The destination
+/// kernel must have its memory restored through
+/// `apply_snapshot_to_shared_memory` (the Shared arm of
+/// `dispatch_memory_apply`), and the marker must be observable in
+/// the post-apply shared backing store.
+#[test]
+fn migration_roundtrip_preserves_shared_memory_state() -> Result<()> {
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio current_thread runtime");
+        rt.block_on(f)
+    }
+
+    const SHARED_MARKER_WAT: &str = r#"
+        (module
+          (memory (export "memory") 1 1 shared))
+    "#;
+
+    const SHARED_MARKER_BYTES: i64 = 0x4445_5441_5247_494d; // "MIGRATED"
+
+    block_on(async {
+        let (engine, linker) = common::engine_and_linker()?;
+        let module = common::compile_wat(&engine, SHARED_MARKER_WAT)?;
+
+        // Phase 1: host-A. Instantiate and attach the shared memory.
+        let mut store = build_store(&engine, Kernel::new_without_stdio(vec![], vec![]));
+        let instance = linker.instantiate_async(&mut store, &module).await?;
+        let shared_mem = instance
+            .get_shared_memory(&mut store, "memory")
+            .expect("shared memory export must exist");
+        store.data_mut().attach_shared_memory(shared_mem);
+
+        // Verify the kernel routed to MemoryKind::Shared.
+        {
+            let kind = store
+                .data()
+                .memory_kind()
+                .expect("memory must be attached");
+            assert!(
+                kind.as_shared_memory().is_some(),
+                "kernel must store the SharedMemory, not a regular Memory"
+            );
+        }
+
+        // Write the marker directly into shared memory bytes.
+        // `SharedMemory::data` returns `&[UnsafeCell<u8>]`; project
+        // to `&mut [u8]` for the write. Safe here because we are
+        // single-threaded inside the freeze CLI's quiescent-point
+        // window.
+        let shared = store
+            .data()
+            .memory_kind()
+            .unwrap()
+            .as_shared_memory()
+            .unwrap();
+        let bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(shared.data().as_ptr() as *mut u8, shared.data_size())
+        };
+        bytes[0x1000..0x1008].copy_from_slice(&SHARED_MARKER_BYTES.to_le_bytes());
+
+        // Phase 2: snapshot.
+        let snap = try_to_snapshot(store.data(), &store)?;
+
+        // Phase 3+4: encode/decode (simulates cross-host transfer).
+        let encoded = encode_snapshot(&snap)?;
+        let snap_restored = decode_snapshot(&encoded)?;
+        assert_eq!(snap_restored.format_version.0, snap.format_version.0);
+
+        // Phase 5: host-B. Fresh kernel + fresh shared-memory
+        // guest. Split-phase apply mirrors the Owned-path test
+        // above: kernel-state apply first (no `Store` borrow),
+        // then memory apply.
+        let mut fresh_store = build_store(&engine, Kernel::new_without_stdio(vec![], vec![]));
+        let fresh_instance = linker.instantiate_async(&mut fresh_store, &module).await?;
+        let fresh_shared = fresh_instance
+            .get_shared_memory(&mut fresh_store, "memory")
+            .expect("shared memory export must exist");
+        fresh_store.data_mut().attach_shared_memory(fresh_shared);
+
+        apply_snapshot_kernel_state(&snap_restored, fresh_store.data_mut())?;
+        let shared_clone = fresh_store
+            .data()
+            .memory_kind()
+            .expect("memory attached")
+            .as_shared_memory()
+            .expect("memory is Shared variant")
+            .clone();
+        apply_snapshot_to_shared_memory(&snap_restored, &shared_clone)?;
+
+        // Read the marker back from the post-apply shared memory.
+        let fresh_shared_ref = fresh_store
+            .data()
+            .memory_kind()
+            .unwrap()
+            .as_shared_memory()
+            .unwrap();
+        let restored_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(fresh_shared_ref.data().as_ptr() as *const u8, fresh_shared_ref.data_size())
+        };
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&restored_bytes[0x1000..0x1008]);
+        let restored_marker = i64::from_le_bytes(buf);
+        assert_eq!(
+            restored_marker, SHARED_MARKER_BYTES,
+            "marker must roundtrip through the Shared-memory encode/decode/apply path"
+        );
+        Ok::<(), anyhow::Error>(())
+    })
 }
