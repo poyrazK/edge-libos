@@ -145,8 +145,7 @@ fn resolve_eai_noname_on_bad_name() -> Result<()> {
     block_on(async {
         let (engine, linker) = common::engine_and_linker()?;
         let module = common::compile_wat(&engine, RESOLVE_WAT)?;
-        let mut store =
-            edge_libos::build_store(&engine, make_kernel(vec![], vec![], 5_000));
+        let mut store = edge_libos::build_store(&engine, make_kernel(vec![], vec![], 5_000));
         let inst = linker.instantiate_async(&mut store, &module).await?;
         if let Some(mem) = inst.get_memory(&mut store, "memory") {
             store.data_mut().attach_memory(mem);
