@@ -6,7 +6,7 @@
 > session-local handoff that `.gitignore` excludes). Subsequent
 > session-local handoffs follow the existing `.gitignore` rule.
 
-**edge-libos** version: **0.2.0** (P3 final-bundle).
+**edge-libos** version: **0.2.0** (P3 final-bundle + P2-DNS `NR_RESOLVE`).
 
 ## P3 final-bundle PR — DOF (Definition of Finalized)
 
@@ -316,6 +316,150 @@ Accepted. Pins the per-thread `Kernel` field split (`Arc<ProcessState>`), `Arc<E
 
 - **Item #1** (deferred child-fiber resumption): closed by M1 + M2. `fork_syscall` spawns a real `std::thread` driving a fresh `Store<Kernel>` to `_start.call_async`. End-to-end tested by `tests/fork_conformance.rs::fork_with_real_child_thread_returns_child_exit_code_via_wat`.
 - **Item #6** (`CLONE_VM` / `CLONE_THREAD`): closed by M4 + M6. `clone(CLONE_VM | CLONE_THREAD | CLONE_CHILD_SETTID | CLONE_PARENT_SETTID)` is accepted; child shares linear memory via `SharedMemory` and joins the parent's tgid. End-to-end tested by `tests/clone_conformance.rs::clone_vm_threads_share_writes_across_stores`.
+
+## P2-DNS — `NR_RESOLVE` syscall + guest libc adapter (ADR 0007)
+
+Closes the P2-DNS deliverable from the implementation plan on branch
+`worktree-p2-dns-resolver`. Adds `socket.getaddrinfo("api.example.com", 443)`
+working end-to-end inside a CPython guest.
+
+**Why this matters.** P2 DoD is *"FastAPI + pydantic + httpx + SQLAlchemy-
+over-Postgres deploys unchanged, cold-starts <5 ms, meters CPU-ms"*.
+Without DNS, httpx / asyncpg cannot reach any real service — DNS was
+the last true production blocker.
+
+**Why project-private NR, not UDP + musl.** Three load-bearing facts:
+
+1. There is no Linux `getaddrinfo` syscall at any NR; musl implements
+   it in libc over UDP `socket`/`sendto`/`recvmsg`/`poll`.
+2. The kernel has **no UDP layer at all** — `SocketKind::Datagram`
+   exists as an enum tag, but `sendto`/`recvfrom` are TCP-only.
+   Adding UDP is a separate, larger workstream.
+3. wasm32-musl `EAI_*` are **negative** (`EAI_NONAME = -2`); wasm32
+   `struct addrinfo` is **32 bytes** (4-byte pointers), not 48.
+
+Path A (real UDP + musl) is **months**; Path C (guest-side re-impl)
+hits the wasm32-musl `--disable-threads --without-threads
+--disable-ipv6 --disable-ssl` wall. Path B (chosen) is a project-
+private `NR_RESOLVE` syscall + a tiny musl-override guest adapter.
+
+### What landed
+
+- `src/sys/resolver.rs` — `NR_RESOLVE=400` handler, `ResolverState`
+  on `ProcessState` (mirrors `futex_table` from ADR 0006), per-
+  ProcessState cache (TTL 60s default), TTL'd denylist filter,
+  `ResolverBackend` trait + `TokioResolverBackend` (hickory 0.26) +
+  `StubResolver` for tests, lock-then-clone-then-drop discipline
+  (no parking_lot guard across `.await`).
+- `src/dispatch.rs` — `NR_RESOLVE` arm in `dispatch()` + `syscall_name()`.
+- `src/sys/process.rs:92-97` — `NR_SNAPSHOT` docstring fixed to
+  reflect the upstream-reserved 387-423 truth; both project-private
+  NRs (123, 400) live in reserved/adjacent space.
+- `src/kernel.rs` — `attach_resolver_config(&mut self, ResolverConfig)`
+  + `attach_resolver_backend` (test-only) post-construction setters
+  (same `Arc::get_mut` precondition as `attach_inherited_listeners`).
+- `src/cli/run.rs`, `src/cli/serve.rs` — parse `EDGE_RESOLVER_DENY=`,
+  `EDGE_RESOLVER_CACHE_TTL_MS=`, `EDGE_RESOLVER_TIMEOUT_MS=` env vars
+  before `Kernel::new`.
+- `guest/resolver/{getaddrinfo,freeaddrinfo,host_lookup.h}` — musl
+  weak-symbol overrides; marshal through `__kernel_syscall(NR_RESOLVE, ...)`.
+- `guest/build.sh` — appends the two `.o` files to `ENTRY_OBJS`
+  with `-I$GUEST/resolver` (link-order = ours first, so weak symbols
+  resolve to our overrides).
+- `tests/resolve_conformance.rs` — 6 integration cases via WAT + Wasmtime.
+- `tests/conformance/{getaddrinfo_loopback,getaddrinfo_eai_noname}.c` —
+  C-side marker-enforced conformance.
+- `docs/adr/0007-p2-dns-resolver.md` — full decision tree.
+
+### NR_RESOLVE wire contract
+
+```
+NR_RESOLVE = 400  (inside upstream-reserved 387-423)
+
+a[0] = node_ptr      (u32 guest ptr; 0 = no node)
+a[1] = node_len      (i64; 0 = scan to NUL; cap 256)
+a[2] = service_ptr   (u32 guest ptr; 0 = no service)
+a[3] = service_len   (i64; 0 = scan to NUL; cap 64)
+a[4] = hints_ptr     (u32 guest ptr; 0 = no hints)
+a[5] = res_ptr_ptr   (u32 guest ptr to a u32 slot)
+
+Return:
+  >= 0   success; number of addrinfo nodes written
+  <  0   -EAI_* (musl-negative: -2 NONAME, -3 AGAIN, -4 FAIL, ...)
+```
+
+Marshal layout is written to `MARKER_ADDR + 8192` (4 KiB scratch
+region); head pointer is written to the slot at `res_ptr_ptr`. The
+linked-list `ai_next` pointers are guest-memory offsets (so the
+guest adapter can walk them via `wasm32` 4-byte pointer loads),
+but the `addrinfo` structs themselves are `malloc`'d by the guest
+adapter (musl owns those copies).
+
+### Test totals (P2-DNS close)
+
+Canonical source of truth: `bash tests/count_tests.sh`.
+
+| Source | Pre-P2-DNS → Post-P2-DNS |
+|---|---|
+| Rust unit (`#[cfg(test)]` in `src/**`) | 169 → **188** (+19) |
+| Rust integration (`tests/*.rs`) | 215 → **222** (+7) |
+| C conformance (`tests/conformance/*.c`) | 106 → **108** (+2) |
+| **Grand total** | **490 → 518** |
+
+Net Rust new tests:
+- `src/sys/resolver.rs::tests`: **18** unit tests
+  (`marshal_addrinfo_*`, `denylist_filter_*`, `cache_ttl_*`, `eai_to_ret_*`,
+   `from_env_*`).
+- `tests/resolve_conformance.rs`: **6** integration tests
+  (`resolve_loopback_v4_returns_127_0_0_1`, `resolve_eai_noname_on_bad_name`,
+   `resolve_denylist_blocks_resolved_ip`, `resolve_cache_hit_avoids_second_lookup`,
+   `resolve_timeout_returns_eai_again`, `resolve_hints_filter_to_v6_only`).
+- `src/cli/run.rs::tests` / `src/cli/serve.rs::tests`: **+1** unit test
+  (`ResolverConfig::from_env` round-trip added in commit 3).
+
+### Architectural decisions (P2-DNS)
+
+#### ADR 0007 — P2-DNS `NR_RESOLVE`
+
+Accepted. Pins:
+
+- `NR_RESOLVE = 400` in upstream-reserved range 387-423 (per
+  `syscall_64.tbl` header). Future project-private syscalls also live
+  in that range.
+- `ResolverBackend` trait for testability; `TokioResolverBackend` wraps
+  `hickory_resolver::TokioResolver 0.26` (bumped from 0.25 during
+  commit 1 to clear RUSTSEC-2026-0118 / RUSTSEC-2026-0119 in
+  `hickory-proto 0.25.2`); `StubResolver` for deterministic
+  integration tests.
+- EAI sign convention: negative (matches musl). No translation.
+- Snapshot non-persistence: `KernelSnapshot` does **not** serialize
+  `ResolverState`; rebuild on restore. Denylist is operator-supplied
+  via env vars on `serve`.
+- Per-`ProcessState` placement (mirrors `futex_table` from ADR 0006);
+  shared across `clone`/`fork` via `Arc<ProcessState>`.
+- Lock-then-clone-then-drop: `Arc<dyn ResolverBackend>` is cloned
+  while the `parking_lot::Mutex` guard is held, then the guard is
+  dropped before any `.await`. Never hold a parking_lot guard across
+  `.await` (carries from ADR 0001 §2 / 0006 §4).
+
+### Operational knobs
+
+- `EDGE_RESOLVER_DENY=<ip1>,<ip2>,...` — post-resolve IP denylist.
+  Filtered IPs are dropped; if all are dropped, returns `-EAI_NONAME`.
+- `EDGE_RESOLVER_CACHE_TTL_MS=<n>` — default 60_000.
+- `EDGE_RESOLVER_TIMEOUT_MS=<n>` — default 5_000. Exceeded → `-EAI_AGAIN`.
+
+### Deferred (out of scope for v1)
+
+- **UDP socket layer in kernel** (Path A) — separate, larger workstream.
+- **`AI_NUMERICHOST` / `AI_NUMERICSERV` hint flags** → `-EAI_BADFLAGS`
+  (musl handles in libc anyway).
+- **`getservbyname()`** — v1 numeric-only service strings.
+- **PTR (reverse DNS).**
+- **Per-record denylist** (currently IP-level post-filter).
+- **Snapshot persistence of denylist config** — operator re-issues env
+  vars on `serve`.
+- **`AI_CANONNAME` population** — v1 leaves `ai_canonname = 0`.
 
 ## Repo hygiene post-merge
 
