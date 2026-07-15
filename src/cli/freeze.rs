@@ -146,6 +146,23 @@ mod tests {
             .unwrap()
     }
 
+    /// Minimal WAT that calls `exit(0)` immediately on `_start` —
+    /// drives the freeze timeout down to the natural exit path
+    /// rather than the 10 s server-style fallback. Imports
+    /// `kernel.syscall` so the linker can satisfy the import.
+    const EXIT_FAST_WAT: &str = r#"
+        (module
+          (import "kernel" "syscall"
+            (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+          (memory (export "memory") 1)
+          (func (export "_start") (result i64)
+            ;; exit(0) → trap-as-exit, caught by `call_start`.
+            (call $syscall
+              (i64.const 60) (i64.const 0)
+              (i64.const 0) (i64.const 0)
+              (i64.const 0) (i64.const 0) (i64.const 0))))
+    "#;
+
     #[test]
     fn argv_requires_out_path() {
         let r = rt();
@@ -167,5 +184,49 @@ mod tests {
         let r = rt();
         let err = r.block_on(run_main(&["--out".into()])).unwrap_err();
         assert!(matches!(err, CliError::Args(_)), "got {err:?}");
+    }
+
+    /// P3-D3.5-followup-1 / ADR 0005: `freeze_snapshot` embeds the
+    /// SHA-256 of the wasm file bytes onto the returned
+    /// `KernelSnapshot.module_sha256` so a serve-side mismatch
+    /// becomes a hard error. Use a tmpfile to drive the
+    /// file-path entry point — no FS mocking needed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn freeze_writes_module_sha256_to_snapshot() {
+        let wasm_bytes = wat::parse_str(EXIT_FAST_WAT).expect("compile WAT");
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&wasm_bytes);
+        let expected: [u8; 32] = hasher.finalize().into();
+
+        let dir = tempdir_in_target();
+        let wasm_path = dir.join("guest.wasm");
+        std::fs::write(&wasm_path, &wasm_bytes).expect("write wasm");
+
+        let snap = freeze_snapshot(wasm_path.to_str().expect("utf8 path"), &[])
+            .await
+            .expect("freeze_snapshot must succeed on a fast-exit guest");
+        assert_eq!(
+            snap.module_sha256, expected,
+            "freeze must embed SHA-256 of the wasm bytes"
+        );
+        // Sanity: the fixture really did `exit(0)` so the snapshot
+        // captured a deterministic post-_start state (no listener,
+        // just the kernel seed + 1 page of linear memory).
+        assert_eq!(snap.exit_code, Some(crate::snapshot::endian::LeI32(0)));
+    }
+
+    /// Minimal `tempfile`-style helper scoped to this test module —
+    /// returns a fresh dir under `target/ci/freeze-hash-tests-<pid>`
+    /// that the caller can drop on test exit. Avoids pulling the
+    /// `tempfile` crate as a direct dep just for two tests.
+    fn tempdir_in_target() -> std::path::PathBuf {
+        let pid = std::process::id();
+        let dir = std::path::PathBuf::from(format!(
+            "target/ci/freeze-hash-tests-{pid}"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create tempdir");
+        dir
     }
 }
