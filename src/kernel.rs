@@ -8,7 +8,6 @@
 //! the dispatch table needs to compile.
 
 use std::sync::atomic::AtomicI32;
-use std::task::Waker;
 use std::time::Instant;
 
 use std::collections::{HashMap, HashSet};
@@ -259,27 +258,33 @@ impl MemoryKind {
     }
 }
 
-/// P3 Tier-6: per-child exit status recorded in `Kernel.children`.
+/// P3 Tier-6 + Tier-8 v2: per-child exit status recorded in
+/// `Kernel.children`.
 ///
-/// `waker` is `Option<Waker>` (not `SmallVec<[Waker; 2]>`) because
-/// the typical case is a single `wait4` caller per child. v1's
-/// `wait4` parked path replaces the waker on each new parked call
-/// — multiple concurrent waiters on the same child would clobber
-/// each other. This is documented as a known limitation; a future
-/// PR may promote `SmallVec` and support concurrent waiters.
+/// M5 replaces the v1 `waker: Option<Waker>` field with
+/// `notify: Arc<Notify>`. Rationale: v1's single-waiter
+/// `Option<Waker>` cannot safely host concurrent `wait4`
+/// callers on the same child — a second caller would clobber
+/// the first waker on `wait4_syscall`'s "park new waker"
+/// branch. The `Arc<Notify>` clone-on-lock-out pattern (ADR
+/// 0001 §2) supports multiple parked waiters: each waiter
+/// clones an `Arc` out of the children map under the lock,
+/// drops the lock, then calls `notify.notified().await`.
+/// `notify_waiters()` (fired on exit / exit_group) wakes every
+/// currently-registered waiter in one shot.
 ///
-/// `Waker` is `!Clone` and `!Debug`, so we implement `Debug`
-/// manually (it just shows `exited` + `exit_code`).
+/// `Clone` rebuilds a fresh `Arc<Notify>` (per ADR 0002 §5
+/// rebuild-on-restore) so the snapshot roundtrip path stays
+/// correct.
 pub struct ChildExitStatus {
     pub exit_code: i32,
     pub exited: bool,
-    /// P3 final-bundle sub-deliverable 4 — parked-waker path.
-    /// `Some(waker)` means a `wait4` caller is parked on this
-    /// child; the waker is fired when `exit()` / `exit_group()`
-    /// marks the child as `exited = true`. Locked via the parent's
-    /// `Kernel.children` mutex; never clone the waker out (use
-    /// `waker.wake_by_ref()` if you need to fire without moving).
-    pub waker: Option<Waker>,
+    /// P3 Tier-8 v2 / M5: per-child notify, multiple waiters
+    /// welcome. The handle is `Clone` (it's an `Arc`), so
+    /// parked waiters can take a clone out of the children
+    /// map under the mutex guard without holding the lock
+    /// across `.await` (per ADR 0001 §2 lock discipline).
+    pub notify: Arc<Notify>,
 }
 
 impl std::fmt::Debug for ChildExitStatus {
@@ -287,46 +292,46 @@ impl std::fmt::Debug for ChildExitStatus {
         f.debug_struct("ChildExitStatus")
             .field("exit_code", &self.exit_code)
             .field("exited", &self.exited)
-            .field("waker_is_set", &self.waker.is_some())
+            .field("notify_refcount", &Arc::strong_count(&self.notify))
             .finish()
     }
 }
 
 impl Clone for ChildExitStatus {
-    /// Clone **without** the waker — `Waker: !Clone`, and
-    /// snapshot rebuild path takes a `ChildExitStatus` by value
-    /// and re-inserts it into the live map. The original waker
-    /// (if any) is dropped; the rebuilt entry starts with
-    /// `waker: None`, and any subsequent parked-wait4 caller
-    /// will register a fresh waker.
+    /// Clone with a fresh `Arc<Notify>` — the snapshot rebuild
+    /// path takes a `ChildExitStatus` by value and re-inserts
+    /// it into the live map. The new entry must be observable
+    /// to a fresh `wait4` caller; the rebuilt `Arc<Notify>`
+    /// gives it a fresh notify primitive (matches ADR 0002
+    /// §5's rebuild-on-restore for `FutexTable`).
     fn clone(&self) -> Self {
         Self {
             exit_code: self.exit_code,
             exited: self.exited,
-            waker: None,
+            notify: Arc::new(Notify::new()),
         }
     }
 }
 
 impl ChildExitStatus {
-    /// Fresh child entry — not yet exited, no parked waker. Use
+    /// Fresh child entry — not yet exited, fresh notify. Use
     /// this for all kernel-side insertions (`fork`, `clone`,
     /// test setup).
-    pub const fn new(exit_code: i32) -> Self {
+    pub fn new(exit_code: i32) -> Self {
         Self {
             exit_code,
             exited: false,
-            waker: None,
+            notify: Arc::new(Notify::new()),
         }
     }
 
     /// Fresh child entry that's already reaped (test fixture
     /// helper — equivalent to `new(code)` then `mark_exited`).
-    pub const fn reaped(exit_code: i32) -> Self {
+    pub fn reaped(exit_code: i32) -> Self {
         Self {
             exit_code,
             exited: true,
-            waker: None,
+            notify: Arc::new(Notify::new()),
         }
     }
 }

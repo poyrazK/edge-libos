@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use tokio::sync::Notify;
 use wasmtime::Caller;
 
 use crate::errno::{EINVAL, EPERM, ESRCH};
@@ -129,32 +130,40 @@ pub async fn exit_group(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     0
 }
 
-/// Mark every entry in `Kernel.children` as `exited = true`, drain
-/// any parked wakers, and fire `child_event.notify_waiters()`.
+/// Mark every entry in `Kernel.children` as `exited = true`,
+/// drain per-child `Arc<Notify>` clones, and fire
+/// `child_event.notify_waiters()`.
 ///
-/// Lock discipline: take `children` briefly to mark + drain,
-/// drop before calling `wake()` on each waker — `Waker::wake`
-/// must not run under the parking_lot mutex guard (it can run
-/// arbitrary user code). `child_event.notify_waiters()` is a
-/// `tokio::sync::Notify` call; it's safe to invoke outside the
-/// lock because Notify is internally synchronized.
+/// Lock discipline: take `children` briefly to mark + clone
+/// notify handles into a Vec, drop before calling
+/// `notify.notify_waiters()` on each — `notify_waiters` must
+/// not run under the parking_lot mutex guard (it can wake
+/// arbitrary waiters whose contexts can run user code).
+/// `child_event.notify_waiters()` is a `tokio::sync::Notify`
+/// call; it's safe to invoke outside the lock because Notify
+/// is internally synchronized.
+///
+/// M5: replaces v1's `Waker::wake()` per-child path with the
+/// `Arc<Notify>` clone-on-lock-out pattern (ADR 0001 §2). The
+/// only behavior change is that multiple concurrent waiters
+/// on the same child PID now all wake — v1's single-waiter
+/// `Option<Waker>` would have only fired the most recent
+/// caller.
 fn reap_all_children(caller: &mut Caller<'_, Kernel>) {
-    // Phase 1: under the lock, mark + drain wakers into a Vec.
-    let drained: Vec<std::task::Waker> = {
+    // Phase 1: under the lock, mark + clone notify handles into a Vec.
+    let drained: Vec<Arc<Notify>> = {
         let kernel = caller.data();
         let mut children = kernel.process_state.children.lock();
         let mut out = Vec::new();
         for (_, status) in children.iter_mut() {
             status.exited = true;
-            if let Some(w) = status.waker.take() {
-                out.push(w);
-            }
+            out.push(status.notify.clone());
         }
         out
     };
-    // Phase 2: fire drained wakers (lock dropped).
-    for w in drained {
-        w.wake();
+    // Phase 2: fire drained notifies (lock dropped).
+    for n in drained {
+        n.notify_waiters();
     }
     // Phase 3: notify any parked `child_event.notified().await`
     // waiters (any-pid parked wait4 callers).
@@ -383,15 +392,22 @@ pub async fn sched_yield() -> i64 {
 /// for normal exit). The child entry is removed from
 /// `Kernel.children`.
 ///
-/// P3 final-bundle sub-deliverable 4 — parked-Waker path:
+/// P3 Tier-8 v2 / M5 — `Arc<Notify>` parked path:
 ///
 /// When called without `WNOHANG` and no child is currently reaped,
-/// we park on either the matching child's `ChildExitStatus::waker`
+/// we park on either the matching child's `ChildExitStatus::notify`
 /// (specific-PID wait) or `Kernel.child_event.notified()` (any-pid
-/// wait). Lock discipline: register the waker under the
-/// `children` lock, drop the lock, then `.await`. The waker
-/// closure re-takes the lock to drain; `Waker::wake` does not run
-/// under the lock.
+/// wait). Lock discipline: clone the `Arc<Notify>` handle out of
+/// the children map under the lock, drop the lock, then `.await`
+/// (ADR 0001 §2 — never hold `Mutex` across `.await`). The
+/// exit-side `reap_all_children` fires `notify.notify_waiters()`
+/// after dropping the children lock, so the wake itself does not
+/// happen under the lock.
+///
+/// M5 change vs. v1: replaces the 1ms polling block with the
+/// `Arc<Notify>::notified().await` path. Concurrent waiters on
+/// the same child PID are now supported (v1's single-waiter
+/// `Option<Waker>` would have only fired the most recent caller).
 pub async fn wait4_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     use crate::errno::ECHILD;
     let pid = a[0];
@@ -449,47 +465,38 @@ pub async fn wait4_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 
     // can fire on exit even if we weren't parked yet, which we
     // must accept gracefully).
     loop {
-        // Snapshot a fresh notify handle BEFORE we lock — `Arc`
-        // clone is cheap and lock-free. We can't take the lock
-        // and then construct a future that needs `&caller.data()`.
+        // Snapshot a fresh `Arc<Notify>` clone for the child we're
+        // waiting on BEFORE we lock — `Arc::clone` is cheap and
+        // lock-free. We can't take the lock and then construct a
+        // future that needs `&caller.data()`. Per-child notify
+        // (specific pid) or kernel-wide child_event (any pid).
         let child_event = caller.data().process_state.child_event.clone();
-        let specific_waker_pid: Option<i32> = if pid > 0 { Some(pid as i32) } else { None };
+        let specific_notify: Option<Arc<Notify>> = if pid > 0 {
+            let children = caller.data().process_state.children.lock();
+            children.get(&(pid as i32)).map(|c| c.notify.clone())
+        } else {
+            None
+        };
 
-        if let Some(sp) = specific_waker_pid {
-            // Specific-pid parked path: poll the child's `exited`
-            // flag under the lock every 1ms. We use a tight poll
-            // rather than a per-address `Notify` because
-            // `ChildExitStatus::waker` is a per-child `Option<Waker>`
-            // with a 1-waiter contract — concurrent waiters on
-            // the same child would clobber each other (see
-            // `ChildExitStatus::waker` doc comment for the v1
-            // known limitation). 1ms is fine for the test
-            // workload and avoids the per-waker registration
-            // complexity.
-            let mut budget: u32 = 0;
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                let exit_code_opt: Option<i32> = {
-                    let mut children = caller.data().process_state.children.lock();
-                    match children.get(&sp) {
-                        Some(c) if c.exited => {
-                            let exit_code = c.exit_code;
-                            children.remove(&sp);
-                            Some(exit_code)
-                        }
-                        None => return -ECHILD,
-                        _ => None,
-                    }
-                };
-                if let Some(exit_code) = exit_code_opt {
-                    return write_wstatus_and_return(caller, sp, exit_code, wstatus_ptr);
-                }
-                budget = budget.saturating_add(1);
-                if budget > 10_000 {
-                    // 10s of 1ms polling — pathological; bail out.
-                    return -ECHILD;
-                }
+        if let Some(specific) = specific_notify {
+            // Specific-pid parked path: clone the per-child
+            // `Arc<Notify>` out of the children map (already done
+            // above), drop the lock, then `notified().await`. The
+            // exit-side `reap_all_children` fires
+            // `notify.notify_waiters()` after dropping the children
+            // lock, so the wake itself does not happen under the
+            // lock. Per ADR 0001 §2 — never hold `Mutex` across
+            // `.await`.
+            specific.notified().await;
+            // Re-try the synchronous reap (the child may have
+            // exited AND been reaped already; we still try).
+            if let Some((picked, exit_code)) = try_reap(caller, pid) {
+                return write_wstatus_and_return(caller, picked, exit_code, wstatus_ptr);
             }
+            // No child ready after wake — loop back to re-park.
+            // (The child may have been removed by a concurrent
+            // waiter; the next iteration's ECHILD check at the
+            // top of the function handles that.)
         } else {
             // Any-pid parked path: block on child_event.notified().
             // The exit-side fires `child_event.notify_waiters()`
@@ -783,29 +790,30 @@ mod tests {
         drop(rt);
     }
 
-    /// M2: `register_and_signal` for a pid that already exists
+    /// M5: `register_and_signal` for a pid that already exists
     /// (e.g. via the `run_child` before-start insert path) updates
     /// the existing entry in place rather than overwriting it
-    /// with a fresh `waker = None`. The `waker: Option<Waker>`
-    /// field is preserved across the update.
+    /// with a fresh `notify`. The `Arc<Notify>` field is preserved
+    /// across the update — concurrent waiters parked on the
+    /// child's notify must still wake on the exit.
     #[test]
-    fn register_and_signal_updates_existing_entry_preserving_waker() {
+    fn register_and_signal_updates_existing_entry_preserving_notify() {
         use crate::kernel::ChildExitStatus;
         use std::collections::HashMap;
         use std::sync::Arc;
-        use std::task::Waker;
 
         let children_arc: Arc<parking_lot::Mutex<HashMap<i32, ChildExitStatus>>> =
             Arc::new(parking_lot::Mutex::new(HashMap::new()));
-        // pre-insert an entry with a sentinel waker so we can
-        // detect whether `register_and_signal` clears it.
-        let sentinel_waker: Waker = Arc::new(NoopWaker).into();
+        // pre-insert an entry so we can detect whether
+        // `register_and_signal` overwrites it (it must NOT —
+        // existing entries are updated in place).
+        let pre_notify = Arc::new(tokio::sync::Notify::new());
         children_arc.lock().insert(
             9,
             ChildExitStatus {
                 exit_code: 0,
                 exited: false,
-                waker: Some(sentinel_waker.clone()),
+                notify: pre_notify.clone(),
             },
         );
 
@@ -818,34 +826,111 @@ mod tests {
 
         super::register_and_signal(&children_arc, &tx, &child_event, 9, 137);
 
-        let (exited, exit_code) = {
+        let (exited, exit_code, post_notify_ptr) = {
             let guard = children_arc.lock();
             let entry = guard.get(&9).expect("entry for pid 9 must exist");
-            (entry.exited, entry.exit_code)
+            (
+                entry.exited,
+                entry.exit_code,
+                Arc::as_ptr(&entry.notify),
+            )
         };
         assert!(
             exited && exit_code == 137,
             "entry must be (exited=true, exit_code=137); got (exited={exited}, exit_code={exit_code})"
         );
+        // The update branch must preserve the existing notify
+        // handle (so a previously-parked waiter still wakes).
+        assert_eq!(
+            post_notify_ptr,
+            Arc::as_ptr(&pre_notify),
+            "register_and_signal must preserve the existing notify handle"
+        );
 
-        // (Note: the helper in production is called only on the
-        // run_child error paths where no waker was registered; the
-        // "preserves waker" property is observed by the run_child
-        // happy path which mutates the entry in place via a
-        // waker.take(). M2's test only validates the update
-        // branch's data correctness here.)
         let _ = rt.block_on(async { rx.recv().await });
         drop(rt);
     }
 
-    /// No-op Waker used by M2 tests to verify that the helper
-    /// doesn't accidentally clear an existing waker (the production
-    /// happy path explicitly takes it; the helper is the error
-    /// path that does not).
-    struct NoopWaker;
-    impl std::task::Wake for NoopWaker {
-        fn wake(self: Arc<Self>) {}
-        fn wake_by_ref(self: &Arc<Self>) {}
+    /// M5: two waiters parked on the SAME per-child
+    /// `ChildExitStatus::notify` both observe the wake when
+    /// `reap_all_children` (or the equivalent `notify_waiters`
+    /// fire) fires. v1's single-waiter `Option<Waker>` could only
+    /// host one; v2's `Arc<Notify>` supports N. This is the
+    /// load-bearing test for the multi-waiter contract that
+    /// motivated the M5 field migration.
+    ///
+    /// Note: `tokio::sync::Notify::notify_waiters()` only wakes
+    /// **currently-registered** waiters (per its docs). The test
+    /// uses a multi-thread runtime so the two waiter tasks and the
+    /// fire thread can run concurrently — the barrier ensures
+    /// both waiters register before the fire.
+    #[test]
+    fn concurrent_waiters_on_same_child_notify_both_wake() {
+        use crate::kernel::ChildExitStatus;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let children_arc: Arc<parking_lot::Mutex<HashMap<i32, ChildExitStatus>>> =
+            Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let notify_w1 = Arc::clone(&notify);
+        let notify_w2 = Arc::clone(&notify);
+        children_arc.lock().insert(
+            17,
+            ChildExitStatus {
+                exit_code: 0,
+                exited: false,
+                notify: Arc::clone(&notify),
+            },
+        );
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("rt");
+
+        let waker_results = rt.block_on(async {
+            let barrier = Arc::new(tokio::sync::Barrier::new(3));
+            let b1 = Arc::clone(&barrier);
+            let b2 = Arc::clone(&barrier);
+            let bf = Arc::clone(&barrier);
+            let w1 = tokio::spawn(async move {
+                b1.wait().await;
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    notify_w1.notified(),
+                )
+                .await
+                .is_ok()
+            });
+            let w2 = tokio::spawn(async move {
+                b2.wait().await;
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    notify_w2.notified(),
+                )
+                .await
+                .is_ok()
+            });
+            let fire_task = tokio::spawn(async move {
+                bf.wait().await;
+                // Yield once so the waiter tasks register their
+                // notified().await wakers against `notify`.
+                tokio::task::yield_now().await;
+                notify.notify_waiters();
+            });
+            let r1 = w1.await.expect("w1 panicked");
+            let r2 = w2.await.expect("w2 panicked");
+            fire_task.await.expect("fire panicked");
+            (r1, r2)
+        });
+        let (w1_ok, w2_ok) = waker_results;
+        assert!(
+            w1_ok && w2_ok,
+            "both waiters must wake on a single notify_waiters(); got w1={w1_ok} w2={w2_ok}"
+        );
+        drop(rt);
     }
 }
 
@@ -1086,14 +1171,7 @@ async fn run_child(
     // difference is the writer (child thread vs parent syscall).
     {
         let mut children = children_arc.lock();
-        children.insert(
-            child_pid,
-            ChildExitStatus {
-                exit_code: 0,
-                exited: false,
-                waker: None,
-            },
-        );
+        children.insert(child_pid, ChildExitStatus::new(0));
     }
 
     // Pick the exit code. `_start` returning cleanly (`Ok(_)`) wins.
@@ -1116,20 +1194,26 @@ async fn run_child(
     let _ = exit_tx.send((child_pid, exit_code));
 
     // M2: update the parent's `children` map for this pid on the
-    // way out — set `exited = true, exit_code`, drain any parked
-    // `waker` (v1 single-waiter Waker park; per-child `Arc<Notify>`
-    // lands in M5), and fire the kernel-wide `child_event` so any
-    // `wait4(-1)` parked on the parent wakes.
-    {
+    // way out — set `exited = true, exit_code`, snapshot the per-child
+    // `Arc<Notify>` (M5), drop the children lock, then fire
+    // `notify.notify_waiters()`. Per ADR 0001 §2 lock discipline,
+    // `notify_waiters()` MUST NOT run under the parking_lot mutex
+    // guard (it can wake arbitrary user code). The kernel-wide
+    // `child_event` fires after the per-child notify so any
+    // `wait4(-1)` parked on the parent also wakes.
+    let notify_snapshot: Option<Arc<Notify>> = {
         let mut children = children_arc.lock();
-        if let Some(entry) = children.get_mut(&child_pid) {
-            entry.exited = true;
-            entry.exit_code = exit_code;
-            if let Some(w) = entry.waker.take() {
-                drop(children); // release lock before waking
-                w.wake();
+        match children.get_mut(&child_pid) {
+            Some(entry) => {
+                entry.exited = true;
+                entry.exit_code = exit_code;
+                Some(entry.notify.clone())
             }
+            None => None,
         }
+    };
+    if let Some(n) = notify_snapshot {
+        n.notify_waiters();
     }
     child_event.notify_waiters();
 }
@@ -1156,14 +1240,7 @@ fn register_and_signal(
             entry.exited = true;
             entry.exit_code = exit_code;
         } else {
-            children.insert(
-                child_pid,
-                ChildExitStatus {
-                    exit_code,
-                    exited: true,
-                    waker: None,
-                },
-            );
+            children.insert(child_pid, ChildExitStatus::reaped(exit_code));
         }
     }
     let _ = exit_tx.send((child_pid, exit_code));
