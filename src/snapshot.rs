@@ -840,6 +840,46 @@ pub fn apply_snapshot_inherited_listeners(
     Ok(())
 }
 
+/// P3-D3.5-followup-1 (ADR 0005): confirm the snapshot's recorded
+/// module sha256 matches the wasm bytes the caller is about to load.
+/// MUST be called BEFORE any `apply_snapshot_*` so a mismatched wasm
+/// can be refused without partial-apply.
+///
+/// **Quirk — `[0u8; 32]` skip path.** Pre-existing v1 snapshots
+/// (frozen before this commit) decode with `snap.module_sha256`
+/// defaulting to all-zeros because the field has `#[serde(default)]`
+/// and the additive-precedent rule (ADR 0004 §4) keeps the format
+/// version at 1. We treat `[0u8; 32]` as "no hash recorded →
+/// skip verification" and `tracing::warn!` so the operator knows
+/// they're running an unverified restore. Re-freeze with the updated
+/// `edge-cli` to enable strict verification.
+///
+/// Wire cost on the apply path: one SHA-256 over `wasm_bytes`
+/// (cheap; <1 ms for any wasm of plausible size).
+pub fn verify_module_hash(
+    snap: &KernelSnapshot,
+    wasm_bytes: &[u8],
+) -> Result<(), SnapshotError> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(wasm_bytes);
+    let computed: [u8; 32] = hasher.finalize().into();
+    if snap.module_sha256 == [0u8; 32] {
+        tracing::warn!(
+            "snapshot has no recorded module sha256; skipping portability check. \
+             Re-freeze with the updated edge-cli to enable strict verification."
+        );
+        return Ok(());
+    }
+    if computed != snap.module_sha256 {
+        return Err(SnapshotError::ModuleHashMismatch {
+            snap_hash: snap.module_sha256,
+            wasm_hash: computed,
+        });
+    }
+    Ok(())
+}
+
 /// Step 1 of `apply_snapshot`: replace kernel-resident state (args,
 /// env, brk, fd-table, signals, vfs, clock, mm, rng). Takes only
 /// `&mut Kernel` — does NOT touch `Store<Kernel>`. Public for callers
