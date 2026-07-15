@@ -32,3 +32,11 @@ implementation has a contract to honor.
   the v2-supported clone flag set (`CLONE_VM | CLONE_THREAD |
   CLONE_CHILD_SETTID | CLONE_PARENT_SETTID`), tgid/tid routing for
   `kill` / `tgkill`, and the child-thread panic sentinel (139).
+- [ADR 0007 — P3 signal delivery (EINTR + default actions)](0007-p3-signal-delivery.md) — Proposed.
+  Pins v1 signal delivery: `deliverable()` decision (mask filter, SIGKILL/
+  SIGSTOP uncatchable, default-action table), the per-tid `signal_wakes`
+  `Notify` map, terminating-default via `exit_requested` (no trap), the
+  per-syscall `-EINTR` `select!` arms, the `SIGUSR1` → freeze quiescence
+  `quiesce_notify`, and the "pending signals not serialized" snapshot rule.
+  Explicitly excludes guest `sa_handler` invocation (spec §4.8).
+

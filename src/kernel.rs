@@ -7,7 +7,7 @@
 //! Step 4 of the P0 build order fleshes this out; the skeleton here is what
 //! the dispatch table needs to compile.
 
-use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::time::Instant;
 
 use std::collections::{HashMap, HashSet};
@@ -92,6 +92,25 @@ pub struct ProcessState {
     /// process. All threads in the same process share the same
     /// tgid; the init kernel has `tgid = 1`.
     pub tgid: i32,
+    /// Signal-delivery (ADR 0007): per-tid wake handles. When a
+    /// thread parks in a blocking syscall it clones its tid's
+    /// `Arc<Notify>` out (lazy-created here) and adds it as a
+    /// `select!` arm; `kill` / `tgkill` fire it after enqueuing the
+    /// signal so the parked syscall re-checks `deliverable()` and
+    /// returns `-EINTR`. Per-process scope is required because the
+    /// signal *sender* runs on a different fiber than the target
+    /// and cannot reach the target's `Kernel`. Runtime-only; never
+    /// serialized (like `child_event`).
+    pub signal_wakes: parking_lot::Mutex<HashMap<i32, Arc<Notify>>>,
+    /// Signal-delivery (ADR 0007): host-driven freeze quiescence.
+    /// `None` for a normal `run`; `edge-cli freeze` installs an
+    /// `Arc<Notify>` here and fires it from a `SIGUSR1` listener.
+    /// Blocking syscalls race it as an extra `select!` arm *only*
+    /// when `Some`, and on that wake continue normally (NOT
+    /// `-EINTR`) — the guest is left at a well-defined in-syscall
+    /// quiescent point for the snapshot. Runtime-only; never
+    /// serialized.
+    pub quiesce_notify: Option<Arc<Notify>>,
 }
 
 pub struct Kernel {
@@ -121,6 +140,15 @@ pub struct Kernel {
     /// Set by exit() / exit_group() syscalls. The host driver inspects this
     /// after each call returns and surfaces the code in its own exit code.
     pub exit_code: Option<i32>,
+    /// Signal-delivery (ADR 0007): set to `true` when a
+    /// default-terminating signal is delivered. `dispatch()` checks
+    /// it at the top and short-circuits every subsequent syscall to
+    /// `0`, so the guest's libc unwinds and the run path surfaces
+    /// `exit_code` (`128 + signo`). Distinct from `exit_code`
+    /// because an explicit `exit(0)` must NOT be treated as a
+    /// signal-termination (this flag stays `false` for normal exit).
+    /// Per-thread; not serialized.
+    pub exit_requested: AtomicBool,
     /// P2-C2: prctl(PR_SET_NAME) writes here; PR_GET_NAME reads from here.
     pub comm: [u8; 16],
     /// P3 Tier-8 v2 / M3: per-thread thread id. `gettid()` reads
@@ -390,6 +418,8 @@ impl Kernel {
             signals_pending: parking_lot::Mutex::new(Vec::new()),
             tgid_registry: parking_lot::Mutex::new(HashSet::from([1])),
             tgid: 1,
+            signal_wakes: parking_lot::Mutex::new(HashMap::new()),
+            quiesce_notify: None,
         });
 
         Self {
@@ -408,6 +438,7 @@ impl Kernel {
             signals: SignalState::new(),
             started_at: now,
             exit_code: None,
+            exit_requested: AtomicBool::new(false),
             comm: [0; 16],
             tid: 1,
             tgid: 1,
@@ -460,6 +491,7 @@ impl Kernel {
             signals: SignalState::new(),
             started_at: now,
             exit_code: None,
+            exit_requested: AtomicBool::new(false),
             comm: [0; 16],
             tid,
             tgid,
