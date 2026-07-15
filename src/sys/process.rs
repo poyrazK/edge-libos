@@ -724,7 +724,11 @@ pub async fn kill(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         // pid == -1
         return -EINVAL;
     }
-    // Append to the recorded-only queue (v2.5 delivery).
+    // Append to the pending queue, then wake every parked thread in
+    // this tgid so its blocking syscall re-checks `deliverable()`
+    // (ADR 0007 §3). Snapshot the tid list under the registry lock,
+    // drop it, then fire wakes outside the lock (ADR 0001 §2).
+    let tids: Vec<i32> = registry.iter().copied().collect();
     drop(registry);
     caller
         .data()
@@ -732,6 +736,9 @@ pub async fn kill(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         .signals_pending
         .lock()
         .push(sig as i32);
+    for tid in tids {
+        caller.data().process_state.wake_signal(tid);
+    }
     0
 }
 
@@ -781,6 +788,8 @@ pub async fn tgkill(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         .signals_pending
         .lock()
         .push(sig as i32);
+    // Wake the specific target thread (ADR 0007 §3).
+    caller.data().process_state.wake_signal(tid as i32);
     0
 }
 

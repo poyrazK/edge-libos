@@ -114,6 +114,18 @@ pub fn register(linker: &mut Linker<Kernel>) -> Result<()> {
 /// This function is `async` so P1 socket work drops in without re-architecture.
 /// Sync syscalls simply return immediately inside the future.
 pub async fn dispatch(mut caller: wasmtime::Caller<'_, Kernel>, nr: u32, a: [i64; 6]) -> i64 {
+    // Signal-delivery (ADR 0007 §4): once a default-terminating signal
+    // has been delivered, every subsequent syscall short-circuits to 0
+    // so the guest's libc unwinds toward exit. `exit_code` is already set
+    // to `128 + signo`; the run path surfaces it. `exit_requested` is set
+    // ONLY by signal termination, never by an explicit `exit(0)`.
+    if caller
+        .data()
+        .exit_requested
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return 0;
+    }
     match nr {
         // Process
         sys::process::NR_EXIT => sys::process::exit(&mut caller, a).await,

@@ -113,6 +113,33 @@ pub struct ProcessState {
     pub quiesce_notify: Option<Arc<Notify>>,
 }
 
+impl ProcessState {
+    /// Signal-delivery (ADR 0007 §3): return the `Arc<Notify>` a thread
+    /// with tid `tid` parks on, creating it on first use. A blocking
+    /// syscall clones this out before `.await`ing so `kill`/`tgkill` can
+    /// wake it; the sender and the target run on different fibers, so the
+    /// handle must live on the shared `ProcessState`.
+    pub fn signal_wake_for(&self, tid: i32) -> Arc<Notify> {
+        self.signal_wakes
+            .lock()
+            .entry(tid)
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone()
+    }
+
+    /// Signal-delivery (ADR 0007 §3): wake the thread with tid `tid` (if
+    /// it has ever parked). Mirrors the `reap_all_children`
+    /// clone-then-drop-then-notify discipline — the `Arc<Notify>` is
+    /// cloned out under the lock, the guard dropped, then
+    /// `notify_waiters()` fires outside the lock (ADR 0001 §2).
+    pub fn wake_signal(&self, tid: i32) {
+        let notify = self.signal_wakes.lock().get(&tid).cloned();
+        if let Some(n) = notify {
+            n.notify_waiters();
+        }
+    }
+}
+
 pub struct Kernel {
     /// Linear memory reference. Attached post-instantiation.
     ///
