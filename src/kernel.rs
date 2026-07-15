@@ -385,7 +385,7 @@ impl Kernel {
     ///   the snapshot was taken at, since the guest's
     ///   `accept4(inherited_fd, ...)` reads back that exact
     ///   number from linear memory (the WAT freeze fixture
-    ///   stores it at memory[300] for example).
+    ///   stores it at `memory\[300\]` for example).
     /// - `source_fd` — the parent's OS fd. We `dup` it (the
     ///   parent retains the original after we exit; matches
     ///   systemd's `dup2(2)`-on-inherit contract).
