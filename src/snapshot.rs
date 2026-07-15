@@ -1989,6 +1989,67 @@ mod tests {
         }
     }
 
+    // P3-D3.5-followup-1 / ADR 0005: `verify_module_hash` rejects a
+    // mismatched wasm before any apply step runs. The `[0u8; 32]`
+    // skip-verify quirk (no hash recorded on a pre-existing v1
+    // snapshot) keeps the additive-precedent compatibility path
+    // intact — see the docstring on `verify_module_hash` and
+    // ADR 0005.
+
+    #[test]
+    fn verify_module_hash_rejects_mismatch() {
+        let mut snap = make_test_snapshot();
+        // Pre-existing-handle pattern: nonzero bytes 0xAA…
+        snap.module_sha256 = [0xAAu8; 32];
+        // Caller-side bytes hash to 0xBB… → mismatch.
+        let wasm_bytes = vec![0xBBu8; 256];
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&wasm_bytes);
+        let expected_computed: [u8; 32] = hasher.finalize().into();
+        let err = verify_module_hash(&snap, &wasm_bytes)
+            .expect_err("verify must reject mismatched wasm hash");
+        match err {
+            SnapshotError::ModuleHashMismatch { snap_hash, wasm_hash } => {
+                assert_eq!(snap_hash, [0xAAu8; 32]);
+                // `wasm_hash` is the SHA-256 of the caller-side
+                // bytes, NOT the raw bytes themselves.
+                assert_eq!(wasm_hash, expected_computed);
+            }
+            other => panic!("expected ModuleHashMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_module_hash_accepts_matching() {
+        // Compute the hash of a known byte sequence, embed it, then
+        // verify with the SAME bytes — must return Ok(()). Covers
+        // the happy-path call from `edge-cli serve`.
+        let wasm_bytes = b"\0asm\x01\x00\x00\x00".to_vec();
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&wasm_bytes);
+        let digest: [u8; 32] = hasher.finalize().into();
+        let mut snap = make_test_snapshot();
+        snap.module_sha256 = digest;
+        verify_module_hash(&snap, &wasm_bytes)
+            .expect("matching hash must verify cleanly");
+    }
+
+    #[test]
+    fn verify_module_hash_skips_when_unset() {
+        // ADR 0005 D1 quirk: snap.module_sha256 == [0u8; 32] means
+        // "no hash recorded" — verify returns Ok(()) without
+        // inspecting `wasm_bytes` (the `[0xFF; 32]…` payload here
+        // would normally trip a strict compare, but the quirk
+        // explicitly skips). Logs a `tracing::warn!` (visible via
+        // RUST_LOG=warn).
+        let snap = make_test_snapshot(); // module_sha256 = [0u8; 32]
+        let wasm_bytes = vec![0xFFu8; 1024];
+        verify_module_hash(&snap, &wasm_bytes)
+            .expect("unset hash must short-circuit through skip-verify");
+    }
+
     /// P2-D3.5+review (F.2): the ephemeral-port-drift fix at lines 564-585
     /// must rewrite `SocketSnapshot.bound.port` from 0 to the materialized
     /// `TcpListener`'s `local_addr().port()` so `apply_snapshot`'s reopen
