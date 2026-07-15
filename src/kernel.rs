@@ -89,7 +89,18 @@ pub struct Kernel {
     /// `exit()` / `exit_group()`; `wait4` returns the cached exit
     /// code and removes the entry. Locked briefly — never held
     /// across `.await` (project lock discipline, see CLAUDE.md).
-    pub children: parking_lot::Mutex<HashMap<i32, ChildExitStatus>>,
+    ///
+    /// P3 Tier-8 v2: the mutex is wrapped in `Arc<...>` so the
+    /// forked child thread can clone the parent's table — the
+    /// child thread inserts the `ChildExitStatus` entry on its
+    /// own behalf (its own pid is keyed here when it forks
+    /// again) and updates `exited = true, exit_code = N` on
+    /// `exit()`. M3 introduces `ProcessState` which makes this
+    /// explicit; the M2 round just promotes the existing v1
+    /// field to `Arc<Mutex<>>` so the same storage can be shared
+    /// across threads without changing every `.lock()` callsite
+    /// (`Arc<Mutex<T>>` derefs to `Mutex<T>`).
+    pub children: Arc<parking_lot::Mutex<HashMap<i32, ChildExitStatus>>>,
     /// P3 Tier-6: per-kernel notifier for any-child wakeups. Used
     /// by `wait4` to wait on `pid == -1` / `pid == 0` (any child)
     /// when no specific child is currently ready. Fired by
@@ -348,7 +359,7 @@ impl Kernel {
             comm: [0; 16],
             futex_table: parking_lot::Mutex::new(FutexTable::default()),
             next_pid: AtomicI32::new(2),
-            children: parking_lot::Mutex::new(HashMap::new()),
+            children: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             child_event: Arc::new(Notify::new()),
             cpu_ns: 0,
         }

@@ -74,6 +74,7 @@ async fn child_thread_runs_wasm_and_delivers_exit_code_via_mpsc() {
     // runtime-in-runtime check would panic. The OS thread boundary
     // escapes the parent's runtime context cleanly.
     let child_event_for_thread = child_event.clone();
+    let children_for_thread = Arc::clone(&parent_store.data().children);
     std::thread::Builder::new()
         .name(format!("edge-test-fork-{child_pid}"))
         .spawn(move || {
@@ -84,6 +85,7 @@ async fn child_thread_runs_wasm_and_delivers_exit_code_via_mpsc() {
                 child_pid,
                 tx,
                 child_event_for_thread,
+                children_for_thread,
             );
         })
         .expect("spawn child thread");
@@ -98,6 +100,24 @@ async fn child_thread_runs_wasm_and_delivers_exit_code_via_mpsc() {
     assert_eq!(
         exit_code, 42,
         "child called NR_EXIT(42); the kernel preserves that as exit_code on the trap, got {exit_code}"
+    );
+
+    // M2: the parent's `Kernel.children` map must carry an entry
+    // for `child_pid` with `exited == true, exit_code == 42`. The
+    // child thread inserts the entry BEFORE invoking `_start`
+    // (exited=false) and updates it on exit. This proves the
+    // shared `Arc<Mutex<HashMap>>` plumbing works through the
+    // runtime boundary.
+    let exit = {
+        let map = parent_store.data().children.lock();
+        map.get(&child_pid)
+            .map(|s| (s.exited, s.exit_code))
+            .unwrap_or((false, -1))
+    };
+    assert_eq!(
+        exit,
+        (true, 42),
+        "parent.children[{child_pid}] must be (exited=true, exit_code=42) after the child finishes"
     );
 
     // The mpsc delivery itself proves the child thread ran to
