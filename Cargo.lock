@@ -419,6 +419,7 @@ dependencies = [
  "pretty_assertions",
  "rand",
  "serde",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",

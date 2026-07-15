@@ -1,4 +1,4 @@
-# ADR 0005 — P3 clone threads (v2 of fork/clone/wait4)
+# ADR 0006 — P3 clone threads (v2 of fork/clone/wait4)
 
 ## Status
 

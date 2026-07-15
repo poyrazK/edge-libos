@@ -192,6 +192,20 @@ pub struct KernelSnapshot {
     /// backward-compatible (postcard is forgiving of new fields).
     /// Snapshot format version stays at `SNAPSHOT_FORMAT_VERSION = 1`.
     pub cpu_ns: LeU64,
+    /// P3-D3.5-followup-1 (ADR 0005): SHA-256 of the freeze-side
+    /// `.wasm` file bytes, embedded so `serve` can refuse to apply
+    /// a snapshot onto a mismatched wasm (silent mis-execution
+    /// otherwise — see HANDOFF.md D3.5 §1 + ADR 0002 §8).
+    ///
+    /// Appended at end-of-struct with `#[serde(default)]` mirrors
+    /// the `inherited: bool` (ADR 0004 §4) and `cpu_ns` additive
+    /// precedent, so `SNAPSHOT_FORMAT_VERSION` stays at 1.
+    /// Pre-existing v1 snapshots decode with
+    /// `module_sha256 = [0u8; 32]`, which [`verify_module_hash`]
+    /// treats as "no hash recorded → skip verification" (logged via
+    /// `tracing::warn!` so operators see it).
+    #[serde(default)]
+    pub module_sha256: [u8; 32],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -470,6 +484,15 @@ pub enum SnapshotError {
         found: u32,
         supported: u32,
     },
+    /// P3-D3.5-followup-1 (ADR 0005): the `.wasm` bytes the user passed
+    /// to `edge-cli serve` do not match the freeze host's `.wasm`.
+    /// Embedding both hashes lets the operator immediately see which
+    /// snapshot and which wasm disagree (e.g. "frozen by CI build
+    /// #431 vs local dev build").
+    ModuleHashMismatch {
+        snap_hash: [u8; 32],
+        wasm_hash: [u8; 32],
+    },
     /// An underlying `std::fs` call failed during snapshot or restore.
     IoError(std::io::Error, String),
     /// A snapshot referenced a path that no longer exists on restore.
@@ -493,6 +516,15 @@ impl std::fmt::Display for SnapshotError {
                 f,
                 "snapshot format_version={found} does not match supported {supported}"
             ),
+            SnapshotError::ModuleHashMismatch {
+                snap_hash,
+                wasm_hash,
+            } => write!(
+                f,
+                "snapshot module hash mismatch: snap={} wasm={}; refusing to apply",
+                hex_lower32(snap_hash),
+                hex_lower32(wasm_hash),
+            ),
             SnapshotError::IoError(e, ctx) => {
                 write!(f, "io error during snapshot ({ctx}): {e}")
             }
@@ -506,6 +538,19 @@ impl std::fmt::Display for SnapshotError {
             SnapshotError::Postcard(s) => write!(f, "postcard error: {s}"),
         }
     }
+}
+
+/// Format a 32-byte hash as 64 lowercase hex chars. No new dep — just
+/// per-byte `{b:02x}` format. Used by the [`SnapshotError`] Display
+/// arm for `ModuleHashMismatch` so operators can `sha256sum` their
+/// file and see exactly why the snapshot was rejected.
+fn hex_lower32(b: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for byte in b {
+        use std::fmt::Write;
+        let _ = write!(s, "{byte:02x}");
+    }
+    s
 }
 
 impl std::error::Error for SnapshotError {
@@ -664,6 +709,12 @@ fn build_kernel_snapshot(kernel: &Kernel, pages: Vec<MemoryPageSnapshot>) -> Ker
         // is appended at the end of the struct so the postcard wire
         // format stays backward-compatible with v1 readers.
         cpu_ns: LeU64(kernel.cpu_ns),
+        // P3-D3.5-followup-1 (ADR 0005): the freeze CLI sets this
+        // to the real SHA-256 of the wasm bytes after `try_to_snapshot`
+        // returns. The guest-driven `NR_SNAPSHOT` path can't supply a
+        // wasm hash and leaves this at `[0u8; 32]`; `verify_module_hash`
+        // treats that sentinel as "no hash recorded → skip verify".
+        module_sha256: [0u8; 32],
     }
 }
 
@@ -788,6 +839,43 @@ pub fn apply_snapshot_inherited_listeners(
         let _ = kernel
             .fds
             .insert_at(*fd_num, Resource::Socket(shared.clone()));
+    }
+    Ok(())
+}
+
+/// P3-D3.5-followup-1 (ADR 0005): confirm the snapshot's recorded
+/// module sha256 matches the wasm bytes the caller is about to load.
+/// MUST be called BEFORE any `apply_snapshot_*` so a mismatched wasm
+/// can be refused without partial-apply.
+///
+/// **Quirk — `[0u8; 32]` skip path.** Pre-existing v1 snapshots
+/// (frozen before this commit) decode with `snap.module_sha256`
+/// defaulting to all-zeros because the field has `#[serde(default)]`
+/// and the additive-precedent rule (ADR 0004 §4) keeps the format
+/// version at 1. We treat `[0u8; 32]` as "no hash recorded →
+/// skip verification" and `tracing::warn!` so the operator knows
+/// they're running an unverified restore. Re-freeze with the updated
+/// `edge-cli` to enable strict verification.
+///
+/// Wire cost on the apply path: one SHA-256 over `wasm_bytes`
+/// (cheap; <1 ms for any wasm of plausible size).
+pub fn verify_module_hash(snap: &KernelSnapshot, wasm_bytes: &[u8]) -> Result<(), SnapshotError> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(wasm_bytes);
+    let computed: [u8; 32] = hasher.finalize().into();
+    if snap.module_sha256 == [0u8; 32] {
+        tracing::warn!(
+            "snapshot has no recorded module sha256; skipping portability check. \
+             Re-freeze with the updated edge-cli to enable strict verification."
+        );
+        return Ok(());
+    }
+    if computed != snap.module_sha256 {
+        return Err(SnapshotError::ModuleHashMismatch {
+            snap_hash: snap.module_sha256,
+            wasm_hash: computed,
+        });
     }
     Ok(())
 }
@@ -1287,6 +1375,7 @@ mod tests {
             comm: [0u8; 16],
             futex_table: vec![],
             cpu_ns: LeU64::default(),
+            module_sha256: [0u8; 32],
         };
         let bytes = postcard::to_stdvec(&snap).expect("encode");
         let back: KernelSnapshot = postcard::from_bytes(&bytes).expect("decode");
@@ -1881,6 +1970,7 @@ mod tests {
             comm: [0u8; 16],
             futex_table: vec![],
             cpu_ns: LeU64::default(),
+            module_sha256: [0u8; 32],
         }
     }
 
@@ -1897,6 +1987,69 @@ mod tests {
             }
             other => panic!("expected FormatVersionMismatch, got {other:?}"),
         }
+    }
+
+    // P3-D3.5-followup-1 / ADR 0005: `verify_module_hash` rejects a
+    // mismatched wasm before any apply step runs. The `[0u8; 32]`
+    // skip-verify quirk (no hash recorded on a pre-existing v1
+    // snapshot) keeps the additive-precedent compatibility path
+    // intact — see the docstring on `verify_module_hash` and
+    // ADR 0005.
+
+    #[test]
+    fn verify_module_hash_rejects_mismatch() {
+        let mut snap = make_test_snapshot();
+        // Pre-existing-handle pattern: nonzero bytes 0xAA…
+        snap.module_sha256 = [0xAAu8; 32];
+        // Caller-side bytes hash to 0xBB… → mismatch.
+        let wasm_bytes = vec![0xBBu8; 256];
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&wasm_bytes);
+        let expected_computed: [u8; 32] = hasher.finalize().into();
+        let err = verify_module_hash(&snap, &wasm_bytes)
+            .expect_err("verify must reject mismatched wasm hash");
+        match err {
+            SnapshotError::ModuleHashMismatch {
+                snap_hash,
+                wasm_hash,
+            } => {
+                assert_eq!(snap_hash, [0xAAu8; 32]);
+                // `wasm_hash` is the SHA-256 of the caller-side
+                // bytes, NOT the raw bytes themselves.
+                assert_eq!(wasm_hash, expected_computed);
+            }
+            other => panic!("expected ModuleHashMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_module_hash_accepts_matching() {
+        // Compute the hash of a known byte sequence, embed it, then
+        // verify with the SAME bytes — must return Ok(()). Covers
+        // the happy-path call from `edge-cli serve`.
+        let wasm_bytes = b"\0asm\x01\x00\x00\x00".to_vec();
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&wasm_bytes);
+        let digest: [u8; 32] = hasher.finalize().into();
+        let mut snap = make_test_snapshot();
+        snap.module_sha256 = digest;
+        verify_module_hash(&snap, &wasm_bytes).expect("matching hash must verify cleanly");
+    }
+
+    #[test]
+    fn verify_module_hash_skips_when_unset() {
+        // ADR 0005 D1 quirk: snap.module_sha256 == [0u8; 32] means
+        // "no hash recorded" — verify returns Ok(()) without
+        // inspecting `wasm_bytes` (the `[0xFF; 32]…` payload here
+        // would normally trip a strict compare, but the quirk
+        // explicitly skips). Logs a `tracing::warn!` (visible via
+        // RUST_LOG=warn).
+        let snap = make_test_snapshot(); // module_sha256 = [0u8; 32]
+        let wasm_bytes = vec![0xFFu8; 1024];
+        verify_module_hash(&snap, &wasm_bytes)
+            .expect("unset hash must short-circuit through skip-verify");
     }
 
     /// P2-D3.5+review (F.2): the ephemeral-port-drift fix at lines 564-585

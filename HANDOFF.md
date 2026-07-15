@@ -119,7 +119,7 @@ that the v1 contract defers:
    reachable through the dispatch path). `CLONE_FILES`,
    `CLONE_SIGHAND`, `CLONE_FS`, `CLONE_IO`, `CLONE_VFORK`,
    and the `CLONE_NEW*` namespace flags remain rejected per
-   ADR 0005 §6.
+   ADR 0006 §6.
 7. **`WUNTRACED` / `WCONTINUED` / `WNOWAIT` / `WALL`** —
    wait4 flag bits rejected with `-EINVAL`. Signal-aware wait4
    lands with a real signal delivery story.
@@ -187,10 +187,18 @@ stays at 1 (additive `inherited: bool` field with
 
 ### D3.5 follow-ups (deferred to a later branch)
 
-1. **Snapshot portability check** — `serve` trusts that the
+1. ~~**Snapshot portability check** — `serve` trusts that the
    `.wasm` path matches the freeze host's. Mismatch → apply
    succeeds but the guest mis-executes. Embed a module hash
-   in `KernelSnapshot` and bump `SNAPSHOT_FORMAT_VERSION`.
+   in `KernelSnapshot` and bump `SNAPSHOT_FORMAT_VERSION`.~~
+   ✅ **Landed as ADR 0005 / branch `p3-d35-followup-snapshot-portability`**
+   (8 commits, tip `3c68403`). Added SHA-256 of freeze-side
+   raw `.wasm` bytes as `KernelSnapshot.module_sha256` (no
+   format-version bump — additive precedent per ADR 0004 §4);
+   `verify_module_hash` rejects mismatched wasm on serve BEFORE
+   any apply step. Pre-existing v1 snapshots decode via the
+   `[0u8; 32]` skip-verify quirk; re-freeze with the updated
+   `edge-cli` to opt into strict verification.
 2. **SIGUSR1 → `SIGSNAPSHOT` queued signal → guest syscall
    path** — host-driven quiescence for guests that don't call
    `NR_SNAPSHOT` themselves. Needs a real signal-delivery
@@ -201,6 +209,67 @@ stays at 1 (additive `inherited: bool` field with
    `MARKER_ADDR`-pinned cleanup at the start of `chdir.c`.
 4. **`edge-cli bench` real body** — still a stub from D3.3.
    Land as D3.7.
+
+## P3-D3.5-followup-1 — snapshot portability check (ADR 0005)
+
+Closes D3.5 follow-up #1 on branch
+`p3-d35-followup-snapshot-portability`. The headline
+silent-mis-execution hazard: `edge-cli serve` used to trust the
+`.wasm` path matched the freeze host's. A stale or wrong wasm →
+`apply_snapshot_kernel_state` succeeds, the guest respawns, and
+the result is wrong function pointers / wrong global layout /
+silent failure observable only by reading output.
+
+ADR 0005 (accepted) pins the fix:
+
+- SHA-256 of the freeze-side raw `.wasm` file bytes, embedded
+  in `KernelSnapshot.module_sha256: [u8; 32]`.
+- `verify_module_hash` lives at the `serve` CLI boundary
+  (`src/cli/serve.rs::serve_loop`), called BEFORE the
+  three-step apply. Mismatch → `CliError::Snapshot(
+  SnapshotError::ModuleHashMismatch { snap_hash, wasm_hash } )`
+  → exit 1.
+- `SNAPSHOT_FORMAT_VERSION` stays at 1 (additive precedent per
+  ADR 0004 §4 — `#[serde(default)]` on the new field).
+- Pre-existing v1 snapshots decode with
+  `module_sha256 = [0u8; 32]`, which `verify_module_hash` treats
+  as "no hash recorded → skip verify with `tracing::warn!`".
+  Re-freeze with the updated `edge-cli` to opt into strict
+  verification.
+
+### Test totals (P3-D3.5-followup-1 close)
+
+| Source | Count (pre → post) |
+|---|---|
+| Rust unit | 144 → 160 (+16) |
+| Rust integration | 210 → 213 (+3) |
+| C conformance | 106 → 106 (unchanged) |
+| **Grand total** | **460 → 479** |
+
+Numbers are `bash tests/count_tests.sh` output (the canonical
+source of truth). Net Rust new tests: 6 explicit + 13 ambient
+(the lib test runner counts the snapshot-module tests,
+`cli::freeze::tests::*` and `cli::serve::tests::*` lib tests
+separately from the integration `tests/cli_migration_e2e.rs`
+count). Six explicit additions:
+
+- `src/snapshot.rs::tests::verify_module_hash_rejects_mismatch`
+- `src/snapshot.rs::tests::verify_module_hash_accepts_matching`
+- `src/snapshot.rs::tests::verify_module_hash_skips_when_unset`
+- `src/cli/freeze.rs::tests::freeze_writes_module_sha256_to_snapshot`
+- `src/cli/serve.rs::tests::serve_rejects_snapshot_with_wrong_wasm_hash`
+- `tests/cli_migration_e2e.rs::cli_migration_e2e_rejects_mismatched_wasm`
+
+### Architectural decisions (P3-D3.5-followup-1)
+
+#### ADR 0005 — snapshot module-hash portability check
+Accepted. Pins SHA-256 of the freeze-side raw `.wasm` file
+bytes inside `KernelSnapshot.module_sha256`; `verify_module_hash`
+refuses to apply on mismatch at the `serve` boundary. Closes
+the silent mis-execution caveat formerly called out by ADR 0002
+§8. Wire-format impact: +32 bytes per snapshot. Pre-existing v1
+snapshots still decode cleanly via the `[0u8; 32]` skip-verify
+quirk.
 
 ## Repo hygiene post-merge
 

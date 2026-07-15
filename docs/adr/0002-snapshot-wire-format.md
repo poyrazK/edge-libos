@@ -188,10 +188,14 @@ an SLA. P2-D3.7 provides `edge-cli bench <snap> <wasm> --iters 50`:
   hide (e.g. a single expensive syscall path that's slower
   5% of the time).
 
-Caveat (NOT addressed by this ADR): bench trusts the wasm
-path matches freeze's. Future: embed a module hash in
-`KernelSnapshot`, bump `SNAPSHOT_FORMAT_VERSION`, refuse to
-apply if hashes disagree.
+Caveat (formerly NOT addressed by this ADR — closed by
+ADR 0005): serve/bench used to trust the wasm path matches
+freeze's. ADR 0005 pins SHA-256 of the freeze-side `.wasm`
+bytes inside `KernelSnapshot.module_sha256` and refuses to
+apply on mismatch via `verify_module_hash` at the `serve`
+boundary. Pre-existing v1 snapshots still decode (the
+`#[serde(default)]` quirk yields `[0u8; 32]`); re-freeze with
+the updated `edge-cli` to opt into strict verification.
 
 ## Consequences
 

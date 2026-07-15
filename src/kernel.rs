@@ -54,14 +54,14 @@ pub struct ClockState {
 ///
 /// The split between per-process and per-thread state is described
 /// in detail in the M3 commit message of branch
-/// `p3-v2-fork-clone-threads` (see also ADR 0005 §1). The TL;DR:
+/// `p3-v2-fork-clone-threads` (see also ADR 0006 §1). The TL;DR:
 /// every field on `Kernel` that is shared across threads in the
 /// same process moves to `ProcessState`. Every field that is
 /// per-thread (or per-`Store`) stays on `Kernel`. The split is
 /// enforced by the contract of `clone()` on `Kernel`: per-thread
 /// fields deep-copy, per-process fields `Arc::clone`.
 ///
-/// ADR 0005 §1 documents the full table.
+/// ADR 0006 §1 documents the full table.
 pub struct ProcessState {
     /// P3 Tier-4: monotonic PID counter for `clone()` and `fork()`.
     /// Starts at 2 because PID 1 is reserved for the init kernel
@@ -135,7 +135,7 @@ pub struct Kernel {
     /// P3 Tier-8 v2 / M3: per-process state. Cloned (Arc-clone)
     /// into every thread in the same process. Replaces the v1
     /// direct fields (`children`, `child_event`, `futex_table`,
-    /// `next_pid`) which all moved to `ProcessState` per ADR 0005
+    /// `next_pid`) which all moved to `ProcessState` per ADR 0006
     /// §1.
     pub process_state: Arc<ProcessState>,
     /// P2 metering (ADR 0004 §4): monotonic CPU time consumed by
@@ -426,7 +426,7 @@ impl Kernel {
     ///     group leader). The decision is made by the caller;
     ///     this helper takes `tgid` as a parameter.
     ///   * `comm`, `exit_code`, `signals` follow the per-thread
-    ///     clone contract from ADR 0005 §1.
+    ///     clone contract from ADR 0006 §1.
     ///   * `args` / `env` / `rng_seed` are fresh per-thread.
     ///
     /// The caller (fork_syscall / clone_syscall) is responsible

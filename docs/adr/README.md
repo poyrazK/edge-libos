@@ -20,7 +20,12 @@ implementation has a contract to honor.
   Pins the v1 contract for `NR_SNAPSHOT = 123` (guest-driven quiescence),
   `EDGE_SERVE_FD_<N>` env-var fd-inherit shape, and the subprocess flow
   that `edge-cli migrate` orchestrates via `Command::new(current_exe)`.
-- [ADR 0005 — P3 clone threads (v2 of fork/clone/wait4)](0005-p3-clone-threads.md) — Accepted.
+- [ADR 0005 — snapshot module-hash portability check (P3-D3.5-followup-1)](0005-snapshot-module-hash.md) — Accepted.
+  Pins SHA-256 of the freeze-side `.wasm` bytes inside
+  `KernelSnapshot.module_sha256`; `verify_module_hash` refuses to
+  apply on mismatch at the `serve` boundary. Closes the silent
+  mis-execution caveat formerly called out by ADR 0002 §8.
+- [ADR 0006 — P3 clone threads (v2 of fork/clone/wait4)](0006-p3-clone-threads.md) — Accepted.
   Pinned the per-thread Kernel field split (`Arc<ProcessState>`),
   `Arc<Engine>` + `Arc<Module>` ownership, `Arc<Notify>` clone-on-lock-out
   multi-waiter pattern (replacing v1's single-waiter `Option<Waker>`),
