@@ -32,6 +32,7 @@
 pub mod bench;
 pub mod error;
 pub mod freeze;
+pub mod migrate;
 pub mod run;
 pub mod serve;
 pub mod subcommand;
@@ -87,6 +88,7 @@ pub fn run_main_from<I: IntoIterator<Item = String>>(args: I) -> i32 {
         Subcommand::Serve => rt.block_on(serve::run_main(&rest)),
         Subcommand::Bench => rt.block_on(bench::run_main(&rest)),
         Subcommand::Trace => rt.block_on(trace::run_main(&rest)),
+        Subcommand::Migrate => rt.block_on(migrate::run_main(&rest)),
     };
 
     match res {
