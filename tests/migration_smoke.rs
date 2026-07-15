@@ -118,12 +118,41 @@ fn migration_roundtrip_preserves_kernel_state() -> Result<()> {
 /// compiled in-process; the migrate subcommand runs the
 /// in-process roundtrip directly.
 ///
+/// P2-D3.5: migrate now defaults to the subprocess path; tests
+/// that want to exercise the in-process roundtrip opt in via
+/// the `MIGRATE_IN_PROCESS=1` env var (the migrate subcommand
+/// checks for it at startup). We RAII-guard the env var so the
+/// test doesn't leak state to other tests in the same process.
+///
 /// Plain `#[test]` (not `#[tokio::test]`) because `run_main_from`
 /// builds its own current-thread tokio runtime internally; nesting
 /// `block_on` inside a `#[tokio::test]` runtime triggers "Cannot
 /// start a runtime from within a runtime".
 #[test]
 fn migration_in_process_via_edge_cli_migrate() -> Result<()> {
+    // RAII guard for MIGRATE_IN_PROCESS=1 — set on entry,
+    // restored to its prior value on exit. This keeps the test
+    // hermetic and prevents cross-test env pollution.
+    struct Guard(Option<String>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            // SAFETY: set_var/remove_var are unsafe in recent
+            // Rust but the test process is single-threaded for
+            // env mutations (we serialize via the Drop at end
+            // of test).
+            unsafe {
+                match self.0.as_ref() {
+                    Some(v) => std::env::set_var("MIGRATE_IN_PROCESS", v),
+                    None => std::env::remove_var("MIGRATE_IN_PROCESS"),
+                }
+            }
+        }
+    }
+    let prev = std::env::var("MIGRATE_IN_PROCESS").ok();
+    // SAFETY: see Guard::drop.
+    unsafe { std::env::set_var("MIGRATE_IN_PROCESS", "1") };
+    let _guard = Guard(prev);
+
     // Write the marker wasm to a temp file (migrate reads the
     // wasm from disk, per its argv contract).
     let tmp = tempfile::Builder::new()
@@ -144,10 +173,11 @@ fn migration_in_process_via_edge_cli_migrate() -> Result<()> {
 }
 
 /// Spawn the actual `edge-cli` binary against a tiny wasm and
-/// assert exit 0. Skipped by default — pays for subprocess spawn
-/// + Wasmtime compile. Run with `--ignored`.
+/// assert exit 0. P2-D3.5: this is the production-shape subprocess
+/// test (the migrate subcommand now spawns `edge-cli freeze` and
+/// `edge-cli serve` as children). Cheap enough to run in CI on
+/// every push.
 #[tokio::test]
-#[ignore = "subprocess smoke; run with `cargo test --profile ci -- --ignored`"]
 async fn migration_smoke_subprocess_roundtrip() -> Result<()> {
     use std::process::Command;
 
@@ -158,18 +188,31 @@ async fn migration_smoke_subprocess_roundtrip() -> Result<()> {
     let bytes = wat::parse_str(MARKER_WAT)?;
     std::fs::write(tmp.path(), &bytes)?;
 
-    // cargo test sets CARGO_BIN_EXE_<name> for the workspace's
-    // binaries when running through `cargo test` / `cargo nextest`.
-    // We require it explicitly — guessing from `current_exe().parent()`
-    // produces a path that doesn't exist on most setups (the test
-    // binary and edge-cli are not siblings). If you see this panic,
-    // you're running the test binary directly instead of via cargo.
-    let bin = std::env::var("CARGO_BIN_EXE_edge-cli").unwrap_or_else(|_| {
-        panic!(
-            "CARGO_BIN_EXE_edge-cli not set — run via \
-             `cargo test --profile ci -p edge-libos --test migration_smoke -- --ignored`"
-        )
-    });
+    // Resolve the edge-cli binary. cargo test usually sets
+    // CARGO_BIN_EXE_edge-cli; if not (e.g. running the test
+    // binary directly), fall back to `<test_exe_dir>/../edge-cli`
+    // — cargo places workspace bins at `target/<profile>/` while
+    // integration-test artifacts live under `target/<profile>/deps/`,
+    // so we walk up one level.
+    let bin = std::env::var("CARGO_BIN_EXE_edge-cli")
+        .ok()
+        .or_else(|| {
+            let exe = std::env::current_exe().ok()?;
+            let dir = exe.parent()?;
+            let candidate = dir.join("..").join("edge-cli");
+            if candidate.is_file() {
+                Some(candidate.to_string_lossy().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "cannot locate edge-cli binary: set CARGO_BIN_EXE_edge-cli or \
+                 run via `cargo test --profile ci -p edge-libos \
+                 --test migration_smoke`"
+            )
+        });
 
     let status = Command::new(&bin)
         .arg("migrate")

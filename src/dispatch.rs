@@ -268,6 +268,11 @@ pub async fn dispatch(mut caller: wasmtime::Caller<'_, Kernel>, nr: u32, a: [i64
         sys::process::NR_WAIT4 => sys::process::wait4_syscall(&mut caller, a).await,
         sys::futex::NR_FUTEX => sys::futex::futex(&mut caller, a).await,
 
+        // P2-D3.5: NR_SNAPSHOT — guest-driven quiescence. The guest
+        // passes a path pointer; the kernel writes a postcard snapshot
+        // to it. See ADR 0004 §1 and `sys::process::snapshot_syscall`.
+        sys::process::NR_SNAPSHOT => sys::process::snapshot_syscall(&mut caller, a).await,
+
         // P2-C2: memory
         sys::memory::NR_MREMAP => sys::memory::mremap(&mut caller, a),
 
@@ -428,6 +433,8 @@ pub fn syscall_name(nr: u32) -> &'static str {
         sys::process::NR_FORK => "fork",
         sys::process::NR_WAIT4 => "wait4",
         sys::futex::NR_FUTEX => "futex",
+        // P2-D3.5: NR_SNAPSHOT (123) — see ADR 0004 §1.
+        sys::process::NR_SNAPSHOT => "snapshot",
 
         sys::random::NR_GETRANDOM => "getrandom",
 

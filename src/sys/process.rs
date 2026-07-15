@@ -59,6 +59,17 @@ pub const NR_CLONE: u32 = 56;
 pub const NR_FORK: u32 = 57;
 pub const NR_WAIT4: u32 = 61;
 
+// P2-D3.5: NR_SNAPSHOT — guest-driven quiescence for the
+// freeze/snapshot path. See ADR 0004 §1. The number (123) is
+// a reserved range in the Linux x86-64 NR space (post-
+// 4-bit-namespace collapse; some older kernels report
+// numbers in this range as `sys_set_tid_address` etc. but
+// 123 is currently unused on a stock x86-64 5.x+ kernel).
+// v1 is a synchronous guest→host call: the kernel encodes
+// the live `KernelSnapshot`, writes the bytes to the
+// guest-provided path, and returns the byte count.
+pub const NR_SNAPSHOT: u32 = 123;
+
 // prctl(2) options we recognize (subset — others return -EINVAL).
 pub const PR_SET_NAME: i32 = 15;
 pub const PR_GET_NAME: i32 = 16;
@@ -587,6 +598,91 @@ pub async fn tgkill(_caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 #[allow(dead_code)]
 fn _kill_perm() -> i64 {
     -EPERM
+}
+
+/// `snapshot(snap_path_ptr)` — P2-D3.5 guest-driven quiescence.
+///
+/// Reads a NUL-terminated absolute path string from guest linear
+/// memory (via `crate::mem::guest_str`), encodes the live kernel
+/// into a `KernelSnapshot` postcard (`try_to_snapshot` +
+/// `encode_snapshot`), and writes the bytes to the path via
+/// `std::fs::write`. Returns the byte count on success.
+///
+/// Contract (ADR 0004 §1):
+/// - `snap_path_ptr == 0` → `-EFAULT` (refuses a NULL pointer
+///   rather than silently writing to ".").
+/// - Out-of-memory `snap_path_ptr` → `-EFAULT` via the existing
+///   `guest_str` choke point.
+/// - Write failure (`ENOSPC`, `EACCES`, …) → `-EIO`. The host
+///   drives `_start` to the syscall, then blocks waiting; a
+///   write failure is the operator's signal that the destination
+///   is misconfigured (perms, full disk).
+/// - The snapshot is taken at this call site, **inside the
+///   syscall handler**. The kernel is single-threaded (per ADR
+///   0001 §2 — `Store: !Send`/`!Sync` pins one fiber per host
+///   thread), so there is no race window between the snapshot
+///   and the subsequent write.
+///
+/// Lock discipline: snapshots already acquire short-lived
+/// `parking_lot::Mutex` guards internally (see
+/// `try_to_snapshot` and its callers); we do not hold any
+/// kernel lock across the await boundary here.
+pub async fn snapshot_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+    use crate::errno::{EFAULT, EIO};
+    let snap_path_ptr = a[0];
+
+    // NULL pointer → -EFAULT. Per ADR 0004 §1, refusing NULL is
+    // explicit (vs. silently coercing to "." or "/").
+    if snap_path_ptr == 0 {
+        return -EFAULT;
+    }
+
+    // Read the path string from guest memory. `guest_str` caps
+    // the search at the given `max_len` to avoid scanning to the
+    // end of linear memory on a missing NUL. We pick 4096 (one
+    // page) — long enough for any realistic absolute path
+    // including a tmp-dir /run/user/1000 prefix.
+    let snap_path: std::path::PathBuf = match mem::guest_str(caller, snap_path_ptr, 4096) {
+        Ok(s) => std::path::PathBuf::from(s),
+        Err(e) => return e,
+    };
+
+    // Snapshot the live kernel + linear memory. The pattern mirrors
+    // `src/cli/migrate.rs` — `try_to_snapshot(kernel_ref, &store_ref)`
+    // takes the inner store by reference, sidestepping the borrow
+    // checker on `caller`. The `caller` reborrows to `&*caller`
+    // here so the AsContext impl is dispatched through deref.
+    let snap = match crate::snapshot::try_to_snapshot(caller.data(), &*caller) {
+        Ok(s) => s,
+        Err(_e) => {
+            // `try_to_snapshot` currently never errors at
+            // runtime (memory reads here only fail on a
+            // missing Kernel memory_kind, which only happens
+            // if the host forgot to attach_memory — that's
+            // a host construction error surfaced by the
+            // freeze CLI, not a guest-facing errno). Map to
+            // -EIO conservatively.
+            return -EIO;
+        }
+    };
+
+    // Encode + write. We use the existing `write_snapshot_file`
+    // helper so the error mapping lives in one place (per the
+    // snapshot/io.rs module doc).
+    match crate::snapshot::io::write_snapshot_file(&snap_path, &snap) {
+        Ok(()) => {
+            // Re-encode to learn the byte count (a fresh encode
+            // is cheap relative to the file write; cheaper than
+            // teaching `write_snapshot_file` to also return the
+            // length).
+            let bytes = match crate::snapshot::encode_snapshot(&snap) {
+                Ok(b) => b,
+                Err(_) => return -EIO,
+            };
+            bytes.len() as i64
+        }
+        Err(_) => -EIO,
+    }
 }
 
 #[cfg(test)]

@@ -375,6 +375,95 @@ impl Kernel {
         self.memory = Some(MemoryKind::Shared(mem));
     }
 
+    /// P2-D3.5 (ADR 0004 §2): attach pre-opened TCP listener fds
+    /// inherited from the parent process — typically via
+    /// systemd-style socket activation. Each input pair is
+    /// `(target_fd, source_fd)`:
+    ///
+    /// - `target_fd` — the kernel fd slot the inherited
+    ///   listener will live at. This MUST match the fd number
+    ///   the snapshot was taken at, since the guest's
+    ///   `accept4(inherited_fd, ...)` reads back that exact
+    ///   number from linear memory (the WAT freeze fixture
+    ///   stores it at `memory\[300\]` for example).
+    /// - `source_fd` — the parent's OS fd. We `dup` it (the
+    ///   parent retains the original after we exit; matches
+    ///   systemd's `dup2(2)`-on-inherit contract).
+    ///
+    /// For each pair we:
+    ///   1. `dup` the source fd so we own an independent
+    ///      handle.
+    ///   2. Wrap the dup'd fd in a `tokio::net::TcpListener`
+    ///      via `std::net::TcpListener::from_raw_fd` +
+    ///      `tokio::net::TcpListener::from_std`.
+    ///   3. Build a `SocketInner::from_inherited_listener`
+    ///      (no bind step, `so_reuseaddr = true`,
+    ///      `is_acceptor = true`) and wrap it in a
+    ///      `SharedSocket`.
+    ///   4. Insert as `Resource::Socket` at `target_fd` via
+    ///      `FdTable::insert_at`.
+    ///
+    /// Returns a `Vec<(u32, SharedSocket)>` of the constructed
+    /// listeners keyed by `target_fd` so callers can re-attach
+    /// them after `apply_snapshot_kernel_state` resets `self.fds`
+    /// — see
+    /// [`crate::snapshot::apply_snapshot_inherited_listeners`].
+    ///
+    /// Lock discipline: `parking_lot::Mutex` on `self.fds`
+    /// (already enforced by `FdTable::insert_at`); the fds lock
+    /// is never held across `.await`. `libc::dup` is a sync
+    /// syscall.
+    #[allow(unsafe_code)]
+    pub fn attach_inherited_listeners(
+        &mut self,
+        fds: &[(u32, i32)],
+    ) -> Vec<(u32, crate::fd::SharedSocket)> {
+        use crate::fd::{Resource, SockAddr, SocketInner};
+        use std::os::unix::io::FromRawFd;
+        let mut out = Vec::new();
+        for &(target_fd, source_fd) in fds {
+            if source_fd < 0 {
+                continue;
+            }
+            // SAFETY: `libc::dup(source_fd)` returns a fresh owned
+            // fd that we transfer ownership of into the
+            // std::net::TcpListener below via `from_raw_fd`.
+            // On drop, the TcpListener will close that fd.
+            let dup_fd = unsafe { libc::dup(source_fd) };
+            if dup_fd < 0 {
+                continue;
+            }
+            let std_listener = unsafe { std::net::TcpListener::from_raw_fd(dup_fd) };
+            let listener = match tokio::net::TcpListener::from_std(std_listener) {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            let bound = match listener.local_addr() {
+                Ok(std::net::SocketAddr::V4(v4)) => SockAddr::V4 {
+                    port: v4.port(),
+                    addr: v4.ip().octets(),
+                },
+                Ok(std::net::SocketAddr::V6(v6)) => SockAddr::V6 {
+                    port: v6.port(),
+                    addr: v6.ip().octets(),
+                },
+                Err(_) => continue,
+            };
+            let inner = SocketInner::from_inherited_listener(listener, bound);
+            let shared: crate::fd::SharedSocket =
+                std::sync::Arc::new(parking_lot::Mutex::new(inner));
+            // `insert_at` returns `Err` if the fd is already
+            // occupied; we silently skip those (the operator
+            // inherited a duplicate, which is a config error
+            // we don't want to crash on).
+            let _ = self
+                .fds
+                .insert_at(target_fd, Resource::Socket(shared.clone()));
+            out.push((target_fd, shared));
+        }
+        out
+    }
+
     /// Borrow the linear memory (compatibility shim), or `-EFAULT` if
     /// not yet attached. Returns `-EINVAL` if the variant is
     /// `MemoryKind::Shared` — syscall handlers that don't take

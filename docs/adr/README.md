@@ -16,3 +16,7 @@ implementation has a contract to honor.
   Pinned the v1 freeze-then-serve migration flow: module portability,
   drain semantics, format-version interaction, accepted-stream +
   abstract-namespace rejection, and the `Subcommand::Migrate` wrapper.
+- [ADR 0004 — freeze / serve wire contract (P2-D3.5)](0004-freeze-serve-wire.md) — Proposed.
+  Pins the v1 contract for `NR_SNAPSHOT = 123` (guest-driven quiescence),
+  `EDGE_SERVE_FD_<N>` env-var fd-inherit shape, and the subprocess flow
+  that `edge-cli migrate` orchestrates via `Command::new(current_exe)`.
