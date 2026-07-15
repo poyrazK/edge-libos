@@ -3,7 +3,7 @@
 use wasmtime::Caller;
 
 use crate::errno::{EINVAL, EPERM, ESRCH};
-use crate::kernel::Kernel;
+use crate::kernel::{ChildExitStatus, Kernel};
 use crate::mem;
 
 // Linux x86-64 `wait4(2)` options (`linux/wait.h`).
@@ -170,6 +170,7 @@ pub fn set_robust_list() -> i64 {
 /// starting at 2 (PID 1 is reserved for the init kernel — `getpid()` returns
 /// 1). Ordering is `Relaxed`; no other field is gated on PID order.
 pub async fn clone_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
+
     let flags = a[0];
     // a[1] = child_stack (unused — guest passes 0; v1 has no stack model).
     let ptid_ptr = a[2];
@@ -215,6 +216,63 @@ pub async fn clone_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 
     }
 
     child_tid as i64
+}
+
+/// `fork()` — P3 Tier-5 v1.
+///
+/// **v1 returns the child PID in the parent; the child fiber is
+/// NOT resumed in this PR.** This is the deferred-resume contract
+/// documented in `impelementationplan` §P3 Tier-5: spawning a
+/// separate fiber requires either driving a second
+/// `Store<Kernel>` from a fresh thread, or yielding the current
+/// fiber and routing child execution through it — both options
+/// need a follow-up that lands behind the multi-fiber (P3
+/// Tier-3) and ADR 0003 (live migration) stories.
+///
+/// What v1 DOES do:
+///   1. Allocate a fresh PID via `Kernel.next_pid.fetch_add`.
+///   2. Insert `ChildExitStatus { exited: false, exit_code: 0,
+///      waker: None }` into `Kernel.children`. The parent can
+///      later `wait4` for this PID; the wait4 parked-Waker path
+///      (sub-deliverable 4) will block until something marks
+///      the child as `exited = true`. In v1 nothing ever marks
+///      a forked child as exited (because nothing executes the
+///      child), so a parent `wait4(child_pid)` parks forever
+///      unless the parent also calls `exit()` itself — `exit()`
+///      in `reap_all_children` marks all live children as
+///      exited.
+///
+/// What v1 does NOT do (the deferred parts):
+///   * Resume the child on its own fiber / Store.
+///   * Set up a separate stack for the child.
+///   * CoW the linear memory pages between parent and child.
+///   * Wire the `CLONE_VM` / `CLONE_THREAD` / `CLONE_FILES`
+///     semantics (rejected with -EINVAL anyway in clone(56)).
+///
+/// The fork handler is registered in `src/dispatch.rs`. A guest
+/// calling `fork()` gets back `child_pid > 0` and continues;
+/// the child PID is observable via `Kernel.children` for the
+/// parent. The child-fiber-resume work lands in a follow-up that
+/// piggybacks on P3 Tier-3 (threads + shared memory) + ADR 0003
+/// (live migration).
+pub async fn fork_syscall(caller: &mut Caller<'_, Kernel>, _a: [i64; 6]) -> i64 {
+    // Allocate a fresh PID (PID 1 is reserved for the init
+    // kernel; clone starts at 2, so fork follows the same
+    // convention). Atomic ordering: Relaxed — no other field is
+    // gated on PID order.
+    let child_pid = caller
+        .data()
+        .next_pid
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Insert the child into the children table. The child is
+    // not yet exited; the parent can wait4 for it. See the
+    // handler doc comment for the deferred-resume contract.
+    let mut children = caller.data().children.lock();
+    children.insert(child_pid, ChildExitStatus::new(0));
+    drop(children);
+
+    child_pid as i64
 }
 
 /// `sched_yield()` → 0. CPython sometimes calls this in poll loops; we
