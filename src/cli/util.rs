@@ -31,9 +31,15 @@ pub async fn call_start(instance: &Instance, store: &mut Store<Kernel>) -> CliRe
             .await
             .map_err(CliError::from)
             .map(|_| ())
+    } else if let Ok(start) = instance.get_typed_func::<(), i64>(&mut *store, "_start") {
+        start
+            .call_async(&mut *store, ())
+            .await
+            .map_err(CliError::from)
+            .map(|_| ())
     } else {
         Err(CliError::Args(
-            "no _start export (expected () -> () or () -> i32)".to_string(),
+            "no _start export (expected () -> (), () -> i32, or () -> i64)".to_string(),
         ))
     }
 }

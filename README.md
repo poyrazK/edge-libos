@@ -23,6 +23,11 @@ through the full async pivot (epoll/eventfd): ✅
 **P2** — production-ish single instance: ✅
 **P3** — multi-fiber, snapshot, live migration: ✅ (0.2.0)
 
+P2 adds pre-init snapshot/restore (sub-5 ms cold start), host-backed DNS
+resolver, default-deny egress policy, fuel-based per-request CPU-ms
+metering ([ADR 0004](./docs/adr/0004-metering-semantics.md)), and minimal
+AF_UNIX support, alongside the literal CPython cross-compile pipeline.
+
 P3 lands the multi-fiber story (wasmtime `wasm_threads` +
 `shared_memory` + `wasm_shared_everything_threads` all enabled —
 PR #12), futex(2) FUTEX_WAIT/WAKE (ADR 0001), futex-table snapshot
@@ -33,9 +38,12 @@ live x86→ARM migration flow (`edge-cli migrate` subcommand).
 `Kernel.memory_kind` accepts either a regular `Memory` or a
 `SharedMemory`. Format version stays at 1 (ADR 0002 §4).
 
-See [`HANDOFF.md`](./HANDOFF.md) for the running status; see
-[`docs/adr/0003-p3-live-migration.md`](./docs/adr/0003-p3-live-migration.md)
-for the migration contract.
+See [`HANDOFF.md`](./HANDOFF.md) for the running status. The
+ADR index is at [`docs/adr/README.md`](./docs/adr/README.md);
+specific contracts: [0001 futex](./docs/adr/0001-p3-futex-semantics.md),
+[0002 snapshot](./docs/adr/0002-snapshot-wire-format.md),
+[0003 migration](./docs/adr/0003-p3-live-migration.md),
+[0004 metering](./docs/adr/0004-metering-semantics.md).
 
 ## P1 DoD (satisfied)
 
@@ -70,6 +78,18 @@ P2-D3.5 lands: `NR_SNAPSHOT=123` (guest-driven quiescence),
 `edge-cli freeze` and `edge-cli serve` bodies (replacing the
 D3.3 stubs), and the subprocess variant of `edge-cli migrate`.
 See `HANDOFF.md` for the per-deliverable breakdown.
+
+P2 added `statx(2)` + a C test (B4), `dup/dup2/dup3` + shared-state
+refactor + 5 C tests (B5), the identity/process/signal/time/ioctl/
+AF_UNIX/sendmsg/recvmsg/ppoll/epoll_pwait/eventfd/getrandom/pipe2/
+close_range/sysinfo/times batch + literal CPython DoD gate (C1-C3),
+the snapshot foundation `postcard` + serde `KernelSnapshot` roundtrip
+(D1), the linear-memory blob overlay (D2, ADR 0002 sparse per-page
+layout + `LeU*`/`LeI*` newtypes + `tests/snapshot_roundtrip.rs`
+end-to-end conformance gate), freeze/serve/cold-start bench on
+`edge-cli` (D3), and the per-request fuel budget + `CliError::Metered`
+trap path + metering DoD smoke (`edge_cli_metering_smoke`,
+ADR 0004).
 
 P3 adds `futex(2)` conformance (P3 Tier-1), `clone(56)` v1 (P3
 Tier-4), `fork(57)` v1 (P3 Tier-5), `wait4(61)` v1 with parked-Waker
@@ -110,8 +130,11 @@ Concretely P2 lands (in order):
    50-iteration cold-start benchmark under 5 ms p50.
 4. **DNS + egress** (E1-E2) — default-deny egress policy, host-backed
    resolver via `hickory-resolver`, new `NR_RESOLVE` syscall.
-5. **Metering** (F1-F2) — epoch-based interruption, 100 ms default
-   budget per request, `cpu_ms_used` accounting.
+5. **Metering** (F1-F2) — fuel-based per-request CPU budget
+   (`--cpu-budget-ms <ms>` on `edge-cli run`/`serve`/`bench`), Wasmtime
+   `consume_fuel` + `set_fuel` instrumentation, `CliError::Metered`
+   trap classification. Implementation lives on branch
+   `p2-metering-hooks`; ADR 0004 captures the contract.
 6. **Literal CPython DoD** (A6) — `guest/cpython` submodule cross-compile
    via `zig cc`, real `edge-cli run serve_one_request.py` produces
    `200 OK` from a real CPython+uvicorn+FastAPI wasm module.

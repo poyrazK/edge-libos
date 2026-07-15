@@ -41,7 +41,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::sync::Notify;
 
-use edge_libos::snapshot::endian::LeU32;
+use edge_libos::snapshot::endian::{LeU32, LeU64};
 use edge_libos::snapshot::{
     ClockStateSnapshot, FdSnapshot, LinearAllocatorSnapshot, SignalStateSnapshot, VfsSnapshot,
 };
@@ -315,6 +315,7 @@ fn futex_table_roundtrips_via_snapshot() -> Result<()> {
         exit_code: None,
         comm: [0u8; 16],
         futex_table: futex_wire,
+        cpu_ns: LeU64::default(),
     };
     let wire = postcard::to_stdvec(&snap).expect("encode snapshot");
     let snap_decoded: KernelSnapshot = postcard::from_bytes(&wire).expect("decode snapshot");

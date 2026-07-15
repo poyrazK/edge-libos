@@ -58,6 +58,12 @@ pub enum CliError {
     /// `edge-cli bench` observed an SLA violation (e.g. p50 >= 5ms
     /// gate) and wants to fail the run. Maps to exit code 1.
     Bench(String),
+
+    /// Per-request CPU budget exhausted (ADR 0004 §6). The guest
+    /// trapped on `OutOfFuel`; the message names the consumed vs
+    /// budgeted µs. Maps to exit code 1 for `run`; `serve` and
+    /// `bench` catch this trap and count it instead of propagating.
+    Metered(String),
 }
 
 impl fmt::Display for CliError {
@@ -74,6 +80,7 @@ impl fmt::Display for CliError {
             CliError::Wasmtime(e) => write!(f, "wasmtime: {e}"),
             CliError::Io(e) => write!(f, "io: {e}"),
             CliError::Bench(msg) => write!(f, "bench: {msg}"),
+            CliError::Metered(msg) => write!(f, "metered: {msg}"),
         }
     }
 }
@@ -87,7 +94,7 @@ impl std::error::Error for CliError {
             // wasmtime 45.0.3 — chain it through `Display` instead.
             CliError::Wasmtime(_) => None,
             CliError::Io(e) => Some(e),
-            CliError::Bench(_) => None,
+            CliError::Bench(_) | CliError::Metered(_) => None,
         }
     }
 }
