@@ -162,7 +162,7 @@ fn memory_attached_has_expected_size() -> Result<()> {
     let module = common::compile_wat(&engine, WAT)?;
     block_on(async {
         let (store, _instance) = common::instantiate_async(&engine, &linker, &module).await?;
-        let mem = store.data().memory.as_ref().expect("memory attached");
+        let mem = store.data().memory().expect("memory attached");
         let size = mem.data(&store).len();
         assert_eq!(size, 65536, "1-page wasm memory must be 64 KiB");
         Ok::<(), anyhow::Error>(())

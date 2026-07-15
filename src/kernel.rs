@@ -17,7 +17,7 @@ use tokio::sync::Notify;
 
 use rand::rngs::SmallRng;
 use rand::{RngCore, SeedableRng};
-use wasmtime::Memory;
+use wasmtime::{Memory, SharedMemory, StoreContext, StoreContextMut};
 
 /// P2-D1: 32-byte seed captured at construction so the RNG can be
 /// deterministically reconstructed by `apply_snapshot`. Fits inside
@@ -37,7 +37,15 @@ pub struct ClockState {
 
 pub struct Kernel {
     /// Linear memory reference. Attached post-instantiation.
-    pub memory: Option<Memory>,
+    ///
+    /// P3 Tier-3: the field holds a [`MemoryKind`] (regular `Memory` or
+    /// `SharedMemory`) so the kernel can host guests that declare
+    /// `(memory … shared)` (used by `i32.atomic.wait` /
+    /// `memory.atomic.notify`). The legacy `memory()` accessor still
+    /// returns `&Memory` and returns `-EINVAL` on the shared variant —
+    /// syscall handlers don't care about the variant; only the snapshot
+    /// read/write paths need both.
+    pub memory: Option<MemoryKind>,
     pub fds: FdTable,
     pub vfs: Vfs,
     pub mm: LinearAllocator,
@@ -77,6 +85,121 @@ pub struct Kernel {
     /// follow-up lands the blocking variant once PR 4's child
     /// fiber can actually call `exit`).
     pub child_event: Arc<Notify>,
+}
+
+/// P3 Tier-3: the linear-memory handle stored on the kernel.
+///
+/// P3 final-bundle (see `docs/adr/0003-p3-live-migration.md` + this PR's
+/// sub-deliverable 2) lets one `Kernel` host either a regular
+/// `wasmtime::Memory` (the default — for guests without `(memory …
+/// shared)`) or a `wasmtime::SharedMemory` (for guests that declare
+/// `(memory … shared)` to use `i32.atomic.wait` /
+/// `memory.atomic.notify`). Both variants expose the same byte-buffer
+/// surface; the difference is in the wasmtime API: `Memory::data`
+/// takes a `Store` reference (per-Store), while `SharedMemory::data`
+/// returns `&[UnsafeCell<u8>]` (cross-Store safe). `MemoryKind`
+/// abstracts over both with a single byte-buffer API that the
+/// snapshot read/write paths can consume.
+///
+/// `MemoryKind` is a live-state field on `Kernel` and is **not**
+/// part of `KernelSnapshot` — the snapshot carries the page
+/// bytes (per ADR 0002 §3 sparse per-page layout), and the
+/// memory handle itself is rebuilt by attaching the freshly-
+/// instantiated `Memory` (or `SharedMemory`) via
+/// `attach_memory` / `attach_shared_memory` after restore.
+#[derive(Debug)]
+pub enum MemoryKind {
+    Owned(Memory),
+    Shared(SharedMemory),
+}
+
+impl MemoryKind {
+    /// Borrow the inner [`Memory`]. Returns `None` if this is the
+    /// `Shared` variant.
+    pub fn as_memory(&self) -> Option<&Memory> {
+        match self {
+            Self::Owned(m) => Some(m),
+            Self::Shared(_) => None,
+        }
+    }
+
+    /// Borrow the inner [`SharedMemory`]. Returns `None` if this is the
+    /// `Owned` variant.
+    pub fn as_shared_memory(&self) -> Option<&SharedMemory> {
+        match self {
+            Self::Owned(_) => None,
+            Self::Shared(m) => Some(m),
+        }
+    }
+
+    /// Borrow the linear-memory bytes as `&[u8]`. The `Owned` variant
+    /// requires a `Store` (matching wasmtime's `Memory::data`
+    /// signature); the `Shared` variant ignores the store argument
+    /// (matching wasmtime's `SharedMemory::data` which returns
+    /// `&[UnsafeCell<u8>]` without a store — safe because the backing
+    /// pointer is stable for the lifetime of the `SharedMemory`).
+    ///
+    /// # Safety (Shared variant)
+    ///
+    /// The caller must treat the returned slice as if it were
+    /// `&[UnsafeCell<u8>]` — concurrent guest fibers may modify
+    /// the bytes. Snapshot/restore paths are single-threaded by
+    /// construction (the freeze CLI is at a quiescent point;
+    /// restore is on a fresh kernel with no live guest), so
+    /// non-atomic access is safe there.
+    pub fn data<'a, T: 'static>(
+        &self,
+        store: impl Into<StoreContext<'a, T>>,
+    ) -> &'a [u8] {
+        match self {
+            Self::Owned(m) => m.data(store),
+            Self::Shared(m) => unsafe {
+                std::slice::from_raw_parts(m.data().as_ptr() as *const u8, m.data_size())
+            },
+        }
+    }
+
+    /// Borrow the linear-memory bytes as `&mut [u8]`. Same safety
+    /// contract as [`Self::data`].
+    pub fn data_mut<'a, T: 'static>(
+        &self,
+        store: impl Into<StoreContextMut<'a, T>>,
+    ) -> &'a mut [u8] {
+        match self {
+            Self::Owned(m) => m.data_mut(store),
+            Self::Shared(m) => unsafe {
+                std::slice::from_raw_parts_mut(m.data().as_ptr() as *mut u8, m.data_size())
+            },
+        }
+    }
+
+    /// Grow the linear memory by `delta` wasm pages. `Owned` requires
+    /// a store (per `Memory::grow`); `Shared` ignores it (per
+    /// `SharedMemory::grow`, which mutates the shared backing
+    /// directly).
+    pub fn grow<T: 'static>(
+        &self,
+        store: impl wasmtime::AsContextMut<Data = T>,
+        delta: u64,
+    ) -> anyhow::Result<u64> {
+        match self {
+            Self::Owned(m) => m
+                .grow(store, delta)
+                .map_err(|e| anyhow::anyhow!("Memory::grow failed: {e:?}")),
+            Self::Shared(m) => m
+                .grow(delta)
+                .map_err(|e| anyhow::anyhow!("SharedMemory::grow failed: {e}")),
+        }
+    }
+
+    /// Byte length of the linear memory. `Owned` requires a store;
+    /// `Shared` does not (per `SharedMemory::data_size`).
+    pub fn data_size<T: 'static>(&self, store: impl wasmtime::AsContext<Data = T>) -> usize {
+        match self {
+            Self::Owned(m) => m.data_size(store),
+            Self::Shared(m) => m.data_size(),
+        }
+    }
 }
 
 /// P3 Tier-6: per-child exit status recorded in `Kernel.children`.
@@ -162,13 +285,38 @@ impl Kernel {
         seed
     }
 
-    /// Attach the linear memory. Called from instantiation setup.
+    /// Attach the linear memory. Called from instantiation setup for
+    /// guests that declare a regular `(memory N)` (no `shared` flag).
     pub fn attach_memory(&mut self, mem: Memory) {
-        self.memory = Some(mem);
+        self.memory = Some(MemoryKind::Owned(mem));
     }
 
-    /// Borrow the linear memory, or `-EFAULT` if not yet attached.
+    /// Attach a shared linear memory. Called from instantiation setup
+    /// for guests that declare `(memory N M shared)` — required for
+    /// `i32.atomic.wait` / `memory.atomic.notify`. The `SharedMemory`
+    /// type is wasmtime's cross-Store-safe handle.
+    pub fn attach_shared_memory(&mut self, mem: SharedMemory) {
+        self.memory = Some(MemoryKind::Shared(mem));
+    }
+
+    /// Borrow the linear memory (compatibility shim), or `-EFAULT` if
+    /// not yet attached. Returns `-EINVAL` if the variant is
+    /// `MemoryKind::Shared` — syscall handlers that don't take
+    /// shared-memory args can keep using this accessor and surface
+    /// `-EINVAL` consistently. The snapshot read/write paths use
+    /// [`Kernel::memory_kind`] instead.
     pub fn memory(&self) -> Result<&Memory, i64> {
+        match self.memory.as_ref() {
+            None => Err(-(crate::errno::EFAULT)),
+            Some(MemoryKind::Owned(m)) => Ok(m),
+            Some(MemoryKind::Shared(_)) => Err(-(crate::errno::EINVAL)),
+        }
+    }
+
+    /// Borrow the [`MemoryKind`] enum, or `-EFAULT` if not yet attached.
+    /// Used by the snapshot read/write paths, which need to handle both
+    /// the `Owned` and `Shared` variants.
+    pub fn memory_kind(&self) -> Result<&MemoryKind, i64> {
         self.memory.as_ref().ok_or(-(crate::errno::EFAULT))
     }
 
