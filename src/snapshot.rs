@@ -541,9 +541,9 @@ impl std::fmt::Display for SnapshotError {
 }
 
 /// Format a 32-byte hash as 64 lowercase hex chars. No new dep — just
-/// per-byte `{b:02x}` format. Used by [`SnapshotError::Display`] for
-/// `ModuleHashMismatch` so operators can `sha256sum` their file and
-/// see exactly why the snapshot was rejected.
+/// per-byte `{b:02x}` format. Used by the [`SnapshotError`] Display
+/// arm for `ModuleHashMismatch` so operators can `sha256sum` their
+/// file and see exactly why the snapshot was rejected.
 fn hex_lower32(b: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
     for byte in b {
