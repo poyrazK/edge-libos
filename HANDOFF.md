@@ -21,7 +21,7 @@ the P3 final-bundle PR lands **seven sub-deliverables** on
 | 3 | pthread_mutex two-fiber test (`MemoryKind::Shared` end-to-end) | ✅ committed |
 | 4 | `wait4` parked-Waker path (any-pid + specific-pid) | ✅ committed |
 | 5 | `fork(57)` v1 handler + C conformance + 4 Rust integration tests | ✅ committed |
-| 6 | `edge-cli migrate` subcommand + 2 Rust smoke tests + 1 `#[ignore]`'d subprocess test | ✅ committed |
+| 6 | `edge-cli migrate` subcommand + 3 Rust smoke tests (1 `#[ignore]`'d subprocess) + Shared-memory roundtrip test | ✅ committed |
 | 7 | HANDOFF.md regen + `Cargo.toml` 0.2.0 + README bump | ✅ this commit |
 
 ## Test totals (P3 final-bundle close)
@@ -29,9 +29,9 @@ the P3 final-bundle PR lands **seven sub-deliverables** on
 | Source | Count |
 |---|---|
 | Rust unit (`#[cfg(test)]` in `src/**`) | 123 |
-| Rust integration (`tests/*.rs`) | 196 |
+| Rust integration (`tests/*.rs`) | 197 |
 | C conformance (`tests/conformance/*.c`) | 105 |
-| **Grand total** | **424** |
+| **Grand total** | **425** |
 
 All 4 CI gates must be green on push:
 - `cargo clippy --profile ci --all-targets -- -D warnings`

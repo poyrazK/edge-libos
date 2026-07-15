@@ -63,7 +63,17 @@ pub async fn run_main(args: &[String]) -> CliResult<i32> {
     // call if so, then snapshot whatever state the kernel has at
     // instantiation time.
     if let Ok(start) = instance.get_typed_func::<(), i64>(&mut store, "_start") {
-        let _ = start.call_async(&mut store, ()).await;
+        match start.call_async(&mut store, ()).await {
+            Ok(0) => {}
+            Ok(rc) => eprintln!(
+                "edge-cli migrate: guest _start returned non-zero exit code {rc}; \
+                 snapshot will reflect post-exit kernel state"
+            ),
+            Err(e) => eprintln!(
+                "edge-cli migrate: guest _start trapped ({e}); \
+                 snapshot will reflect trap-time kernel state"
+            ),
+        }
     }
 
     // Phase 2: snapshot the live kernel.
@@ -90,8 +100,8 @@ pub async fn run_main(args: &[String]) -> CliResult<i32> {
     // v1 migrate only supports Owned-memory guests. Use the public
     // Owned-path API: kernel-state apply first (no Store borrow),
     // then memory apply. The Shared-memory path lives in
-    // `apply_snapshot_to_memory_inner` (private) and is exercised
-    // by `tests/futex_conformance.rs::pthread_mutex_two_fiber_wake_on_unlock`.
+    // `dispatch_memory_apply` (private) and is exercised
+    // by `tests/futex_conformance.rs::memory_kind_shared_atomic_wait32_not_equal`.
     crate::snapshot::apply_snapshot_kernel_state(&snap_restored, fresh_store.data_mut())
         .map_err(CliError::Snapshot)?;
     let mem_clone = match fresh_store.data().memory() {

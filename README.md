@@ -60,14 +60,14 @@ artifact and requires `zig cc` + a git submodule — see `guest/build.sh`.
 ## Test totals
 
 - **123** Rust unit tests (in `#[cfg(test)]` modules under `src/`)
-- **196** Rust integration tests (across `tests/*.rs`)
+- **197** Rust integration tests (across `tests/*.rs`)
 - **105** C conformance tests (`tests/conformance/*.c`, marker-enforced)
-- **Total: 424 tests.** Source of truth: `bash tests/count_tests.sh`.
+- **Total: 425 tests.** Source of truth: `bash tests/count_tests.sh`.
 
 P3 adds `futex(2)` conformance (P3 Tier-1), `clone(56)` v1 (P3
 Tier-4), `fork(57)` v1 (P3 Tier-5), `wait4(61)` v1 with parked-Waker
-path (P3 Tier-6), `pthread_mutex_two_fiber_wake_on_unlock`
-(`MemoryKind::Shared` end-to-end), and 3 migration-smoke tests for
+path (P3 Tier-6), `memory_kind_shared_atomic_wait32_not_equal`
+(`MemoryKind::Shared` end-to-end), and 4 migration-smoke tests for
 the `edge-cli migrate` subcommand (P3 Tier-7 / ADR 0003 v1 flow).
 
 Source of truth: `bash tests/count_tests.sh`. The conformance runner
