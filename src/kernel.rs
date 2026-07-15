@@ -8,6 +8,7 @@
 //! the dispatch table needs to compile.
 
 use std::sync::atomic::AtomicI32;
+use std::task::Waker;
 use std::time::Instant;
 
 use std::collections::HashMap;
@@ -80,10 +81,10 @@ pub struct Kernel {
     pub children: parking_lot::Mutex<HashMap<i32, ChildExitStatus>>,
     /// P3 Tier-6: per-kernel notifier for any-child wakeups. Used
     /// by `wait4` to wait on `pid == -1` / `pid == 0` (any child)
-    /// when the calling child hasn't exited yet. Reserved for the
-    /// full parked-wait path (PR 3 ships WNOHANG-only semantics; a
-    /// follow-up lands the blocking variant once PR 4's child
-    /// fiber can actually call `exit`).
+    /// when no specific child is currently ready. Fired by
+    /// `exit()` / `exit_group()` (sub-deliverable 4 — parked-Waker
+    /// path). Per-child parking goes through the matching
+    /// `ChildExitStatus::waker` instead.
     pub child_event: Arc<Notify>,
 }
 
@@ -204,14 +205,74 @@ impl MemoryKind {
 
 /// P3 Tier-6: per-child exit status recorded in `Kernel.children`.
 ///
-/// In v1 only `exited` and `exit_code` are populated; a future PR
-/// adds `waker` registration for blocking `wait4` (PR 3 ships
-/// WNOHANG-only — the plan explicitly defers blocking wait4 until
-/// PR 4's child fiber can actually trigger an exit).
-#[derive(Debug, Clone)]
+/// `waker` is `Option<Waker>` (not `SmallVec<[Waker; 2]>`) because
+/// the typical case is a single `wait4` caller per child. v1's
+/// `wait4` parked path replaces the waker on each new parked call
+/// — multiple concurrent waiters on the same child would clobber
+/// each other. This is documented as a known limitation; a future
+/// PR may promote `SmallVec` and support concurrent waiters.
+///
+/// `Waker` is `!Clone` and `!Debug`, so we implement `Debug`
+/// manually (it just shows `exited` + `exit_code`).
 pub struct ChildExitStatus {
     pub exit_code: i32,
     pub exited: bool,
+    /// P3 final-bundle sub-deliverable 4 — parked-waker path.
+    /// `Some(waker)` means a `wait4` caller is parked on this
+    /// child; the waker is fired when `exit()` / `exit_group()`
+    /// marks the child as `exited = true`. Locked via the parent's
+    /// `Kernel.children` mutex; never clone the waker out (use
+    /// `waker.wake_by_ref()` if you need to fire without moving).
+    pub waker: Option<Waker>,
+}
+
+impl std::fmt::Debug for ChildExitStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildExitStatus")
+            .field("exit_code", &self.exit_code)
+            .field("exited", &self.exited)
+            .field("waker_is_set", &self.waker.is_some())
+            .finish()
+    }
+}
+
+impl Clone for ChildExitStatus {
+    /// Clone **without** the waker — `Waker: !Clone`, and
+    /// snapshot rebuild path takes a `ChildExitStatus` by value
+    /// and re-inserts it into the live map. The original waker
+    /// (if any) is dropped; the rebuilt entry starts with
+    /// `waker: None`, and any subsequent parked-wait4 caller
+    /// will register a fresh waker.
+    fn clone(&self) -> Self {
+        Self {
+            exit_code: self.exit_code,
+            exited: self.exited,
+            waker: None,
+        }
+    }
+}
+
+impl ChildExitStatus {
+    /// Fresh child entry — not yet exited, no parked waker. Use
+    /// this for all kernel-side insertions (`fork`, `clone`,
+    /// test setup).
+    pub const fn new(exit_code: i32) -> Self {
+        Self {
+            exit_code,
+            exited: false,
+            waker: None,
+        }
+    }
+
+    /// Fresh child entry that's already reaped (test fixture
+    /// helper — equivalent to `new(code)` then `mark_exited`).
+    pub const fn reaped(exit_code: i32) -> Self {
+        Self {
+            exit_code,
+            exited: true,
+            waker: None,
+        }
+    }
 }
 
 impl Kernel {

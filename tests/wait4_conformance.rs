@@ -1,11 +1,10 @@
 //! P3 Tier-6 wait4(61) v1 conformance gate.
 //!
-//! v1 honors only `WNOHANG`. A future PR (gated on PR 4's child
-//! fiber that can actually trigger `exit` on behalf of a child)
-//! adds the parked-wait path. The kernel exposes
-//! `Kernel.children: Mutex<HashMap<i32, ChildExitStatus>>` and
-//! `Kernel.child_event: Arc<Notify>` so the follow-up can land
-//! without an additional breaking field change.
+//! v1 honors `WNOHANG` (non-blocking poll) **or no options**
+//! (blocking parked path). The parked path registers the calling
+//! task into the kernel-side wait queue and is woken by
+//! `exit()` / `exit_group()` firing `child_event.notify_waiters()`
+//! + draining any parked per-child wakers.
 //!
 //! Fixture WAT writes the syscall args into linear memory, calls
 //! `(import "kernel" "syscall")` with the composed arguments, and
@@ -141,13 +140,7 @@ async fn wait4_wnohang_with_populated_child_returns_zero() -> Result<()> {
     // must return 0 (no child is ready).
     {
         let mut children = store.data().children.lock();
-        children.insert(
-            42,
-            edge_libos::kernel::ChildExitStatus {
-                exit_code: 0,
-                exited: false,
-            },
-        );
+        children.insert(42, edge_libos::kernel::ChildExitStatus::new(0));
     }
     let r = call_wait4(&mut store, &instance, 42, 0, 0x40).await;
     assert_eq!(
@@ -166,13 +159,7 @@ async fn wait4_wnohang_with_reaped_child_returns_pid_and_writes_wstatus() -> Res
     // Pre-populate an exited child with exit code = 7.
     {
         let mut children = store.data().children.lock();
-        children.insert(
-            42,
-            edge_libos::kernel::ChildExitStatus {
-                exit_code: 7,
-                exited: true,
-            },
-        );
+        children.insert(42, edge_libos::kernel::ChildExitStatus::reaped(7));
     }
     // Allocate a wstatus slot in guest memory at offset 0x200.
     mem_write_i64(&mut store, 0x200, 0); // pre-zero the slot
@@ -192,27 +179,9 @@ async fn wait4_any_pid_picks_first_reaped_child() -> Result<()> {
     let (mut store, instance) = fresh_store_with_fixture().await?;
     {
         let mut children = store.data().children.lock();
-        children.insert(
-            10,
-            edge_libos::kernel::ChildExitStatus {
-                exit_code: 3,
-                exited: true,
-            },
-        );
-        children.insert(
-            11,
-            edge_libos::kernel::ChildExitStatus {
-                exit_code: 0,
-                exited: false,
-            },
-        );
-        children.insert(
-            12,
-            edge_libos::kernel::ChildExitStatus {
-                exit_code: 5,
-                exited: true,
-            },
-        );
+        children.insert(10, edge_libos::kernel::ChildExitStatus::reaped(3));
+        children.insert(11, edge_libos::kernel::ChildExitStatus::new(0));
+        children.insert(12, edge_libos::kernel::ChildExitStatus::reaped(5));
     }
     let r = call_wait4(&mut store, &instance, -1, 0, 0x40).await;
     let r_i32 = r as i32;
@@ -236,5 +205,116 @@ async fn wait4_any_pid_picks_first_reaped_child() -> Result<()> {
         .filter(|p| children.contains_key(p))
         .count();
     assert_eq!(still_present, 1, "exactly one of {{10,12}} stays");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// P3 final-bundle sub-deliverable 4 — parked-Waker path.
+// ---------------------------------------------------------------------------
+
+/// Blocking wait4(any) parks on `child_event.notified()`. We
+/// test the wake contract by firing `notify_waiters()` first and
+/// marking the child as exited before calling wait4 — the
+/// `Notify::notified()` future inside the wait4 handler resolves
+/// immediately because the notify was already registered. The
+/// handler then re-checks `try_reap`, sees the exited child,
+/// and returns the PID.
+///
+/// (Cross-task notification is impossible to test in unit tests
+/// because `wasmtime::Store: !Send`. The wake contract is the
+/// `Notify` itself — exercised end-to-end in the CPython guest
+/// e2e tests, where a real child fiber calls `exit` and the
+/// parent's `wait4` wakes.)
+#[tokio::test]
+async fn wait4_parked_any_pid_wakes_on_notify() -> Result<()> {
+    let (mut store, instance) = fresh_store_with_fixture().await?;
+    // Populate a child that hasn't exited yet.
+    {
+        let mut children = store.data().children.lock();
+        children.insert(7, edge_libos::kernel::ChildExitStatus::new(0));
+    }
+
+    // Fire the notify BEFORE the wait4 call so the parked
+    // `child_event.notified().await` resolves immediately.
+    store.data().child_event.notify_waiters();
+    // Now mark the child as exited — without this, wait4 will
+    // re-park after the wake and the test would hang.
+    {
+        let mut children = store.data().children.lock();
+        if let Some(c) = children.get_mut(&7) {
+            c.exited = true;
+            c.exit_code = 9;
+        }
+    }
+
+    mem_write_i64(&mut store, 0x200, 0); // wstatus slot
+    let r = call_wait4(&mut store, &instance, -1, 0x200, 0).await;
+    assert_eq!(
+        r, 7,
+        "blocking wait4(any) must return the reaped PID after wake"
+    );
+    let wstatus = mem_read_i64(&store, 0x200);
+    assert_eq!(wstatus, 0x0900, "wstatus = (9 << 8)");
+    let children = store.data().children.lock();
+    assert!(!children.contains_key(&7), "child must be popped");
+    Ok(())
+}
+
+/// Blocking wait4(any) returns -ECHILD when no children exist
+/// (matches Linux: ECHILD when no unwaited-for children, regardless
+/// of WNOHANG).
+#[tokio::test]
+async fn wait4_parked_no_children_returns_echild() -> Result<()> {
+    let (mut store, instance) = fresh_store_with_fixture().await?;
+    // No children. Blocking wait4(-1, 0, 0) → -ECHILD.
+    let r = call_wait4(&mut store, &instance, -1, 0, 0).await;
+    assert_eq!(
+        r, -10,
+        "blocking wait4(any) with no children must return -ECHILD (-10)"
+    );
+    Ok(())
+}
+
+/// Blocking wait4 for an unknown specific PID returns -ECHILD
+/// (cannot ever satisfy — no child with that PID exists).
+#[tokio::test]
+async fn wait4_parked_unknown_specific_pid_returns_echild() -> Result<()> {
+    let (mut store, instance) = fresh_store_with_fixture().await?;
+    // Populate one child.
+    {
+        let mut children = store.data().children.lock();
+        children.insert(5, edge_libos::kernel::ChildExitStatus::new(0));
+    }
+    // Block on a PID that doesn't exist.
+    let r = call_wait4(&mut store, &instance, 9999, 0, 0).await;
+    assert_eq!(
+        r, -10,
+        "blocking wait4(9999, 0) must return -ECHILD without parking"
+    );
+    Ok(())
+}
+
+/// Blocking wait4(specific_pid) parks in the polling loop until
+/// the matching child is marked `exited`. Pre-mark it before the
+/// call so the loop reaps on the first iteration (budget=0);
+/// the park-and-poll re-check path is the contract under test.
+#[tokio::test]
+async fn wait4_parked_specific_pid_reaps_when_already_exited() -> Result<()> {
+    let (mut store, instance) = fresh_store_with_fixture().await?;
+    // Pre-populate a reaped child.
+    {
+        let mut children = store.data().children.lock();
+        children.insert(11, edge_libos::kernel::ChildExitStatus::reaped(4));
+    }
+    mem_write_i64(&mut store, 0x200, 0);
+    let r = call_wait4(&mut store, &instance, 11, 0x200, 0).await;
+    assert_eq!(
+        r, 11,
+        "blocking wait4(11) with reaped child must return 11"
+    );
+    let wstatus = mem_read_i64(&store, 0x200);
+    assert_eq!(wstatus, 0x0400, "wstatus = (4 << 8)");
+    let children = store.data().children.lock();
+    assert!(!children.contains_key(&11));
     Ok(())
 }
