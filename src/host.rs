@@ -2,8 +2,9 @@
 //!
 //! `build_engine` is the single place that defines the Wasmtime feature set we
 //! support. P0 enables: async host functions, the component model, reference
-//! types, and SIMD. Threads are disabled (single-threaded v1, see
-//! `impelementationplan` §1.4).
+//! types, and SIMD. P3 Tier-3 also enables: `wasm_threads`,
+//! `shared_memory`, and `wasm_shared_everything_threads` — see ADR 0001 §2
+//! and the in-source comment on `build_engine` for the rationale.
 
 use anyhow::Result;
 use wasmtime::{Config, Engine, Linker, Store};
@@ -19,12 +20,26 @@ pub fn build_engine() -> Result<Engine> {
     cfg.wasm_simd(true);
     // NB: in wasmtime 45.0.3, async host functions are always supported —
     // `Config::async_support` is deprecated and a no-op.
-    cfg.wasm_threads(false); // v1 single-threaded — see ADR 0001 §2.
-                             // P3 follow-on (wasm_threads(true)): ALSO add "threads" to the
-                             // wasmtime feature list in Cargo.toml:22 (currently
-                             // ["component-model", "async", "anyhow"]). The bool flip alone is
-                             // not enough — wasmtime 45.0.3 gates the threads feature at the
-                             // crate-feature level.
+    //
+    // P3 Tier-3 — see ADR 0001 §2. All three independent gates flipped
+    // together because they unlock cross-fiber wakeups as a unit:
+    //   * `wasm_threads(true)` — threads proposal parser/validator
+    //     (atomics + the `shared` flag on memory declarations).
+    //   * `shared_memory(true)` — runtime `SharedMemory::new(...)`,
+    //     required for instantiating modules that declare
+    //     `(memory ... shared)`. Without this, the parser allows
+    //     the declaration but instantiation rejects it.
+    //   * `wasm_shared_everything_threads(true)` — the
+    //     `wasm_shared_everything_threads` proposal, which extends
+    //     the threads proposal to allow `mut` globals and tables
+    //     shared across stores. Required for our kernel since a
+    //     guest fiber may be hosted in a different `Store` than
+    //     the kernel's per-`Store` `Kernel` struct (a Store is
+    //     pinned to a host thread; cross-fiber wakeups go through
+    //     shared-memory atomics on a `SharedMemory`).
+    cfg.wasm_threads(true);
+    cfg.shared_memory(true);
+    cfg.wasm_shared_everything_threads(true);
     Ok(Engine::new(&cfg)?)
 }
 

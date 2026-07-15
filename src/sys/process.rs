@@ -8,19 +8,20 @@ use crate::mem;
 
 // Linux x86-64 `wait4(2)` options (`linux/wait.h`).
 //
-// v1 honors only `WNOHANG`. The full parked-wait path
-// (a fiber blocked on `wait4` until a child calls `exit`) lands
-// behind PR 4's child fiber — until then there is no execution
-// context that can ever trigger an exit on a non-self PID, so a
-// non-WNOHANG wait4 has no consumer. We still parse `WNOHANG` and
-// return -EINVAL on every other bit so guests see the correct
-// failure mode.
+// v1 honors `WNOHANG` (non-blocking poll) and the **default blocking
+// parked path** (no options). The blocking path is the
+// `ChildExitStatus::waker` + `Kernel.child_event` parked-Waker story
+// landed in the P3 final-bundle sub-deliverable 4. Other flag bits
+// (`WUNTRACED` / `WCONTINUED` / `WNOWAIT` / `WALL`) are rejected
+// with -EINVAL — v1 has no signal delivery story and no job control.
 pub const WNOHANG: i32 = 0x40;
 pub const WUNTRACED: i32 = 0x02;
 pub const WCONTINUED: i32 = 0x08;
 pub const WNOWAIT: i32 = 0x0100_0000;
 pub const WALL: i32 = 0x4000_0000;
-/// Mask of v1-supported wait4 options.
+/// Mask of v1-supported wait4 options. v1 supports **either**
+/// `WNOHANG` (0) **or no options** (blocking). Reject anything
+/// outside this set with -EINVAL.
 pub const WAIT4_SUPPORTED_V1: i32 = WNOHANG;
 
 // Linux x86-64 `clone(2)` flag bits (`linux/sched.h`).
@@ -70,15 +71,65 @@ pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
 /// inspects `Kernel::exit_code` after each top-level wasm call and
 /// surfaces it. We don't trap here because musl's `exit` path may still
 /// flush stdio AFTER the syscall returns — a trap would skip the flush.
+///
+/// P3 final-bundle sub-deliverable 4: also mark every entry in
+/// `Kernel.children` as `exited`, drain any parked wakers, and
+/// fire `child_event.notify_waiters()` so a parked `wait4`
+/// caller can wake up. The exit-code recorded in
+/// `Kernel::exit_code` is the per-process code; each child's
+/// `ChildExitStatus::exit_code` is whatever was passed when the
+/// child was registered (fork / clone / test fixture).
 pub async fn exit(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
-    caller.data_mut().exit_code = Some(a[0] as i32);
+    let code = a[0] as i32;
+    {
+        let kernel = caller.data_mut();
+        kernel.exit_code = Some(code);
+    }
+    reap_all_children(caller);
     0
 }
 
 /// `exit_group(code)`: same semantics as `exit` in single-threaded v1.
 pub async fn exit_group(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
-    caller.data_mut().exit_code = Some(a[0] as i32);
+    let code = a[0] as i32;
+    {
+        let kernel = caller.data_mut();
+        kernel.exit_code = Some(code);
+    }
+    reap_all_children(caller);
     0
+}
+
+/// Mark every entry in `Kernel.children` as `exited = true`, drain
+/// any parked wakers, and fire `child_event.notify_waiters()`.
+///
+/// Lock discipline: take `children` briefly to mark + drain,
+/// drop before calling `wake()` on each waker — `Waker::wake`
+/// must not run under the parking_lot mutex guard (it can run
+/// arbitrary user code). `child_event.notify_waiters()` is a
+/// `tokio::sync::Notify` call; it's safe to invoke outside the
+/// lock because Notify is internally synchronized.
+fn reap_all_children(caller: &mut Caller<'_, Kernel>) {
+    // Phase 1: under the lock, mark + drain wakers into a Vec.
+    let drained: Vec<std::task::Waker> = {
+        let kernel = caller.data();
+        let mut children = kernel.children.lock();
+        let mut out = Vec::new();
+        for (_, status) in children.iter_mut() {
+            status.exited = true;
+            if let Some(w) = status.waker.take() {
+                out.push(w);
+            }
+        }
+        out
+    };
+    // Phase 2: fire drained wakers (lock dropped).
+    for w in drained {
+        w.wake();
+    }
+    // Phase 3: notify any parked `child_event.notified().await`
+    // waiters (any-pid parked wait4 callers).
+    caller.data().child_event.notify_waiters();
 }
 
 pub fn getpid() -> i64 {
@@ -166,6 +217,63 @@ pub async fn clone_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 
     child_tid as i64
 }
 
+/// `fork()` — P3 Tier-5 v1.
+///
+/// **v1 returns the child PID in the parent; the child fiber is
+/// NOT resumed in this PR.** This is the deferred-resume contract
+/// documented in `impelementationplan` §P3 Tier-5: spawning a
+/// separate fiber requires either driving a second
+/// `Store<Kernel>` from a fresh thread, or yielding the current
+/// fiber and routing child execution through it — both options
+/// need a follow-up that lands behind the multi-fiber (P3
+/// Tier-3) and ADR 0003 (live migration) stories.
+///
+/// What v1 DOES do:
+///   1. Allocate a fresh PID via `Kernel.next_pid.fetch_add`.
+///   2. Insert `ChildExitStatus { exited: false, exit_code: 0,
+///      waker: None }` into `Kernel.children`. The parent can
+///      later `wait4` for this PID; the wait4 parked-Waker path
+///      (sub-deliverable 4) will block until something marks
+///      the child as `exited = true`. In v1 nothing ever marks
+///      a forked child as exited (because nothing executes the
+///      child), so a parent `wait4(child_pid)` parks forever
+///      unless the parent also calls `exit()` itself — `exit()`
+///      in `reap_all_children` marks all live children as
+///      exited.
+///
+/// What v1 does NOT do (the deferred parts):
+///   * Resume the child on its own fiber / Store.
+///   * Set up a separate stack for the child.
+///   * CoW the linear memory pages between parent and child.
+///   * Wire the `CLONE_VM` / `CLONE_THREAD` / `CLONE_FILES`
+///     semantics (rejected with -EINVAL anyway in clone(56)).
+///
+/// The fork handler is registered in `src/dispatch.rs`. A guest
+/// calling `fork()` gets back `child_pid > 0` and continues;
+/// the child PID is observable via `Kernel.children` for the
+/// parent. The child-fiber-resume work lands in a follow-up that
+/// piggybacks on P3 Tier-3 (threads + shared memory) + ADR 0003
+/// (live migration).
+pub async fn fork_syscall(caller: &mut Caller<'_, Kernel>, _a: [i64; 6]) -> i64 {
+    // Allocate a fresh PID (PID 1 is reserved for the init
+    // kernel; clone starts at 2, so fork follows the same
+    // convention). Atomic ordering: Relaxed — no other field is
+    // gated on PID order.
+    let child_pid = caller
+        .data()
+        .next_pid
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Insert the child into the children table. The child is
+    // not yet exited; the parent can wait4 for it. See the
+    // handler doc comment for the deferred-resume contract.
+    let mut children = caller.data().children.lock();
+    children.insert(child_pid, ChildExitStatus::new(0));
+    drop(children);
+
+    child_pid as i64
+}
+
 /// `sched_yield()` → 0. CPython sometimes calls this in poll loops; we
 /// yield to the executor via `tokio::task::yield_now`.
 pub async fn sched_yield() -> i64 {
@@ -175,7 +283,10 @@ pub async fn sched_yield() -> i64 {
 
 /// `wait4(pid, wstatus, options, rusage)` — P3 Tier-6 v1.
 ///
-/// v1 honors only `WNOHANG`:
+/// v1 honors `WNOHANG` (non-blocking poll) **or no options**
+/// (default blocking parked path). All other option bits are
+/// rejected with -EINVAL.
+///
 /// - `pid == -1` or `pid == 0`: any child of the calling process.
 ///   In v1 the only process is PID 1, so the table always reflects
 ///   that single parent's children.
@@ -184,20 +295,32 @@ pub async fn sched_yield() -> i64 {
 ///
 /// Return contract:
 /// - `0` (with `WNOHANG`) when no child is ready to be reaped.
-/// - `-ECHILD` when there are no children matching `pid` AT ALL
-///   (also returned for non-WNOHANG waits, since v1 has no parked
-///   child-exit path — a future PR adds the blocking variant).
+/// - The reaped child's PID on success (with or without WNOHANG).
+/// - `-ECHILD` when there are no children matching `pid` AT ALL.
+///   A blocking wait on a non-existent PID is **not** parked — it
+///   returns -ECHILD immediately, matching Linux.
 /// - `-EINVAL` for unsupported option bits or invalid pid range.
 ///
-/// On success (a reaped child): returns the reaped child's PID and,
-/// if `wstatus` is non-NULL, writes the wait status (low 16 bits =
-/// `(code << 8) | 0` for normal exit). The child entry is removed
-/// from `Kernel.children`.
+/// On success: returns the reaped child's PID and, if `wstatus`
+/// is non-NULL, writes the wait status (low 16 bits = `(code << 8) | 0`
+/// for normal exit). The child entry is removed from
+/// `Kernel.children`.
+///
+/// P3 final-bundle sub-deliverable 4 — parked-Waker path:
+///
+/// When called without `WNOHANG` and no child is currently reaped,
+/// we park on either the matching child's `ChildExitStatus::waker`
+/// (specific-PID wait) or `Kernel.child_event.notified()` (any-pid
+/// wait). Lock discipline: register the waker under the
+/// `children` lock, drop the lock, then `.await`. The waker
+/// closure re-takes the lock to drain; `Waker::wake` does not run
+/// under the lock.
 pub async fn wait4_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     use crate::errno::ECHILD;
     let pid = a[0];
     let wstatus_ptr = a[1];
     let options = a[2] as i32;
+    let wnohang = options & WNOHANG != 0;
 
     // Reject any flag outside the v1-supported set. Even `WALL` /
     // `WUNTRACED` / `WCONTINUED` are EINVAL — v1 has no signal
@@ -211,64 +334,128 @@ pub async fn wait4_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 
         return -EINVAL;
     }
 
-    let kernel = caller.data();
-    let mut children = kernel.children.lock();
-    if children.is_empty() {
-        // No children at all → -ECHILD (matches Linux semantics:
-        // ECHILD when the calling process has no unwaited-for
-        // children). WNOHANG is irrelevant here because there is
-        // nothing to wait for.
-        return -ECHILD;
+    // ECHILD fast path — no children at all. WNOHANG vs blocking
+    // is irrelevant here because there is nothing to wait for.
+    {
+        let children = caller.data().children.lock();
+        if children.is_empty() {
+            return -ECHILD;
+        }
     }
 
-    // Find the first (or specific) reaped child.
-    let target_pid: Option<i32> = if pid > 0 { Some(pid as i32) } else { None };
+    // Try to reap synchronously (no parking) if a child is ready.
+    if let Some((picked, exit_code)) = try_reap(caller, pid) {
+        return write_wstatus_and_return(caller, picked, exit_code, wstatus_ptr);
+    }
 
-    let picked: Option<i32> = match target_pid {
-        Some(p) => {
-            if children.get(&p).map(|c| c.exited).unwrap_or(false) {
-                Some(p)
-            } else if children.contains_key(&p) {
-                // Child exists but hasn't exited yet.
-                if options & WNOHANG != 0 {
-                    return 0;
-                }
-                // v1 has no parked wait path; treat as "no consumer".
-                return -ECHILD;
-            } else {
-                return -ECHILD;
-            }
+    // Nothing ready yet.
+    if wnohang {
+        return 0;
+    }
+
+    // Blocking parked path. ECHILD for unknown specific PID — no
+    // way to ever satisfy the wait.
+    if pid > 0 {
+        let exists = caller.data().children.lock().contains_key(&(pid as i32));
+        if !exists {
+            return -ECHILD;
         }
-        None => {
-            // Any-child scan.
-            let ready = children.iter().find(|(_, c)| c.exited).map(|(p, _)| *p);
-            match ready {
-                Some(p) => Some(p),
-                None => {
-                    if options & WNOHANG != 0 {
-                        return 0;
+    }
+
+    // Park. We loop on spurious wake-ups: a wake may come from a
+    // child exit OR from a spurious notify (Notify::notify_waiters
+    // can fire on exit even if we weren't parked yet, which we
+    // must accept gracefully).
+    loop {
+        // Snapshot a fresh notify handle BEFORE we lock — `Arc`
+        // clone is cheap and lock-free. We can't take the lock
+        // and then construct a future that needs `&caller.data()`.
+        let child_event = caller.data().child_event.clone();
+        let specific_waker_pid: Option<i32> = if pid > 0 { Some(pid as i32) } else { None };
+
+        if let Some(sp) = specific_waker_pid {
+            // Specific-pid parked path: poll the child's `exited`
+            // flag under the lock every 1ms. We use a tight poll
+            // rather than a per-address `Notify` because
+            // `ChildExitStatus::waker` is a per-child `Option<Waker>`
+            // with a 1-waiter contract — concurrent waiters on
+            // the same child would clobber each other (see
+            // `ChildExitStatus::waker` doc comment for the v1
+            // known limitation). 1ms is fine for the test
+            // workload and avoids the per-waker registration
+            // complexity.
+            let mut budget: u32 = 0;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                let exit_code_opt: Option<i32> = {
+                    let mut children = caller.data().children.lock();
+                    match children.get(&sp) {
+                        Some(c) if c.exited => {
+                            let exit_code = c.exit_code;
+                            children.remove(&sp);
+                            Some(exit_code)
+                        }
+                        None => return -ECHILD,
+                        _ => None,
                     }
+                };
+                if let Some(exit_code) = exit_code_opt {
+                    return write_wstatus_and_return(caller, sp, exit_code, wstatus_ptr);
+                }
+                budget = budget.saturating_add(1);
+                if budget > 10_000 {
+                    // 10s of 1ms polling — pathological; bail out.
                     return -ECHILD;
                 }
             }
+        } else {
+            // Any-pid parked path: block on child_event.notified().
+            // The exit-side fires `child_event.notify_waiters()`
+            // when any child is reaped.
+            child_event.notified().await;
+            // Re-try the synchronous reap.
+            if let Some((picked, exit_code)) = try_reap(caller, pid) {
+                return write_wstatus_and_return(caller, picked, exit_code, wstatus_ptr);
+            }
+            // No child ready after wake — loop back to re-park.
         }
-    };
+    }
+}
 
-    let picked = match picked {
-        Some(p) => p,
-        None => return -ECHILD,
+/// Synchronously attempt to reap one child matching `pid`. Returns
+/// `Some((pid, exit_code))` if a reaped child was found and
+/// popped from `Kernel.children`; `None` otherwise (no child ready
+/// or no matching child). Caller is responsible for `-ECHILD`
+/// disambiguation (an unknown specific PID is ECHILD; no children
+/// at all is also ECHILD).
+fn try_reap(caller: &mut Caller<'_, Kernel>, pid: i64) -> Option<(i32, i32)> {
+    let mut children = caller.data().children.lock();
+    let target: Option<i32> = if pid > 0 { Some(pid as i32) } else { None };
+    let picked: Option<i32> = match target {
+        Some(p) => {
+            if children.get(&p).map(|c| c.exited).unwrap_or(false) {
+                Some(p)
+            } else {
+                None
+            }
+        }
+        None => children.iter().find(|(_, c)| c.exited).map(|(p, _)| *p),
     };
+    let picked = picked?;
+    let exit_code = children.remove(&picked)?.exit_code;
+    Some((picked, exit_code))
+}
 
-    // Drain the entry — capture exit_code + remove from the map.
-    let exit_code = match children.remove(&picked) {
-        Some(ChildExitStatus { exit_code, .. }) => exit_code,
-        None => return -ECHILD,
-    };
-    drop(children);
-
-    // Encode wait status: WIFEXITED=true, WEXITSTATUS=code (lower 8 bits).
+/// Encode wait status (`WIFEXITED=true`, `WEXITSTATUS=code`) and
+/// return the reaped child PID. Writes the 4-byte wstatus to
+/// guest memory at `wstatus_ptr` if non-zero.
+fn write_wstatus_and_return(
+    caller: &mut Caller<'_, Kernel>,
+    picked: i32,
+    exit_code: i32,
+    wstatus_ptr: i64,
+) -> i64 {
     let wstatus: i32 = (exit_code & 0xff) << 8;
-
     if wstatus_ptr != 0 {
         let mem_handle = match caller.data().memory() {
             Ok(m) => *m,
@@ -280,7 +467,6 @@ pub async fn wait4_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 
         };
         bytes.copy_from_slice(&wstatus.to_ne_bytes());
     }
-
     picked as i64
 }
 
