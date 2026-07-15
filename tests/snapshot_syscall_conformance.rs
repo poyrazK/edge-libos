@@ -86,11 +86,10 @@ async fn snapshot_writes_postcard_bytes_to_path() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("tempfile failed: {e}"))?;
     let path = tmp.path().to_string_lossy().to_string();
     let expected_path = path.clone();
-    let expected_version_bytes = edge_libos::snapshot::endian::LeU32(
-        edge_libos::snapshot::SNAPSHOT_FORMAT_VERSION,
-    )
-    .0
-    .to_le_bytes();
+    let expected_version_bytes =
+        edge_libos::snapshot::endian::LeU32(edge_libos::snapshot::SNAPSHOT_FORMAT_VERSION)
+            .0
+            .to_le_bytes();
 
     let mut store = build_store(&engine, Kernel::new_without_stdio(vec![], vec![]));
     let instance = linker.instantiate_async(&mut store, &module).await?;

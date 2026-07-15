@@ -26,16 +26,12 @@
 //! pre-mutating is simpler.)
 //!
 //! `EDGE_SERVE_FD_<N>` env vars (systemd-style socket activation):
-//! each variable whose name starts with `EDGE_SERVE_FD_` carries
-//! the decimal fd number of a pre-opened TCP listener the parent
-//! process bound before exec'ing `edge-cli serve`. We dup + wrap
-//! each in `tokio::net::TcpListener` and attach to the kernel as
-//! `Resource::Socket` with `inherited = true`. The snapshot
-//! records the `inherited` flag on the corresponding fd entry; on
-//! apply, `apply_snapshot_kernel_state` skips the rebuild for
-//! inherited entries (no bind, no listen), and
-//! `apply_snapshot_inherited_listeners` re-inserts the pre-built
-//! listeners after the kernel-state reset. See ADR 0004 §2.
+//! each variable's NAME carries the decimal fd slot the
+//! inherited listener will live at — i.e. the fd number the
+//! listener held when the snapshot was taken (the guest's
+//! `accept4(N, …)` reads back that exact slot). The VALUE is
+//! the parent's OS-level fd number. We `dup` the source fd and
+//! insert the listener at the target slot. See ADR 0004 §2.
 //!
 //! Snapshot portability caveat (NOT addressed): serve trusts the wasm
 //! path matches freeze's. If the user passes a different wasm, apply
@@ -58,8 +54,11 @@ use crate::snapshot::{
 };
 
 /// Prefix for systemd-style socket activation env vars (ADR 0004
-/// §2). `EDGE_SERVE_FD_0` carries the first inherited fd, `…_1`
-/// the second, etc. Values are ASCII decimal fd numbers.
+/// §2). `EDGE_SERVE_FD_<N>` carries an inherited listener: the
+/// suffix `<N>` is the target fd slot (matches the snapshot's
+/// recorded listener fd); the value is the parent's OS-level
+/// source fd number. Multiple inherited listeners get distinct N
+/// suffixes (0, 1, 2, …) so they sort into a deterministic order.
 const EDGE_SERVE_FD_PREFIX: &str = "EDGE_SERVE_FD_";
 
 /// Entry point for `edge-cli serve`. Argv layout:
@@ -111,51 +110,60 @@ pub async fn run_main(args: &[String]) -> CliResult<i32> {
 
 /// Walk an iterator of `(key, value)` env-style pairs (from
 /// `std::env::vars()` in production, from a `vec![..]` in tests)
-/// and collect every `EDGE_SERVE_FD_<N>` value. Returns the
-/// parsed fd numbers as `Vec<i32>` in ascending `N` order (so
-/// `EDGE_SERVE_FD_0` is first, then `…_1`, etc.). Returns an
-/// empty vec if no such vars are set — the guest can still run
-/// without an inherited listener.
+/// and collect every `EDGE_SERVE_FD_<N>` value. Each variable's
+/// value is the **source fd** (the parent's OS-level fd), and
+/// the env-var name's `<N>` is the **target fd slot** — the
+/// kernel fd the inherited listener will live at, matching the
+/// fd number recorded in the snapshot when the listener was
+/// frozen. Returns a `Vec<(target_fd, source_fd)>` in ascending
+/// `N` order so successive inherited listeners don't collide
+/// on the N axis. Returns an empty vec if no such vars are set —
+/// the guest can still run without an inherited listener.
 ///
 /// Errors:
+/// - a variable whose suffix is not a decimal `u32` → `Args`
 /// - a variable whose value is not a decimal `i32` → `Args`
 /// - a variable whose value is negative → `Args`
 ///
 /// We deliberately don't error on `N` collisions or non-contiguous
 /// `N`s — `attach_inherited_listeners` silently skips fds that
-/// can't be dup'd, and the guest can tolerate missing listeners
-/// (it'll just `accept4` and get `EAGAIN`/`EBADF`).
+/// can't be dup'd or whose target slot is already occupied, and
+/// the guest can tolerate missing listeners (it'll just `accept4`
+/// and get `EAGAIN`/`EBADF`).
 ///
 /// Taking an iterator (rather than reading `std::env::vars()`
 /// directly) makes the function pure and testable: tests pass a
 /// hand-built `Vec<(String, String)>` and avoid the multi-threaded
 /// race that comes with mutating the process env.
-fn parse_inherited_fds<I>(env: I) -> CliResult<Vec<i32>>
+fn parse_inherited_fds<I>(env: I) -> CliResult<Vec<(u32, i32)>>
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    let mut entries: Vec<(u32, i32)> = Vec::new();
+    let mut entries: Vec<(u32, u32, i32)> = Vec::new();
     for (key, val) in env {
         let Some(suffix) = key.strip_prefix(EDGE_SERVE_FD_PREFIX) else {
             continue;
         };
-        let n: u32 = suffix.parse().map_err(|e: std::num::ParseIntError| {
+        let target_fd: u32 = suffix.parse().map_err(|e: std::num::ParseIntError| {
             CliError::Args(format!(
-                "serve: {key} suffix must be a non-negative integer: {e}"
+                "serve: {key} suffix must be a non-negative integer (target fd slot): {e}"
             ))
         })?;
-        let fd: i32 = val.parse().map_err(|e: std::num::ParseIntError| {
+        let source_fd: i32 = val.parse().map_err(|e: std::num::ParseIntError| {
             CliError::Args(format!("serve: {key}={val}: {e}"))
         })?;
-        if fd < 0 {
+        if source_fd < 0 {
             return Err(CliError::Args(format!(
-                "serve: {key}={fd}: fds must be non-negative"
+                "serve: {key}={source_fd}: source fds must be non-negative"
             )));
         }
-        entries.push((n, fd));
+        entries.push((target_fd, target_fd, source_fd));
     }
-    entries.sort_by_key(|(n, _)| *n);
-    Ok(entries.into_iter().map(|(_, fd)| fd).collect())
+    entries.sort_by_key(|(n, _, _)| *n);
+    Ok(entries
+        .into_iter()
+        .map(|(_, target_fd, source_fd)| (target_fd, source_fd))
+        .collect())
 }
 
 /// Walk `snap.fds.entries`; for every `Resource::Socket` with
@@ -191,7 +199,7 @@ fn override_snapshot_port(snap: &mut KernelSnapshot, port: u16) -> CliResult<()>
 async fn serve_loop(
     snap: &KernelSnapshot,
     wasm_path: &str,
-    inherited_fds: &[i32],
+    inherited_fds: &[(u32, i32)],
 ) -> CliResult<i32> {
     let engine = build_engine()?;
     let mut linker: Linker<Kernel> = Linker::new(&engine);
@@ -432,13 +440,15 @@ mod tests {
     #[test]
     fn parse_inherited_fds_collects_and_sorts_by_n() {
         // Out-of-order keys to exercise the sort_by_key path.
+        // Each tuple is (target_fd, source_fd); target_fd
+        // comes from the suffix N, source_fd from the value.
         let env = vec![
             ("EDGE_SERVE_FD_2".to_string(), "42".to_string()),
             ("EDGE_SERVE_FD_0".to_string(), "10".to_string()),
             ("EDGE_SERVE_FD_1".to_string(), "20".to_string()),
         ];
         let fds = parse_inherited_fds(env).expect("parse");
-        assert_eq!(fds, vec![10, 20, 42], "sorted by N asc");
+        assert_eq!(fds, vec![(0, 10), (1, 20), (2, 42)], "sorted by N asc");
     }
 
     #[test]

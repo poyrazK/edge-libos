@@ -111,10 +111,84 @@ that the v1 contract defers:
 7. **`WUNTRACED` / `WCONTINUED` / `WNOWAIT` / `WALL`** —
    wait4 flag bits rejected with `-EINVAL`. Signal-aware wait4
    lands with a real signal delivery story.
-8. **`edge-cli freeze` / `edge-cli serve` real bodies** —
-   the D3.5 follow-up lands these. The `migrate` subcommand
-   runs the in-process roundtrip today; the subprocess
-   variant follows.
+8. **~~`edge-cli freeze` / `edge-cli serve` real bodies~~** —
+   landed as P2-D3.5 (`worktree-p3-d3-5-freeze-serve` branch).
+   `freeze` runs the wasm to a quiescent point (or a 10s
+   timeout for server-style guests parked in `epoll_wait`) and
+   writes the snap file; `serve` applies kernel-state +
+   memory + inherited-listener attach in three steps; `migrate`
+   is the subprocess variant (real `Command::new(current_exe)`
+   freeze → serve), with `MIGRATE_IN_PROCESS=1` as a test
+   opt-in. New `NR_SNAPSHOT=123` syscall + ADR 0004 wire
+   contract back the freeze side. The v1 systemd-style fd
+   inherit protocol is `EDGE_SERVE_FD_<N>=<parent_fd>` where
+   `<N>` is the kernel fd slot matching the snapshot's
+   recorded listener fd. New follow-ups listed in the D3.5
+   section below.
+
+## P2-D3.5 — `freeze` / `serve` real bodies + `migrate` subprocess
+
+Closes the P2-D3.5 deliverable from the implementation plan
+on branch `worktree-p3-d3-5-freeze-serve`.
+
+| # | Sub-deliverable | Status |
+|---|---|---|
+| 1 | ADR 0004 (`docs/adr/0004-freeze-serve-wire.md`) — freeze/serve wire contract + `EDGE_SERVE_FD_<N>=<fd>` protocol | ✅ committed (`16f585c`) |
+| 2 | `NR_SNAPSHOT = 123` syscall (guest-driven quiescence + env-var fallback) — 5 C tests + 2 Rust integration tests + dispatch arm + `syscall_name` registration | ✅ committed (`a7b3ad2`) |
+| 3 | `edge-cli freeze <wasm> [--] [args...] --out <snap>` body (10s server-park timeout; includes the ephemeral-port-drift fix at `src/snapshot.rs:560-580`) | ✅ committed (D3.3 stub-replacement PR) |
+| 4 | `Kernel::attach_inherited_listeners` plumbing (`Vec<(target_fd, source_fd)>` → `dup` + `tokio::net::TcpListener` + `Resource::Socket`) + `Socket::from_inherited_listener` + `inherited: bool` snapshot propagation | ✅ committed (`aa23ab2`) |
+| 5 | `edge-cli serve <snap> <wasm> [--port <p>]` body — three-step apply (state → inherited → memory); `--port` pre-mutates snap; 11 new unit tests | ✅ committed (`32cbed7`) |
+| 6 | `edge-cli migrate` subprocess rework — `Command::new(current_exe)` for freeze + serve; `MIGRATE_IN_PROCESS=1` opt-in for tests | ✅ committed (`37c5907`) |
+| 7 | `tests/cli_migration_e2e.rs` (full prod-shape: freeze → snap → bind raw_fd → clear FD_CLOEXEC → spawn serve with `EDGE_SERVE_FD_<listener_fd>=<raw_fd>` → TCP probe for HTTP 200). The headline integration test. | ✅ this commit |
+| 8 | HANDOFF.md regen + test totals bump | ✅ this commit |
+
+### Test totals (P2-D3.5 close)
+
+| Source | Count (pre D3.5 → post D3.5) |
+|---|---|
+| Rust unit | 123 → 144 (+21) |
+| Rust integration | 197 → 210 (+13) |
+| C conformance | 105 → 106 (+1, `snapshot.c`) |
+| **Grand total** | **425 → 460** |
+
+Net Rust new tests:
+- `src/cli/serve.rs` parse tests: 5
+- `src/cli/freeze.rs` / `cli/migrate.rs` real-body tests: 6
+- `src/sys/process.rs` `snapshot` conformance: 2
+- `tests/inherit_listener_conformance.rs`: 2
+- `tests/cli_freeze_serve_smoke.rs` / `tests/migration_smoke.rs`: 5
+- `tests/snapshot_syscall_conformance.rs`: 4
+- `tests/cli_migration_e2e.rs`: 1
+- Plus doc-test additions and minor unit tests in `src/snapshot.rs` /
+  `src/kernel.rs`: ~6
+
+### Architectural decisions (P2-D3.5)
+
+#### ADR 0004 — freeze/serve wire contract
+Accepted. Pins the `EDGE_SERVE_FD_<N>=<parent_fd>` env-var
+shape (the `<N>` suffix is the kernel fd target slot, matching
+the snapshot's recorded listener fd). The `NR_SNAPSHOT=123`
+syscall is the guest-driven quiescence trigger; SIGUSR1 →
+queued signal → guest syscall is deferred. Snapshot format
+stays at 1 (additive `inherited: bool` field with
+`#[serde(default)]` for back-compat).
+
+### D3.5 follow-ups (deferred to a later branch)
+
+1. **Snapshot portability check** — `serve` trusts that the
+   `.wasm` path matches the freeze host's. Mismatch → apply
+   succeeds but the guest mis-executes. Embed a module hash
+   in `KernelSnapshot` and bump `SNAPSHOT_FORMAT_VERSION`.
+2. **SIGUSR1 → `SIGSNAPSHOT` queued signal → guest syscall
+   path** — host-driven quiescence for guests that don't call
+   `NR_SNAPSHOT` themselves. Needs a real signal-delivery
+   story; deferred until the signal-aware wait4 lands.
+3. **`snapshot.c` C test portability + `chdir.c` cleanup** —
+   `chdir.c` leaves a `chdir_subdir` artifact on failure
+   which causes subsequent runs to fail with `EEXIST`. Add
+   `MARKER_ADDR`-pinned cleanup at the start of `chdir.c`.
+4. **`edge-cli bench` real body** — still a stub from D3.3.
+   Land as D3.7.
 
 ## Repo hygiene post-merge
 

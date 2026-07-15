@@ -52,17 +52,24 @@ P1 closed with the 8-step uvicorn+FastAPI syscall-surface coverage:
 | 7 | epoll_create1 + epoll_ctl + epoll_wait + eventfd2 | `src/sys/{epoll,eventfd}.rs` |
 | 8 | serve one HTTP request | `tests/guests/serve_one_request.wat` + smoke tests |
 
-The kernel handles **58 NRs** across 11 modules (`process`, `memory`,
+The kernel handles **59 NRs** across 11 modules (`process`, `memory`,
 `file`, `socket`, `poll`, `epoll`, `eventfd`, `identity`, `time`,
 `random`, `signal`). The cross-compiled CPython guest is the highest-risk
 artifact and requires `zig cc` + a git submodule — see `guest/build.sh`.
 
 ## Test totals
 
-- **123** Rust unit tests (in `#[cfg(test)]` modules under `src/`)
-- **197** Rust integration tests (across `tests/*.rs`)
-- **105** C conformance tests (`tests/conformance/*.c`, marker-enforced)
-- **Total: 425 tests.** Source of truth: `bash tests/count_tests.sh`.
+- **144** Rust unit tests (in `#[cfg(test)]` modules under `src/`)
+- **210** Rust integration tests (across `tests/*.rs`)
+- **106** C conformance tests (`tests/conformance/*.c`, marker-enforced)
+- **Total: 460 tests.** Source of truth: `bash tests/count_tests.sh`.
+
+P2-D3.5 lands: `NR_SNAPSHOT=123` (guest-driven quiescence),
+`EDGE_SERVE_FD_<N>=<fd>` (systemd-style socket activation),
+`Kernel::attach_inherited_listeners` plumbing, the real
+`edge-cli freeze` and `edge-cli serve` bodies (replacing the
+D3.3 stubs), and the subprocess variant of `edge-cli migrate`.
+See `HANDOFF.md` for the per-deliverable breakdown.
 
 P3 adds `futex(2)` conformance (P3 Tier-1), `clone(56)` v1 (P3
 Tier-4), `fork(57)` v1 (P3 Tier-5), `wait4(61)` v1 with parked-Waker

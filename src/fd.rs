@@ -362,10 +362,7 @@ impl SocketInner {
     /// `is_acceptor = true` flag is set so the existing
     /// `accept4` path treats the socket as a server.
     #[allow(dead_code)]
-    pub fn from_inherited_listener(
-        listener: tokio::net::TcpListener,
-        bound: SockAddr,
-    ) -> Self {
+    pub fn from_inherited_listener(listener: tokio::net::TcpListener, bound: SockAddr) -> Self {
         let mut s = Self::new(SocketKind::Stream, false);
         s.listener = Some(listener);
         s.bound = Some(bound);

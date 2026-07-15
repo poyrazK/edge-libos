@@ -370,32 +370,36 @@ impl Kernel {
 
     /// P2-D3.5 (ADR 0004 §2): attach pre-opened TCP listener fds
     /// inherited from the parent process — typically via
-    /// systemd-style socket activation: the env-var protocol
-    /// `EDGE_SERVE_FD_<N>` (N ≥ 0) carries the decimal fd number,
-    /// the host process bound + listened on it before exec'ing
-    /// `edge-cli serve`, and the kernel must NOT re-bind on
-    /// snapshot restore (the parent owns the bind).
+    /// systemd-style socket activation. Each input pair is
+    /// `(target_fd, source_fd)`:
     ///
-    /// For each input fd we:
-    ///   1. `dup` the fd so we own an independent handle (the
-    ///      host process retains the original after we exit;
-    ///      this matches the `dup2(2)`-on-inherit contract used
-    ///      by systemd).
-    ///   2. Wrap the dup'd fd in a `tokio::net::TcpListener` via
-    ///      `std::net::TcpListener::from_raw_fd` +
+    /// - `target_fd` — the kernel fd slot the inherited
+    ///   listener will live at. This MUST match the fd number
+    ///   the snapshot was taken at, since the guest's
+    ///   `accept4(inherited_fd, ...)` reads back that exact
+    ///   number from linear memory (the WAT freeze fixture
+    ///   stores it at memory[300] for example).
+    /// - `source_fd` — the parent's OS fd. We `dup` it (the
+    ///   parent retains the original after we exit; matches
+    ///   systemd's `dup2(2)`-on-inherit contract).
+    ///
+    /// For each pair we:
+    ///   1. `dup` the source fd so we own an independent
+    ///      handle.
+    ///   2. Wrap the dup'd fd in a `tokio::net::TcpListener`
+    ///      via `std::net::TcpListener::from_raw_fd` +
     ///      `tokio::net::TcpListener::from_std`.
     ///   3. Build a `SocketInner::from_inherited_listener`
     ///      (no bind step, `so_reuseaddr = true`,
     ///      `is_acceptor = true`) and wrap it in a
     ///      `SharedSocket`.
-    ///   4. Insert as `Resource::Socket` at the inherited fd
-    ///      number via `FdTable::insert_at`, so the guest's
-    ///      `accept4(inherited_fd, ...)` finds it.
+    ///   4. Insert as `Resource::Socket` at `target_fd` via
+    ///      `FdTable::insert_at`.
     ///
     /// Returns a `Vec<(u32, SharedSocket)>` of the constructed
-    /// listeners (with their new fd numbers) so callers can
-    /// re-attach them after `apply_snapshot_kernel_state` resets
-    /// `self.fds` — see
+    /// listeners keyed by `target_fd` so callers can re-attach
+    /// them after `apply_snapshot_kernel_state` resets `self.fds`
+    /// — see
     /// [`crate::snapshot::apply_snapshot_inherited_listeners`].
     ///
     /// Lock discipline: `parking_lot::Mutex` on `self.fds`
@@ -405,20 +409,20 @@ impl Kernel {
     #[allow(unsafe_code)]
     pub fn attach_inherited_listeners(
         &mut self,
-        fds: &[i32],
+        fds: &[(u32, i32)],
     ) -> Vec<(u32, crate::fd::SharedSocket)> {
         use crate::fd::{Resource, SockAddr, SocketInner};
         use std::os::unix::io::FromRawFd;
         let mut out = Vec::new();
-        for &raw_fd in fds {
-            if raw_fd < 0 {
+        for &(target_fd, source_fd) in fds {
+            if source_fd < 0 {
                 continue;
             }
-            // SAFETY: `libc::dup(raw_fd)` returns a fresh owned
+            // SAFETY: `libc::dup(source_fd)` returns a fresh owned
             // fd that we transfer ownership of into the
             // std::net::TcpListener below via `from_raw_fd`.
             // On drop, the TcpListener will close that fd.
-            let dup_fd = unsafe { libc::dup(raw_fd) };
+            let dup_fd = unsafe { libc::dup(source_fd) };
             if dup_fd < 0 {
                 continue;
             }
@@ -445,8 +449,10 @@ impl Kernel {
             // occupied; we silently skip those (the operator
             // inherited a duplicate, which is a config error
             // we don't want to crash on).
-            let _ = self.fds.insert_at(raw_fd as u32, Resource::Socket(shared.clone()));
-            out.push((raw_fd as u32, shared));
+            let _ = self
+                .fds
+                .insert_at(target_fd, Resource::Socket(shared.clone()));
+            out.push((target_fd, shared));
         }
         out
     }

@@ -29,7 +29,7 @@ pub use kernel::Kernel;
 pub use snapshot::{
     apply_snapshot, apply_snapshot_inherited_listeners, apply_snapshot_kernel_state,
     apply_snapshot_to_memory, apply_snapshot_to_shared_memory, decode_snapshot, encode_snapshot,
-    read_snapshot_file, try_to_snapshot, write_snapshot_file, KernelSnapshot,
-    MemoryPageSnapshot, SnapshotError, PAGE_SIZE_BYTES, SNAPSHOT_FORMAT_VERSION,
+    read_snapshot_file, try_to_snapshot, write_snapshot_file, KernelSnapshot, MemoryPageSnapshot,
+    SnapshotError, PAGE_SIZE_BYTES, SNAPSHOT_FORMAT_VERSION,
 };
 pub use sys::signal::SigAction;

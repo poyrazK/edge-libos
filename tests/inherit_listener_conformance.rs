@@ -44,8 +44,12 @@ fn attach_inherited_listeners_attaches_tokio_listener_as_resource_socket() -> Re
         let raw_fd: i32 = std_listener.into_std()?.into_raw_fd();
 
         // 2. Build a fresh kernel and attach the listener.
+        // `(target_fd, source_fd)` — the test binds and
+        // immediately uses it, so target == source; in
+        // production they differ (target == snapshot's
+        // listener_fd, source == parent's inherited fd).
         let mut kernel = Kernel::new_without_stdio(vec![], vec![]);
-        kernel.attach_inherited_listeners(&[raw_fd]);
+        kernel.attach_inherited_listeners(&[(raw_fd as u32, raw_fd)]);
 
         // 3. Verify the kernel stored a `Resource::Socket` at the
         //    inherited fd, and `local_addr()` round-trips.
@@ -55,9 +59,7 @@ fn attach_inherited_listeners_attaches_tokio_listener_as_resource_socket() -> Re
             .map_err(|e| anyhow::anyhow!("fds.get failed: {e}"))?;
         match res {
             Resource::Socket(_) => {}
-            _other => panic!(
-                "expected Resource::Socket at fd {raw_fd}, got non-Socket variant"
-            ),
+            _other => panic!("expected Resource::Socket at fd {raw_fd}, got non-Socket variant"),
         }
         // Local addr roundtrip via lock acquisition:
         let res_again = kernel.fds.get(raw_fd as u32).unwrap();
@@ -116,7 +118,9 @@ fn apply_snapshot_with_inherited_listener_does_not_rebind() -> Result<()> {
         }
         // Attach the inherited listener AFTER attach_memory,
         // BEFORE snapshot.
-        store.data_mut().attach_inherited_listeners(&[raw_fd]);
+        store
+            .data_mut()
+            .attach_inherited_listeners(&[(raw_fd as u32, raw_fd)]);
 
         // Phase 2: snapshot.
         let snap = try_to_snapshot(store.data(), &store)?;
@@ -171,7 +175,7 @@ fn apply_snapshot_with_inherited_listener_does_not_rebind() -> Result<()> {
         // kernel-state reset.
         let preattached = fresh_store
             .data_mut()
-            .attach_inherited_listeners(&[raw_fd]);
+            .attach_inherited_listeners(&[(raw_fd as u32, raw_fd)]);
         apply_snapshot_kernel_state(&snap_restored, fresh_store.data_mut())?;
         // P2-D3.5: re-attach the inherited listener post the
         // fds reset (ADR 0004 §2).
@@ -180,9 +184,10 @@ fn apply_snapshot_with_inherited_listener_does_not_rebind() -> Result<()> {
             fresh_store.data_mut(),
             &preattached,
         )?;
-        let mem_clone = *fresh_store.data().memory().map_err(|e| {
-            anyhow::anyhow!("memory not attached post-attach_inherited: {e}")
-        })?;
+        let mem_clone = *fresh_store
+            .data()
+            .memory()
+            .map_err(|e| anyhow::anyhow!("memory not attached post-attach_inherited: {e}"))?;
         apply_snapshot_to_memory(&snap_restored, mem_clone, &mut fresh_store)?;
 
         // After apply, the kernel's `fds[raw_fd]` must STILL be
@@ -198,7 +203,8 @@ fn apply_snapshot_with_inherited_listener_does_not_rebind() -> Result<()> {
                 match inner.bound.as_ref() {
                     Some(edge_libos::fd::SockAddr::V4 { port, addr }) => {
                         assert_eq!(
-                            *port, local_addr.port(),
+                            *port,
+                            local_addr.port(),
                             "inherited listener must keep its port post-apply"
                         );
                         assert_eq!(*addr, [127, 0, 0, 1]);
