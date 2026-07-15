@@ -84,6 +84,17 @@ async fn freeze_snapshot(wasm_path: &str, guest_args: &[String]) -> CliResult<Ke
 
     let bytes = std::fs::read(wasm_path)
         .map_err(|e| CliError::Args(format!("freeze: reading {wasm_path}: {e}")))?;
+    // P3-D3.5-followup-1 (ADR 0005): SHA-256 the wasm bytes once so
+    // `edge-cli serve` can refuse to apply the resulting snapshot
+    // onto a mismatched wasm. Hash covers the raw file bytes —
+    // for raw `.wasm` files this is the bytes `Module::new` parses;
+    // for precompiled wasmtime artifacts (the `Module::deserialize`
+    // branch below) this is the bytes the serve side will also
+    // deserialize. Same bytes in, same hash out.
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let module_sha256: [u8; 32] = hasher.finalize().into();
     let module = if bytes.len() >= 4 && &bytes[0..4] == b"\0asm" {
         wasmtime::Module::new(&engine, &bytes)?
     } else {
@@ -115,7 +126,12 @@ async fn freeze_snapshot(wasm_path: &str, guest_args: &[String]) -> CliResult<Ke
     // server-style guest) want the same snapshot of the live store, so
     // we drop the timeout future's result and unconditionally snap.
     let _ = tokio::time::timeout(timeout, call_start(&instance, &mut store)).await;
-    let snap = try_to_snapshot(store.data(), &store)?;
+    let mut snap = try_to_snapshot(store.data(), &store)?;
+    // Embed the freeze-side wasm hash on the snapshot. `try_to_snapshot`
+    // builds with module_sha256 = [0u8; 32] because the guest-driven
+    // `NR_SNAPSHOT` path can't supply one — we overwrite here on the
+    // CLI path. (See ADR 0005 D5 design rationale.)
+    snap.module_sha256 = module_sha256;
     Ok(snap)
 }
 
