@@ -157,20 +157,24 @@ mod tests {
     }
 
     #[test]
-    fn freeze_stub_returns_args_error_which_maps_to_2() {
-        // Freeze is wired as a stub in D3.3. The subcommand returns
-        // CliError::Args("not yet implemented"), which the dispatcher
-        // maps to exit 2.
+    fn freeze_requires_out_path_returns_2() {
+        // P2-D3.5: freeze is a real subcommand now; with no
+        // --out and no wasm, it returns CliError::Args which the
+        // dispatcher maps to exit 2.
         assert_eq!(run(&["freeze"]), 2);
     }
 
     #[test]
-    fn serve_stub_returns_2() {
+    fn serve_requires_positional_args_returns_2() {
+        // P2-D3.5: serve is a real subcommand now; with no
+        // positional <snap> <wasm>, it returns CliError::Args
+        // which the dispatcher maps to exit 2.
         assert_eq!(run(&["serve"]), 2);
     }
 
     #[test]
     fn bench_stub_returns_2() {
+        // bench is still a D3.3 stub (real body lands in D3.7).
         assert_eq!(run(&["bench"]), 2);
     }
 
