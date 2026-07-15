@@ -956,7 +956,7 @@ pub fn apply_snapshot_kernel_state(
 /// pages, this is a no-op (the memory remains at whatever size the
 /// target store was born with — sufficient for the roundtrip test
 /// fixture, which builds a 32-page module ahead of time).
-/// Dispatch memory restore based on the kernel's [`MemoryKind`].
+/// Dispatch memory restore based on the kernel's [`crate::kernel::MemoryKind`].
 ///
 /// P3 Tier-3: the `Owned` variant goes through the public
 /// `apply_snapshot_to_memory` (which still takes `Memory` for
@@ -989,7 +989,7 @@ fn dispatch_memory_apply(
 }
 
 /// Memory-only restore driver for the `Shared` variant of
-/// [`MemoryKind`]. The public [`apply_snapshot_to_memory`] takes
+/// [`crate::kernel::MemoryKind`]. The public [`apply_snapshot_to_memory`] takes
 /// `wasmtime::Memory` (for backwards compatibility with existing
 /// tests); this sibling is the parallel path for shared memory.
 ///
@@ -997,7 +997,7 @@ fn dispatch_memory_apply(
 /// (wasmtime: `pub fn grow(&self, delta: u64) -> Result<u64>`),
 /// and `SharedMemory::data` returns `&[UnsafeCell<u8>]` (also no
 /// store). We unsafely project that to `&mut [u8]` for the
-/// chunk-copy — see the safety contract on [`MemoryKind::data_mut`].
+/// chunk-copy — see the safety contract on [`crate::kernel::MemoryKind::data_mut`].
 ///
 /// Public for callers (notably `tests/migration_smoke.rs`) that
 /// want to drive the Shared-memory restore by hand — same
