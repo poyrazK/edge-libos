@@ -838,11 +838,8 @@ mod tests {
         let tx_for_task = tx.clone();
         let recv = rt.block_on(async {
             let task = tokio::spawn(async move {
-                let mpsc = tokio::time::timeout(
-                    std::time::Duration::from_millis(200),
-                    rx.recv(),
-                )
-                .await;
+                let mpsc =
+                    tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
                 let notify_ok = tokio::time::timeout(
                     std::time::Duration::from_millis(200),
                     child_event_for_task.notified(),
@@ -925,11 +922,7 @@ mod tests {
         let (exited, exit_code, post_notify_ptr) = {
             let guard = children_arc.lock();
             let entry = guard.get(&9).expect("entry for pid 9 must exist");
-            (
-                entry.exited,
-                entry.exit_code,
-                Arc::as_ptr(&entry.notify),
-            )
+            (entry.exited, entry.exit_code, Arc::as_ptr(&entry.notify))
         };
         assert!(
             exited && exit_code == 137,
@@ -993,21 +986,15 @@ mod tests {
             let bf = Arc::clone(&barrier);
             let w1 = tokio::spawn(async move {
                 b1.wait().await;
-                tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
-                    notify_w1.notified(),
-                )
-                .await
-                .is_ok()
+                tokio::time::timeout(std::time::Duration::from_millis(500), notify_w1.notified())
+                    .await
+                    .is_ok()
             });
             let w2 = tokio::spawn(async move {
                 b2.wait().await;
-                tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
-                    notify_w2.notified(),
-                )
-                .await
-                .is_ok()
+                tokio::time::timeout(std::time::Duration::from_millis(500), notify_w2.notified())
+                    .await
+                    .is_ok()
             });
             let fire_task = tokio::spawn(async move {
                 bf.wait().await;
@@ -1129,7 +1116,10 @@ mod tests {
 
         // Simulate fork_syscall's tgid_registry insert path.
         for _ in 0..3 {
-            let new_pid = parent.process_state.next_pid.fetch_add(1, Ordering::Relaxed);
+            let new_pid = parent
+                .process_state
+                .next_pid
+                .fetch_add(1, Ordering::Relaxed);
             parent.process_state.tgid_registry.lock().insert(new_pid);
         }
         let after: std::collections::HashSet<i32> = parent
@@ -1283,13 +1273,7 @@ async fn run_child(
         Ok(l) => l,
         Err(e) => {
             eprintln!("run_child[{child_pid}]: linker build failed: {e}");
-            register_and_signal(
-                &children_arc,
-                &exit_tx,
-                &child_event,
-                child_pid,
-                139,
-            );
+            register_and_signal(&children_arc, &exit_tx, &child_event, child_pid, 139);
             return;
         }
     };
@@ -1303,13 +1287,7 @@ async fn run_child(
         Ok(i) => i,
         Err(e) => {
             eprintln!("run_child[{child_pid}]: instantiate failed: {e}");
-            register_and_signal(
-                &children_arc,
-                &exit_tx,
-                &child_event,
-                child_pid,
-                139,
-            );
+            register_and_signal(&children_arc, &exit_tx, &child_event, child_pid, 139);
             return;
         }
     };
@@ -1324,38 +1302,20 @@ async fn run_child(
     }
     if let Err(e) = crate::snapshot::apply_snapshot_kernel_state(&snap, store.data_mut()) {
         eprintln!("run_child[{child_pid}]: apply_snapshot_kernel_state failed: {e:?}");
-        register_and_signal(
-            &children_arc,
-            &exit_tx,
-            &child_event,
-            child_pid,
-            139,
-        );
+        register_and_signal(&children_arc, &exit_tx, &child_event, child_pid, 139);
         return;
     }
     let mem_handle = match store.data().memory() {
         Ok(m) => *m,
         Err(_) => {
             eprintln!("run_child[{child_pid}]: no memory after instantiate");
-            register_and_signal(
-                &children_arc,
-                &exit_tx,
-                &child_event,
-                child_pid,
-                139,
-            );
+            register_and_signal(&children_arc, &exit_tx, &child_event, child_pid, 139);
             return;
         }
     };
     if let Err(e) = crate::snapshot::apply_snapshot_to_memory(&snap, mem_handle, &mut store) {
         eprintln!("run_child[{child_pid}]: apply_snapshot_to_memory failed: {e:?}");
-        register_and_signal(
-            &children_arc,
-            &exit_tx,
-            &child_event,
-            child_pid,
-            139,
-        );
+        register_and_signal(&children_arc, &exit_tx, &child_event, child_pid, 139);
         return;
     }
 
@@ -1493,13 +1453,7 @@ pub fn run_child_pub(
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("run_child_pub[{child_pid}]: tokio build failed: {e}");
-            register_and_signal(
-                &children_arc,
-                &exit_tx,
-                &child_event,
-                child_pid,
-                139,
-            );
+            register_and_signal(&children_arc, &exit_tx, &child_event, child_pid, 139);
             return;
         }
     };

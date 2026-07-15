@@ -640,7 +640,10 @@ mod tests {
             "clone(CLONE_THREAD) path: child tgid == parent tgid"
         );
         assert_eq!(
-            child.process_state.next_pid.load(std::sync::atomic::Ordering::Relaxed),
+            child
+                .process_state
+                .next_pid
+                .load(std::sync::atomic::Ordering::Relaxed),
             parent
                 .process_state
                 .next_pid
