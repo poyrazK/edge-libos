@@ -507,6 +507,11 @@ pub enum SnapshotError {
     /// Unknown resource variant encountered during decode.
     UnknownResource,
     Postcard(String),
+    /// Operator supplied a malformed snapshot — e.g. empty `pages`
+    /// vector when one was structurally required. Spec §8 forbids
+    /// panicking on host input; surface it as a typed error so
+    /// `edge-cli serve` exits with a clean message.
+    Invalid(&'static str),
 }
 
 impl std::fmt::Display for SnapshotError {
@@ -536,6 +541,7 @@ impl std::fmt::Display for SnapshotError {
             SnapshotError::AbstractUnixNamespace => write!(f, "abstract unix namespace"),
             SnapshotError::UnknownResource => write!(f, "unknown resource variant"),
             SnapshotError::Postcard(s) => write!(f, "postcard error: {s}"),
+            SnapshotError::Invalid(s) => write!(f, "invalid snapshot: {s}"),
         }
     }
 }
@@ -1241,13 +1247,15 @@ pub fn apply_snapshot_to_shared_memory(
     mem: &wasmtime::SharedMemory,
 ) -> Result<(), SnapshotError> {
     // Grow the shared memory to fit the snapshot's largest page.
-    let target_pages = snap
-        .pages
-        .iter()
-        .map(|p| p.page_index.0 as usize)
-        .max()
-        .unwrap()
-        + 1;
+    let target_pages = {
+        let max_idx = snap
+            .pages
+            .iter()
+            .map(|p| p.page_index.0 as usize)
+            .max()
+            .ok_or(SnapshotError::Invalid("empty pages in snapshot"))?;
+        max_idx + 1
+    };
     let cur_pages: usize = mem.data_size() / PAGE_SIZE_BYTES;
     if target_pages > cur_pages {
         let delta: u64 = (target_pages - cur_pages) as u64;
@@ -1297,13 +1305,19 @@ pub fn apply_snapshot_to_memory(
         return Ok(());
     }
     // How many wasm pages does this snapshot need?
-    let target_pages = snap
-        .pages
-        .iter()
-        .map(|p| p.page_index.0 as usize)
-        .max()
-        .unwrap()
-        + 1;
+    // `is_empty()` is checked above, so `max()` cannot return None — but
+    // we use `ok_or_else` defensively so a future refactor that removes
+    // or reorders the early return cannot regress this into a host panic
+    // (spec §8).
+    let target_pages = {
+        let max_idx = snap
+            .pages
+            .iter()
+            .map(|p| p.page_index.0 as usize)
+            .max()
+            .ok_or(SnapshotError::Invalid("empty pages in snapshot"))?;
+        max_idx + 1
+    };
     let cur_pages: usize = mem.data_size(store.as_context()) / PAGE_SIZE_BYTES;
     if target_pages > cur_pages {
         let delta: u64 = (target_pages - cur_pages) as u64;

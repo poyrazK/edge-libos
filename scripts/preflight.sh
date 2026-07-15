@@ -88,6 +88,9 @@ fi
 run_step 0a "NR-consistency check (Rust ↔ C ↔ dispatch)" \
     bash scripts/check_nr_consistency.sh
 
+run_step 0a-bis "Handler hardening gate (no panic on host input, no lock across .await)" \
+    bash scripts/check_no_fragile_unwraps.sh
+
 run_step 0b "cargo fmt --check" \
     bash -c 'cargo fmt --all -- --check'
 

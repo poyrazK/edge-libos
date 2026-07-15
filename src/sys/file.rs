@@ -939,7 +939,16 @@ pub async fn getdents64(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
             _ => return -crate::errno::EBADF,
         }
         .lock();
-        let cache = fp.dir_cache.as_ref().expect("dir_cache just populated");
+        // `dir_cache` is populated above in the
+        // `if fp.dir_cache.is_none() { ... fp.dir_cache = Some(cached); }`
+        // block, inside the same lock guard; the Some arm is the only one
+        // that can reach here. We `match` instead of `.expect()` so the
+        // impossible None arm returns -EBADF instead of panicking the host
+        // (spec §8 / §9: a kernel handler must never panic on guest state).
+        let cache = match fp.dir_cache.as_ref() {
+            Some(c) => c,
+            None => return -crate::errno::EBADF,
+        };
         let start = fp.pos as usize;
         if start >= cache.len() {
             // Already exhausted.

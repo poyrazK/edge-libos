@@ -9,7 +9,17 @@
 //! The P0 deliverable is that `python -c "print(2+2)"` and `import fastapi`
 //! run to completion inside the guest.
 
-#![allow(clippy::result_large_err)] // our i64 "errors" are kernel-style errnos
+#![allow(clippy::result_large_err)]
+// our i64 "errors" are kernel-style errnos
+// P3-P0 hardening: enforce ADR 0001 §2 / CLAUDE.md rule that
+// `parking_lot::Mutex` guards must not be held across `.await`. The
+// current tree is clean (audited 2026-07-15); this lint goes green
+// immediately and prevents future regressions. `parking_lot::MutexGuard`
+// is already `!Send`, but on the current-thread tokio runtime
+// `edge-libos` uses, `.await` does not require `Send`, so the `!Send`
+// bound does NOT catch the bug — this clippy lint is the only
+// compiler-level enforcement available.
+#![warn(clippy::await_holding_lock)]
 
 pub mod cli;
 pub mod dispatch;
