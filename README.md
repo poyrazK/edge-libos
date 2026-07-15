@@ -67,17 +67,22 @@ artifact and requires `zig cc` + a git submodule — see `guest/build.sh`.
 
 ## Test totals
 
-- **144** Rust unit tests (in `#[cfg(test)]` modules under `src/`)
-- **210** Rust integration tests (across `tests/*.rs`)
+- **160** Rust unit tests (in `#[cfg(test)]` modules under `src/`)
+- **213** Rust integration tests (across `tests/*.rs`)
 - **106** C conformance tests (`tests/conformance/*.c`, marker-enforced)
-- **Total: 460 tests.** Source of truth: `bash tests/count_tests.sh`.
+- **Total: 479 tests.** Source of truth: `bash tests/count_tests.sh`.
 
 P2-D3.5 lands: `NR_SNAPSHOT=123` (guest-driven quiescence),
 `EDGE_SERVE_FD_<N>=<fd>` (systemd-style socket activation),
 `Kernel::attach_inherited_listeners` plumbing, the real
 `edge-cli freeze` and `edge-cli serve` bodies (replacing the
 D3.3 stubs), and the subprocess variant of `edge-cli migrate`.
-See `HANDOFF.md` for the per-deliverable breakdown.
+The D3.5 follow-up #1 (ADR 0005) lands the SHA-256 module-hash
+portability check: `edge-cli freeze` embeds the freeze-side
+`.wasm` SHA-256 in `KernelSnapshot.module_sha256`, and
+`edge-cli serve` refuses to apply a snapshot whose hash does
+not match the serve-side wasm. See `HANDOFF.md` for the
+per-deliverable breakdown.
 
 P2 added `statx(2)` + a C test (B4), `dup/dup2/dup3` + shared-state
 refactor + 5 C tests (B5), the identity/process/signal/time/ioctl/
