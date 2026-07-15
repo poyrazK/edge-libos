@@ -88,6 +88,12 @@ pub struct Kernel {
     /// follow-up lands the blocking variant once PR 4's child
     /// fiber can actually call `exit`).
     pub child_event: Arc<Notify>,
+    /// P2 metering (ADR 0003 §4): monotonic CPU time consumed by
+    /// the guest since the last `set_fuel` reset. Reported in `serve`'s
+    /// per-request log line and in `bench`'s per-iter print; snapshotted
+    /// so `serve` carries usage across restore.
+    /// SNAPSHOT: include.
+    pub cpu_ns: u64,
 }
 
 /// P3 Tier-6: per-child exit status recorded in `Kernel.children`.
@@ -163,6 +169,7 @@ impl Kernel {
             next_pid: AtomicI32::new(2),
             children: parking_lot::Mutex::new(HashMap::new()),
             child_event: Arc::new(Notify::new()),
+            cpu_ns: 0,
         }
     }
 

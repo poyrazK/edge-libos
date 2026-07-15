@@ -112,6 +112,10 @@ pub fn run_main_from<I: IntoIterator<Item = String>>(args: I) -> i32 {
             eprintln!("edge-cli: bench: {msg}");
             1
         }
+        Err(CliError::Metered(msg)) => {
+            eprintln!("edge-cli: cpu budget exceeded: {msg}");
+            1
+        }
         Err(CliError::MissingSubcommand) | Err(CliError::Unknown(_)) => 2,
     }
 }

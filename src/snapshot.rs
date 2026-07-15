@@ -184,6 +184,14 @@ pub struct KernelSnapshot {
     /// rebuild-on-restore contract. Append-only field: snapshot
     /// format version stays at `SNAPSHOT_FORMAT_VERSION = 1`.
     pub futex_table: Vec<crate::sys::futex::FutexAddrSnapshot>,
+    /// ADR 0003 §4: monotonic CPU time consumed by the guest since
+    /// `set_fuel` was last called. Reported by `serve` per-request
+    /// and by `bench` per-iter; snapshotted so that the post-restore
+    /// loop carries the pre-freeze usage across the boundary. Append
+    /// to the end of the struct keeps the postcard wire format
+    /// backward-compatible (postcard is forgiving of new fields).
+    /// Snapshot format version stays at `SNAPSHOT_FORMAT_VERSION = 1`.
+    pub cpu_ns: LeU64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -631,6 +639,11 @@ fn build_kernel_snapshot(kernel: &Kernel, pages: Vec<MemoryPageSnapshot>) -> Ker
             let table = kernel.futex_table.lock();
             table.snapshot()
         },
+        // ADR 0003 §4: `cpu_ns` is snapshotted as `LeU64` so the
+        // post-restore loop carries the pre-freeze usage. The field
+        // is appended at the end of the struct so the postcard wire
+        // format stays backward-compatible with v1 readers.
+        cpu_ns: LeU64(kernel.cpu_ns),
     }
 }
 
@@ -748,6 +761,14 @@ pub fn apply_snapshot_kernel_state(
         let mut table = kernel.futex_table.lock();
         table.rebuild_from_snapshot(&snap.futex_table);
     }
+
+    // ADR 0003 §4: restore the cpu_ns accumulator verbatim. The fuel
+    // counter itself is per-Store and is NOT serialized — it is
+    // reset by `serve`/`bench` via `set_fuel(budget)` on the next
+    // request. Only the cumulative wall-clock-equivalent is carried
+    // across restore, matching the "process-scoped, not request-
+    // scoped" semantics in ADR 0003 §4.
+    kernel.cpu_ns = snap.cpu_ns.0;
 
     // ---- fd table ---------------------------------------------------------
     use crate::fd::{
@@ -1089,6 +1110,7 @@ mod tests {
             exit_code: None,
             comm: [0u8; 16],
             futex_table: vec![],
+            cpu_ns: LeU64::default(),
         };
         let bytes = postcard::to_stdvec(&snap).expect("encode");
         let back: KernelSnapshot = postcard::from_bytes(&bytes).expect("decode");
@@ -1682,6 +1704,7 @@ mod tests {
             exit_code: None,
             comm: [0u8; 16],
             futex_table: vec![],
+            cpu_ns: LeU64::default(),
         }
     }
 

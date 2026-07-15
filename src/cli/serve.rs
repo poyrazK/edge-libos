@@ -209,6 +209,7 @@ mod tests {
             exit_code: None,
             comm: [0u8; 16],
             futex_table: vec![],
+            cpu_ns: LeU64::default(),
         }
     }
 

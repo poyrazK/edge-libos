@@ -18,6 +18,7 @@ pub mod fd;
 pub mod host;
 pub mod kernel;
 pub mod mem;
+pub mod meter;
 pub mod mm;
 pub mod snapshot;
 pub mod sys;
