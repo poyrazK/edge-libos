@@ -205,7 +205,12 @@ async fn serve_loop(
     let mut linker: Linker<Kernel> = Linker::new(&engine);
     add_to_linker(&mut linker)?;
 
-    let kernel = Kernel::new(vec![], vec![]);
+    let mut kernel = Kernel::new(vec![], vec![]);
+    // P2-DNS: attach operator-supplied resolver config (denylist /
+    // TTL / timeout) from EDGE_RESOLVER_* env vars. See ADR 0007.
+    let resolver_cfg =
+        crate::sys::resolver::ResolverConfig::from_env(&std::env::vars().collect::<Vec<_>>());
+    kernel.attach_resolver_config(resolver_cfg);
     let mut store: Store<Kernel> = build_store(&engine, kernel);
 
     let bytes = std::fs::read(wasm_path)
