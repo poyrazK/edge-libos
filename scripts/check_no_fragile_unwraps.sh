@@ -87,68 +87,64 @@ fi
 # Scoped to files that hold parking_lot guards in handler paths.
 # src/snapshot.rs is excluded — its locks live inside sync `fn`s.
 #
-# Heuristic: `.lock()` directly on a line whose next non-blank, non-
-# comment line contains `.await` is the obvious bug class — the
-# canonical "take-out-under-lock, await on bare handle" pattern always
-# separates the lock and the await by a brace-close (the let-block ends)
-# and at least one intervening statement. Anything that close is a
-# false positive of the simple form below; clippy::await_holding_lock
-# (enabled in src/lib.rs) catches the rest.
+# Strategy: intentionally MINIMAL. The load-bearing compiler-level
+# enforcement is `clippy::await_holding_lock` (enabled in src/lib.rs
+# by this PR). This script is a backstop for the narrowest bug class:
 #
-# This scan is INTENTIONALLY narrow:
-#   - Look at lines whose `.lock()` is NOT a chain expression
-#     (`xxx.lock().something`) — those are either construction
-#     (`.lock()` returns a guard, immediately used and dropped) or
-#     chain (no guard to hold).
-#   - Exclude lines inside `#[cfg(test)] mod tests` blocks by scanning
-#     each file and zeroing out the "in_test" flag on `#[cfg(test)]`.
+#   let g = x.lock();   ← single-line let-binding
+#   foo.await;          ← next non-blank line
 #
-# If this heuristic ever fires on real code, the fix is to add a
-# `drop(guard);` between the .lock() and the .await, not to widen the
-# heuristic — wider heuristics produce false positives like the
-# canonical `let (x, y) = { ... }; await` pattern.
+# Excludes (verified by tests below):
+#   - `*x.lock() += 1;`        — deref assignment, guard consumed by op
+#   - `x.lock().method()`      — chain, guard held only for the chain
+#   - `let g = { ... lock(); ... }; await` — multi-line block, guard
+#     dropped inside the block (canonical ADR 0001 §2 pattern)
+#   - locks inside `#[cfg(test)] mod tests { ... }`
+#
+# Anything more elaborate — cross-function futures, guards held in
+# struct fields, nested match arms — is caught by
+# `clippy::await_holding_lock`. Wider heuristics here produce false
+# positives; if this gate ever fires on real production code, the
+# fix is to add `drop(guard);` (or scope the let-block tighter),
+# not to widen the heuristic.
 lock_await_violations=$(mktemp)
 trap 'rm -f "$lock_await_violations"' EXIT
 
 for f in src/sys/*.rs src/fd.rs; do
     [[ -f "$f" ]] || continue
-    # Skip test modules entirely. They live in `#[cfg(test)] mod tests
-    # { ... }` blocks; awk can't reliably skip them, so we just rely
-    # on tests being self-contained (cargo test compile errors will
-    # surface any lock-across-await there).
-    if grep -qE '^#\[cfg\(test\)\]' "$f"; then
-        # File has a test mod. Per-file, awk tracks "in_test" so we
-        # can suppress violations inside the test block. This is a
-        # best-effort filter — the canonical guard discipline is
-        # already enforced by clippy::await_holding_lock which catches
-        # both production and test code uniformly.
-        :
-    fi
-    # The simple scan: lines like `<expr>.lock()` followed by `.await`
-    # within 5 lines. The canonical "let x = { ... }; await" pattern
-    # always has the .await at least 3-4 lines after the .lock()
-    # (because of the brace-close + intervening statement); a tighter
-    # 5-line window catches the obvious bug class without false
-    # positives on the canonical pattern.
+
     awk '
+        BEGIN { in_test = 0; last_lock = 0 }
         {
             line = $0
-            # Strip line comments before matching
-            sub(/\/\/.*$/, "", line)
+            sub(/\/\/.*$/, "", line)  # strip line comments
         }
-        line ~ /\.lock\(\)/ && line !~ /\.lock\(\)\./ && last_lock == 0 {
+        /^#\[cfg\(test\)\]/ { in_test = 1; next }
+        in_test && /^}/ { in_test = 0; next }
+        in_test { next }
+
+        # Match a single-line `let <name> = <expr>.lock();` — semicolon
+        # at end of line means the guard is alive on the next line.
+        # Exclude deref-assignment (`*x.lock() = ...`) and chain
+        # (`x.lock().something`).
+        line ~ /^[ \t]*let[ \t]+(mut[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]*=/ \
+            && line ~ /\.lock\(\)[ \t]*;/ \
+            && line !~ /\*[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*\.lock\(\)/ \
+            && line !~ /\.lock\(\)[ \t]*\./ {
             last_lock = NR
         }
-        line ~ /\.await/ && last_lock > 0 && NR > last_lock && NR - last_lock <= 5 {
-            print FILENAME ":" NR ": parking_lot .lock() at L" last_lock " followed quickly by .await — review whether the guard is held across the await"
+
+        # `.await` on the very next non-blank line = obvious bug.
+        line ~ /\.await/ && last_lock > 0 && NR == last_lock + 1 {
+            print FILENAME ":" NR ": parking_lot .lock() bound at L" last_lock ", .await on next line — review whether the guard is held across the await"
             last_lock = 0
         }
-        NR - last_lock > 5 { last_lock = 0 }
+        NR > last_lock + 1 { last_lock = 0 }
     ' "$f" >> "$lock_await_violations" || true
 done
 
 if [[ -s "$lock_await_violations" ]]; then
-    echo "FAIL: parking_lot::Mutex::lock() near .await detected (review each):" >&2
+    echo "FAIL: parking_lot::Mutex::lock() bound to a name with .await on next line:" >&2
     cat "$lock_await_violations" >&2
     fail=1
 fi
