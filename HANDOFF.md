@@ -101,13 +101,25 @@ that the v1 contract defers:
 4. **`Module::serialize` cross-host** — wasmtime's compiled
    `Module` artifact is host-arch-specific. Each host must
    re-compile its own `Module` from the `.wasm`.
-5. **`SmallVec<[Waker; 2]>`** — the plan's preferred waker
-   storage. v1 uses `Option<Waker>` because the typical case
-   is one waiter per child and `SmallVec` is only transitive.
-6. **`CLONE_VM` / `CLONE_THREAD` / `CLONE_FILES`** — rejected
-   with `-EINVAL` per the clone(56) handler; landing the
-   underlying shared-state machinery is behind the same
-   follow-up that adds child-fiber resumption.
+5. **`SmallVec<[Waker; 2]>`** — closed by M5 (`p3-v2-fork-clone-threads`).
+   `ChildExitStatus::waker: Option<Waker>` was replaced with
+   `notify: Arc<Notify>` using the clone-on-lock-out pattern
+   from ADR 0001 §2. Multiple concurrent waiters on the same
+   child PID now all wake via a single
+   `notify.notify_waiters()` fire (v1's single-waiter
+   `Option<Waker>` would have clobbered any second caller).
+   The 1ms polling block in `wait4_syscall` is gone.
+6. **`CLONE_VM` / `CLONE_THREAD` / `CLONE_FILES`** —
+   `CLONE_VM | CLONE_THREAD` are accepted at the
+   flag-validation layer (M4, branch `p3-v2-fork-clone-threads`),
+   with TID writeback working under any combination. The
+   full SharedMemory hand-off + child-thread spawn on
+   `CLONE_VM` lands with the WAT-based integration test in
+   M7 (the first place the engine+module references are
+   reachable through the dispatch path). `CLONE_FILES`,
+   `CLONE_SIGHAND`, `CLONE_FS`, `CLONE_IO`, `CLONE_VFORK`,
+   and the `CLONE_NEW*` namespace flags remain rejected per
+   ADR 0006 §6.
 7. **`WUNTRACED` / `WCONTINUED` / `WNOWAIT` / `WALL`** —
    wait4 flag bits rejected with `-EINVAL`. Signal-aware wait4
    lands with a real signal delivery story.
@@ -258,6 +270,52 @@ the silent mis-execution caveat formerly called out by ADR 0002
 §8. Wire-format impact: +32 bytes per snapshot. Pre-existing v1
 snapshots still decode cleanly via the `[0u8; 32]` skip-verify
 quirk.
+
+## P3-Tier-8-v2 — fork(57) / clone(56) / wait4(61) with real child threads
+
+Closes HANDOFF items **#1** (deferred child-fiber resumption) and
+**#6** (`CLONE_VM` / `CLONE_THREAD` flag rejection) on branch
+`p3-v2-fork-clone-threads`. Seven commits (M1–M7) plus a fmt fix
+plus the origin/main merge. Lands the per-process / per-thread
+`Kernel` field split, full `CLONE_VM | CLONE_THREAD` flag set
+with `SharedMemory` hand-off, multi-waiter `wait4` via per-child
+`Arc<Notify>`, `kill` / `tgkill` routing through `tgid_registry`,
+and the child-thread panic sentinel (139).
+
+| # | Sub-deliverable | Status |
+|---|---|---|
+| 1 | M1: Threaded child skeleton — fork returns child PID, child thread drives `_start` on its own `Store<Kernel>` + `Module` + `Linker` + tokio current-thread runtime. | ✅ `919de2f` |
+| 2 | M2: `fork_syscall` no longer inserts into parent's `Kernel.children` synchronously; the child thread owns the lifecycle and registers the entry before resuming `_start`. | ✅ `5a0dfb8` |
+| 3 | M3: `ProcessState` struct + per-process / per-thread field split. New fields on `Kernel`: `tid`, `tgid`, `process_state: Arc<ProcessState>`. | ✅ `14c6048` |
+| 4 | M4: `CLONE_VM \| CLONE_THREAD \| CLONE_CHILD_SETTID \| CLONE_PARENT_SETTID` accepted; `SharedMemory` hand-off swaps parent's `Owned(Memory)` for `Shared(SharedMemory)` so parent + child see each other's writes. | ✅ `c93422c` |
+| 5 | M5: `ChildExitStatus::waker: Option<Waker>` → `notify: Arc<Notify>`. Replaces the 1ms polling block in `wait4_syscall` with `notify.notified().await`. Multiple concurrent waiters on the same child PID now all wake. | ✅ `9ffe923` |
+| 6 | M6: Per-thread `tid` / per-process `tgid`, signal-mask inheritance, `kill(pid, sig)` via `tgid_registry`, `tgkill(tgid, tid, sig)` with zero-arg substitution (`tgid == 0` / `tid == 0` → caller's). Panic sentinel: `exit_code = 139` on child thread unwind. | ✅ `af51b7a` |
+| 7 | M7: WAT round-trip `tests/guests/fork_child_runs.wat` (`fork()` → child `NR_EXIT(42)` → parent `wait4` → observed exit code = 42) + HANDOFF close-out + ADR 0006. | ✅ `fc72bd1` |
+
+### Test totals (P3-Tier-8-v2 close)
+
+| Source | Pre-v2 → Post-v2 |
+|---|---|
+| Rust unit | 160 → **169** (+9) |
+| Rust integration | 213 → **215** (+2) |
+| C conformance | 106 → 106 (unchanged) |
+| **Grand total** | **479 → 490** |
+
+Net Rust new tests:
+- `src/kernel.rs::tests`: 3 (`process_state_shares_futex_table_across_threads`, `fork_copies_per_process_state_to_child`, `fork_does_not_share_per_thread_rng_seed`)
+- `src/sys/process.rs::tests`: 6 (`init_kernel_has_tid_and_tgid_one`, `fork_via_new_for_child_assigns_distinct_tid`, `clone_thread_via_new_for_child_shares_tgid_with_parent`, `clone_thread_inherits_signal_mask`, `tgid_registry_grows_with_fork_pids`, `concurrent_waiters_on_same_child_notify_both_wake`, `register_and_signal_updates_existing_entry_preserving_notify`, `kill_to_thread_group_routes_to_all_members`)
+- `tests/fork_conformance.rs`: 1 (`fork_with_real_child_thread_returns_child_exit_code_via_wat`)
+- `tests/clone_conformance.rs`: 1 (`clone_vm_threads_share_writes_across_stores`)
+
+### Architectural decisions (P3-Tier-8-v2)
+
+#### ADR 0006 — P3 clone threads (v2 of fork/clone/wait4)
+Accepted. Pins the per-thread `Kernel` field split (`Arc<ProcessState>`), `Arc<Engine>` + `Arc<Module>` ownership, `Arc<Notify>` clone-on-lock-out multi-waiter pattern (replacing v1's single-waiter `Option<Waker>`), the v2-supported clone flag set (`CLONE_VM | CLONE_THREAD | CLONE_CHILD_SETTID | CLONE_PARENT_SETTID`), tgid / tid routing for `kill` / `tgkill`, and the child-thread panic sentinel (`exit_code = 139`). Note: ADR numbering shifted from 0005 → 0006 when the snapshot module-hash ADR landed on `main` in PR #25.
+
+### HANDOFF items closed by v2
+
+- **Item #1** (deferred child-fiber resumption): closed by M1 + M2. `fork_syscall` spawns a real `std::thread` driving a fresh `Store<Kernel>` to `_start.call_async`. End-to-end tested by `tests/fork_conformance.rs::fork_with_real_child_thread_returns_child_exit_code_via_wat`.
+- **Item #6** (`CLONE_VM` / `CLONE_THREAD`): closed by M4 + M6. `clone(CLONE_VM | CLONE_THREAD | CLONE_CHILD_SETTID | CLONE_PARENT_SETTID)` is accepted; child shares linear memory via `SharedMemory` and joins the parent's tgid. End-to-end tested by `tests/clone_conformance.rs::clone_vm_threads_share_writes_across_stores`.
 
 ## Repo hygiene post-merge
 

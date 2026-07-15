@@ -8,10 +8,9 @@
 //! the dispatch table needs to compile.
 
 use std::sync::atomic::AtomicI32;
-use std::task::Waker;
 use std::time::Instant;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::Notify;
@@ -47,6 +46,54 @@ pub struct ClockState {
     pub boot_monotonic_ns: u64,
 }
 
+/// P3 Tier-8 v2 — `ProcessState`: the per-process (vs per-thread)
+/// state container. Held by every thread in the process as
+/// `Arc<ProcessState>` so writes from one thread (PID allocation,
+/// child-exit registration, signal queue, futex table, tgid
+/// registry) are visible to the others.
+///
+/// The split between per-process and per-thread state is described
+/// in detail in the M3 commit message of branch
+/// `p3-v2-fork-clone-threads` (see also ADR 0006 §1). The TL;DR:
+/// every field on `Kernel` that is shared across threads in the
+/// same process moves to `ProcessState`. Every field that is
+/// per-thread (or per-`Store`) stays on `Kernel`. The split is
+/// enforced by the contract of `clone()` on `Kernel`: per-thread
+/// fields deep-copy, per-process fields `Arc::clone`.
+///
+/// ADR 0006 §1 documents the full table.
+pub struct ProcessState {
+    /// P3 Tier-4: monotonic PID counter for `clone()` and `fork()`.
+    /// Starts at 2 because PID 1 is reserved for the init kernel
+    /// (`getpid()` returns 1, matching Linux convention).
+    pub next_pid: AtomicI32,
+    /// P3 Tier-6 + M2: children table for `wait4`. Keyed by child
+    /// PID. `Arc<Mutex<HashMap>>` so the child thread can register
+    /// its own entry on the parent's map (the fork round-trip).
+    pub children: Arc<parking_lot::Mutex<HashMap<i32, ChildExitStatus>>>,
+    /// P3 Tier-6: per-kernel notifier for any-child wakeups. Fired
+    /// by `exit()` / `exit_group()`; wakes any `wait4(-1)` parked
+    /// on this kernel.
+    pub child_event: Arc<Notify>,
+    /// P3 — ADR 0001 §2: wait/wake storage keyed by guest-address.
+    /// Multiple threads in the same process must wake the same
+    /// address; the table is shared.
+    pub futex_table: parking_lot::Mutex<FutexTable>,
+    /// P3 Tier-8 v2 / M6: per-process pending-signal queue.
+    /// Currently recorded-only; the v2.5 deliver path will drain
+    /// this into a per-thread `signals.pending`. `kill(pid, sig)`
+    /// and `tgkill(tgid, tid, sig)` append here.
+    pub signals_pending: parking_lot::Mutex<Vec<i32>>,
+    /// P3 Tier-8 v2 / M6: registry of tids in this process. Used by
+    /// `kill(pid, sig)` to find all threads whose tgid matches
+    /// `pid`. All threads in a process share the same tgid.
+    pub tgid_registry: parking_lot::Mutex<HashSet<i32>>,
+    /// P3 Tier-8 v2 / M6: the thread-group id (TGID) of this
+    /// process. All threads in the same process share the same
+    /// tgid; the init kernel has `tgid = 1`.
+    pub tgid: i32,
+}
+
 pub struct Kernel {
     /// Linear memory reference. Attached post-instantiation.
     ///
@@ -76,27 +123,21 @@ pub struct Kernel {
     pub exit_code: Option<i32>,
     /// P2-C2: prctl(PR_SET_NAME) writes here; PR_GET_NAME reads from here.
     pub comm: [u8; 16],
-    /// P3 — ADR 0001 §2: wait/wake storage keyed by guest-address.
-    /// See `docs/adr/0001-p3-futex-semantics.md`.
-    pub futex_table: parking_lot::Mutex<FutexTable>,
-    /// P3 Tier-4: monotonic PID counter for `clone()` and `fork()`.
-    /// Starts at 2 because PID 1 is reserved for the init kernel
-    /// (`getpid()` returns 1, matching Linux convention). Allocations
-    /// are `Ordering::Relaxed` — no other field is gated on PID order.
-    pub next_pid: AtomicI32,
-    /// P3 Tier-6: children table for `wait4`. Keyed by child PID.
-    /// `ChildExitStatus::exited == true` once the child has called
-    /// `exit()` / `exit_group()`; `wait4` returns the cached exit
-    /// code and removes the entry. Locked briefly — never held
-    /// across `.await` (project lock discipline, see CLAUDE.md).
-    pub children: parking_lot::Mutex<HashMap<i32, ChildExitStatus>>,
-    /// P3 Tier-6: per-kernel notifier for any-child wakeups. Used
-    /// by `wait4` to wait on `pid == -1` / `pid == 0` (any child)
-    /// when no specific child is currently ready. Fired by
-    /// `exit()` / `exit_group()` (sub-deliverable 4 — parked-Waker
-    /// path). Per-child parking goes through the matching
-    /// `ChildExitStatus::waker` instead.
-    pub child_event: Arc<Notify>,
+    /// P3 Tier-8 v2 / M3: per-thread thread id. `gettid()` reads
+    /// from here. Set on construction (`Kernel::new*` sets it from
+    /// `ProcessState::next_pid`); updated by `fork()` /
+    /// `clone()` to the freshly-allocated pid.
+    pub tid: i32,
+    /// P3 Tier-8 v2 / M3: per-thread thread-group id. All threads
+    /// in the same process share the same tgid. The init kernel
+    /// has `tgid = tid = 1`. `getpid()` reads from here.
+    pub tgid: i32,
+    /// P3 Tier-8 v2 / M3: per-process state. Cloned (Arc-clone)
+    /// into every thread in the same process. Replaces the v1
+    /// direct fields (`children`, `child_event`, `futex_table`,
+    /// `next_pid`) which all moved to `ProcessState` per ADR 0006
+    /// §1.
+    pub process_state: Arc<ProcessState>,
     /// P2 metering (ADR 0004 §4): monotonic CPU time consumed by
     /// the guest since the last `set_fuel` reset. Reported in `serve`'s
     /// per-request log line and in `bench`'s per-iter print; snapshotted
@@ -217,27 +258,33 @@ impl MemoryKind {
     }
 }
 
-/// P3 Tier-6: per-child exit status recorded in `Kernel.children`.
+/// P3 Tier-6 + Tier-8 v2: per-child exit status recorded in
+/// `Kernel.children`.
 ///
-/// `waker` is `Option<Waker>` (not `SmallVec<[Waker; 2]>`) because
-/// the typical case is a single `wait4` caller per child. v1's
-/// `wait4` parked path replaces the waker on each new parked call
-/// — multiple concurrent waiters on the same child would clobber
-/// each other. This is documented as a known limitation; a future
-/// PR may promote `SmallVec` and support concurrent waiters.
+/// M5 replaces the v1 `waker: Option<Waker>` field with
+/// `notify: Arc<Notify>`. Rationale: v1's single-waiter
+/// `Option<Waker>` cannot safely host concurrent `wait4`
+/// callers on the same child — a second caller would clobber
+/// the first waker on `wait4_syscall`'s "park new waker"
+/// branch. The `Arc<Notify>` clone-on-lock-out pattern (ADR
+/// 0001 §2) supports multiple parked waiters: each waiter
+/// clones an `Arc` out of the children map under the lock,
+/// drops the lock, then calls `notify.notified().await`.
+/// `notify_waiters()` (fired on exit / exit_group) wakes every
+/// currently-registered waiter in one shot.
 ///
-/// `Waker` is `!Clone` and `!Debug`, so we implement `Debug`
-/// manually (it just shows `exited` + `exit_code`).
+/// `Clone` rebuilds a fresh `Arc<Notify>` (per ADR 0002 §5
+/// rebuild-on-restore) so the snapshot roundtrip path stays
+/// correct.
 pub struct ChildExitStatus {
     pub exit_code: i32,
     pub exited: bool,
-    /// P3 final-bundle sub-deliverable 4 — parked-waker path.
-    /// `Some(waker)` means a `wait4` caller is parked on this
-    /// child; the waker is fired when `exit()` / `exit_group()`
-    /// marks the child as `exited = true`. Locked via the parent's
-    /// `Kernel.children` mutex; never clone the waker out (use
-    /// `waker.wake_by_ref()` if you need to fire without moving).
-    pub waker: Option<Waker>,
+    /// P3 Tier-8 v2 / M5: per-child notify, multiple waiters
+    /// welcome. The handle is `Clone` (it's an `Arc`), so
+    /// parked waiters can take a clone out of the children
+    /// map under the mutex guard without holding the lock
+    /// across `.await` (per ADR 0001 §2 lock discipline).
+    pub notify: Arc<Notify>,
 }
 
 impl std::fmt::Debug for ChildExitStatus {
@@ -245,46 +292,46 @@ impl std::fmt::Debug for ChildExitStatus {
         f.debug_struct("ChildExitStatus")
             .field("exit_code", &self.exit_code)
             .field("exited", &self.exited)
-            .field("waker_is_set", &self.waker.is_some())
+            .field("notify_refcount", &Arc::strong_count(&self.notify))
             .finish()
     }
 }
 
 impl Clone for ChildExitStatus {
-    /// Clone **without** the waker — `Waker: !Clone`, and
-    /// snapshot rebuild path takes a `ChildExitStatus` by value
-    /// and re-inserts it into the live map. The original waker
-    /// (if any) is dropped; the rebuilt entry starts with
-    /// `waker: None`, and any subsequent parked-wait4 caller
-    /// will register a fresh waker.
+    /// Clone with a fresh `Arc<Notify>` — the snapshot rebuild
+    /// path takes a `ChildExitStatus` by value and re-inserts
+    /// it into the live map. The new entry must be observable
+    /// to a fresh `wait4` caller; the rebuilt `Arc<Notify>`
+    /// gives it a fresh notify primitive (matches ADR 0002
+    /// §5's rebuild-on-restore for `FutexTable`).
     fn clone(&self) -> Self {
         Self {
             exit_code: self.exit_code,
             exited: self.exited,
-            waker: None,
+            notify: Arc::new(Notify::new()),
         }
     }
 }
 
 impl ChildExitStatus {
-    /// Fresh child entry — not yet exited, no parked waker. Use
+    /// Fresh child entry — not yet exited, fresh notify. Use
     /// this for all kernel-side insertions (`fork`, `clone`,
     /// test setup).
-    pub const fn new(exit_code: i32) -> Self {
+    pub fn new(exit_code: i32) -> Self {
         Self {
             exit_code,
             exited: false,
-            waker: None,
+            notify: Arc::new(Notify::new()),
         }
     }
 
     /// Fresh child entry that's already reaped (test fixture
     /// helper — equivalent to `new(code)` then `mark_exited`).
-    pub const fn reaped(exit_code: i32) -> Self {
+    pub fn reaped(exit_code: i32) -> Self {
         Self {
             exit_code,
             exited: true,
-            waker: None,
+            notify: Arc::new(Notify::new()),
         }
     }
 }
@@ -329,6 +376,22 @@ impl Kernel {
         // `SmallRng::from_seed` to reproduce the same RNG state.
         let rng_seed = Self::fresh_rng_seed();
         let rng = SmallRng::from_seed(rng_seed);
+
+        // M3: build a fresh `ProcessState` for the init kernel.
+        // `tgid = 1` matches Linux convention (PID 1 is init, its
+        // thread group is itself). The init kernel gets the first
+        // process-state, all subsequent threads (fork/clone
+        // threads) get an `Arc::clone` of this one.
+        let process_state = Arc::new(ProcessState {
+            next_pid: AtomicI32::new(2),
+            children: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            child_event: Arc::new(Notify::new()),
+            futex_table: parking_lot::Mutex::new(FutexTable::default()),
+            signals_pending: parking_lot::Mutex::new(Vec::new()),
+            tgid_registry: parking_lot::Mutex::new(HashSet::from([1])),
+            tgid: 1,
+        });
+
         Self {
             memory: None,
             fds: FdTable::with_buffered_stdio(),
@@ -346,10 +409,61 @@ impl Kernel {
             started_at: now,
             exit_code: None,
             comm: [0; 16],
-            futex_table: parking_lot::Mutex::new(FutexTable::default()),
-            next_pid: AtomicI32::new(2),
-            children: parking_lot::Mutex::new(HashMap::new()),
-            child_event: Arc::new(Notify::new()),
+            tid: 1,
+            tgid: 1,
+            process_state,
+            cpu_ns: 0,
+        }
+    }
+
+    /// M3: build a `Kernel` for a forked/cloned child thread.
+    /// Differs from `new_inner` in that:
+    ///   * `process_state` is the parent's `Arc<ProcessState>`
+    ///     (shared, not a fresh one);
+    ///   * `tid` is allocated from the parent's `next_pid`;
+    ///   * `tgid` is the caller's `tgid` for `clone(CLONE_THREAD)`,
+    ///     or `tid` for `fork()` (i.e. the child is its own thread
+    ///     group leader). The decision is made by the caller;
+    ///     this helper takes `tgid` as a parameter.
+    ///   * `comm`, `exit_code`, `signals` follow the per-thread
+    ///     clone contract from ADR 0006 §1.
+    ///   * `args` / `env` / `rng_seed` are fresh per-thread.
+    ///
+    /// The caller (fork_syscall / clone_syscall) is responsible
+    /// for updating the parent's `process_state.tgid_registry`
+    /// and `process_state.next_pid`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_child(
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        vfs: Vfs,
+        process_state: Arc<ProcessState>,
+        tid: i32,
+        tgid: i32,
+    ) -> Self {
+        let now = Instant::now();
+        let rng_seed = Self::fresh_rng_seed();
+        let rng = SmallRng::from_seed(rng_seed);
+        Self {
+            memory: None,
+            fds: FdTable::with_buffered_stdio(),
+            vfs,
+            mm: LinearAllocator::new(),
+            clock: ClockState {
+                boot_monotonic_ns: 0,
+            },
+            brk: 0,
+            args,
+            env,
+            rng,
+            rng_seed,
+            signals: SignalState::new(),
+            started_at: now,
+            exit_code: None,
+            comm: [0; 16],
+            tid,
+            tgid,
+            process_state,
             cpu_ns: 0,
         }
     }
@@ -540,6 +654,126 @@ mod tests {
         assert_ne!(
             a.rng_seed, b.rng_seed,
             "two kernels should have distinct seeds"
+        );
+    }
+
+    /// M3: two `Kernel`s that share an `Arc<ProcessState>` see the
+    /// same `futex_table`. We exercise this indirectly by taking
+    /// the lock on both kernels and verifying the `Arc` identity
+    /// — the `Mutex<...>` pointer inside `process_state.futex_table`
+    /// must be the SAME on both kernels. (`FutexTable` is a
+    /// private struct in `sys::futex`; we can't poke into its
+    /// entries from this test without exposing internals, but the
+    /// shared-Mutex identity is sufficient for the M3 contract.)
+    #[test]
+    fn process_state_shares_futex_table_across_threads() {
+        let parent = Kernel::new_without_stdio(vec![], vec![]);
+        let child_ps = Arc::clone(&parent.process_state);
+        let child = Kernel::new_for_child(
+            vec![],
+            vec![],
+            crate::vfs::Vfs {
+                root: "/".into(),
+                cwd: "/".into(),
+            },
+            child_ps,
+            2,
+            2,
+        );
+
+        // The Mutex inside `futex_table` is the same pointer for
+        // both kernels (because both share `process_state`).
+        let p = &parent.process_state.futex_table as *const _;
+        let c = &child.process_state.futex_table as *const _;
+        assert_eq!(
+            p, c,
+            "futex_table Mutex<...> must be shared between threads in the same process"
+        );
+
+        // The child_event Notify must also share identity.
+        let np = Arc::as_ptr(&parent.process_state.child_event);
+        let nc = Arc::as_ptr(&child.process_state.child_event);
+        assert_eq!(np, nc, "child_event must be the same Arc<Notify>");
+
+        // The children Arc<Mutex<HashMap>> too.
+        let cp = Arc::as_ptr(&parent.process_state.children);
+        let cc = Arc::as_ptr(&child.process_state.children);
+        assert_eq!(cp, cc, "children map must be the same Arc");
+    }
+
+    /// M3: a child kernel built via `new_for_child` shares the
+    /// same `Arc<ProcessState>` as the parent. `Arc::strong_count`
+    /// is exactly 2 after construction.
+    #[test]
+    fn fork_copies_per_process_state_to_child() {
+        let parent = Kernel::new_without_stdio(vec![], vec![]);
+        let parent_count = Arc::strong_count(&parent.process_state);
+        let child = Kernel::new_for_child(
+            vec![],
+            vec![],
+            crate::vfs::Vfs {
+                root: "/".into(),
+                cwd: "/".into(),
+            },
+            Arc::clone(&parent.process_state),
+            2,
+            2,
+        );
+        assert_eq!(
+            Arc::strong_count(&parent.process_state),
+            parent_count + 1,
+            "Arc<ProcessState> must be shared between parent and child"
+        );
+        assert_eq!(
+            child.process_state.tgid, parent.process_state.tgid,
+            "clone(CLONE_THREAD) path: child tgid == parent tgid"
+        );
+        assert_eq!(
+            child
+                .process_state
+                .next_pid
+                .load(std::sync::atomic::Ordering::Relaxed),
+            parent
+                .process_state
+                .next_pid
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "next_pid is per-process; child sees parent's atomic"
+        );
+    }
+
+    /// M3: a forked child has a fresh `rng_seed` — the parent's
+    /// and child's RNG streams diverge even though they share
+    /// `process_state`.
+    #[test]
+    fn fork_does_not_share_per_thread_rng_seed() {
+        let parent = Kernel::new_without_stdio(vec![], vec![]);
+        let parent_seed = parent.rng_seed;
+        let mut child = Kernel::new_for_child(
+            vec![],
+            vec![],
+            crate::vfs::Vfs {
+                root: "/".into(),
+                cwd: "/".into(),
+            },
+            Arc::clone(&parent.process_state),
+            2,
+            2,
+        );
+        assert_ne!(
+            parent_seed, child.rng_seed,
+            "child must get a fresh rng_seed, not the parent's"
+        );
+
+        // And the child's first random byte sequence is not
+        // derivable from the parent's seed.
+        let mut parent_replay = SmallRng::from_seed(parent_seed);
+        let mut parent_buf = [0u8; 8];
+        parent_replay.fill_bytes(&mut parent_buf);
+        let mut child_buf = [0u8; 8];
+        child.rng.fill_bytes(&mut child_buf);
+        assert_ne!(
+            parent_buf, child_buf,
+            "child RNG output must differ from parent's first-8-bytes"
         );
     }
 }

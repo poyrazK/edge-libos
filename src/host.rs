@@ -94,3 +94,38 @@ pub fn build_store(engine: &Engine, kernel: Kernel) -> Store<Kernel> {
 pub fn add_to_linker(linker: &mut Linker<Kernel>) -> Result<()> {
     dispatch::register(linker)
 }
+
+// ---------------------------------------------------------------------------
+// P3 Tier-8 v2 step 1 — child-thread helpers
+// ---------------------------------------------------------------------------
+//
+// `Store<Kernel>` is `!Send + !Sync` per wasmtime 45.0.3, and so is
+// `Linker<Kernel>`. The parent thread that handles a fork()/clone()
+// cannot share its Store/Linker with the spawned child fiber (which
+// runs on a brand-new `std::thread`). Each child must therefore build
+// its own Store + Linker. The helpers below isolate that pattern so
+// the call site in `src/sys/process.rs::spawn_child_thread` reads
+// cleanly.
+//
+// `Engine` and `Module` are `Send + Sync` (per wasmtime docs), so the
+// parent wraps them in `Arc` and clones the Arc into the child thread
+// — that's the entire reason fork_syscall takes `Arc<Engine>` +
+// `Arc<Module>` instead of `&Engine` / `&Module`.
+///
+/// Build a fresh child-thread `Linker<Kernel>`. The linker is
+/// `!Send + !Sync` and must be constructed on the thread that will
+/// own it. Cost is one `func_new_async` registration per syscall —
+/// negligible (~tens of µs).
+pub fn build_child_linker(engine: &wasmtime::Engine) -> Result<Linker<Kernel>> {
+    let mut linker: Linker<Kernel> = Linker::new(engine);
+    add_to_linker(&mut linker)?;
+    Ok(linker)
+}
+
+/// Build a fresh child-thread `Store<Kernel>`. Same body as
+/// `build_store` (pre-fills `u64::MAX` fuel per ADR 0004 §1) but
+/// documented separately so the caller contract is explicit: the
+/// kernel belongs to a forked/cloned child fiber, not the parent.
+pub fn build_child_store(engine: &wasmtime::Engine, kernel: Kernel) -> Store<Kernel> {
+    build_store(engine, kernel)
+}

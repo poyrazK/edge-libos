@@ -25,3 +25,10 @@ implementation has a contract to honor.
   `KernelSnapshot.module_sha256`; `verify_module_hash` refuses to
   apply on mismatch at the `serve` boundary. Closes the silent
   mis-execution caveat formerly called out by ADR 0002 §8.
+- [ADR 0006 — P3 clone threads (v2 of fork/clone/wait4)](0006-p3-clone-threads.md) — Accepted.
+  Pinned the per-thread Kernel field split (`Arc<ProcessState>`),
+  `Arc<Engine>` + `Arc<Module>` ownership, `Arc<Notify>` clone-on-lock-out
+  multi-waiter pattern (replacing v1's single-waiter `Option<Waker>`),
+  the v2-supported clone flag set (`CLONE_VM | CLONE_THREAD |
+  CLONE_CHILD_SETTID | CLONE_PARENT_SETTID`), tgid/tid routing for
+  `kill` / `tgkill`, and the child-thread panic sentinel (139).

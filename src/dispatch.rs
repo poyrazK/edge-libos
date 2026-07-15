@@ -118,8 +118,8 @@ pub async fn dispatch(mut caller: wasmtime::Caller<'_, Kernel>, nr: u32, a: [i64
         // Process
         sys::process::NR_EXIT => sys::process::exit(&mut caller, a).await,
         sys::process::NR_EXIT_GROUP => sys::process::exit_group(&mut caller, a).await,
-        sys::process::NR_GETPID => sys::process::getpid(),
-        sys::process::NR_GETTID => sys::process::gettid(),
+        sys::process::NR_GETPID => sys::process::getpid(&mut caller, a),
+        sys::process::NR_GETTID => sys::process::gettid(&mut caller, a),
         sys::process::NR_SET_TID_ADDRESS => sys::process::set_tid_address(&mut caller, a),
         sys::process::NR_SET_ROBUST_LIST => sys::process::set_robust_list(),
         sys::process::NR_ARCH_PRCTL => to_ret(crate::errno::ENOSYS),

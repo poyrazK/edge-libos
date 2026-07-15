@@ -701,7 +701,7 @@ fn build_kernel_snapshot(kernel: &Kernel, pages: Vec<MemoryPageSnapshot>) -> Ker
             // involved, so the lock-doesn't-cross-await rule from
             // ADR 0001 §2 is preserved. The resulting `Vec` moves
             // into the struct literal by ownership.
-            let table = kernel.futex_table.lock();
+            let table = kernel.process_state.futex_table.lock();
             table.snapshot()
         },
         // ADR 0004 §4: `cpu_ns` is snapshotted as `LeU64` so the
@@ -929,7 +929,7 @@ pub fn apply_snapshot_kernel_state(
     // model. Lock is held only for the duration of the rebuild — no
     // `.await` involved, matching the rest of this function.
     {
-        let mut table = kernel.futex_table.lock();
+        let mut table = kernel.process_state.futex_table.lock();
         table.rebuild_from_snapshot(&snap.futex_table);
     }
 
