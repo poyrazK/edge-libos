@@ -756,8 +756,16 @@ pub async fn tgkill(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     // Linux convention: tgid == 0 means "use caller's tgid";
     // tid == 0 means "use caller's tid". The conformance test
     // tgkill_self.c exercises both zeroed args.
-    let tgid = if tgid_arg == 0 { caller_tgid as i64 } else { tgid_arg };
-    let tid = if tid_arg == 0 { caller_tid as i64 } else { tid_arg };
+    let tgid = if tgid_arg == 0 {
+        caller_tgid as i64
+    } else {
+        tgid_arg
+    };
+    let tid = if tid_arg == 0 {
+        caller_tid as i64
+    } else {
+        tid_arg
+    };
     if tgid as i32 != caller_tgid {
         return -ESRCH;
     }
