@@ -265,10 +265,10 @@ async fn serve_rejects_port_zero() {
 /// gets `HTTP/1.1 200 OK`.
 ///
 /// Fixture mechanics: `serve_forever.wat` stores its listener fd at
-/// memory[300] on fresh boot. After `apply_snapshot`, the linear
+/// `memory\[300\]` on fresh boot. After `apply_snapshot`, the linear
 /// memory is restored, so the restored-boot branch of `_start` reads
-/// memory[300] and uses the inherited fd directly. The HTTP loop then
-/// accepts on the kernel-restored listener at `<p>`.
+/// `memory\[300\]` and uses the inherited fd directly. The HTTP loop
+/// then accepts on the kernel-restored listener at `<p>`.
 ///
 /// Drift-fix timing: the freeze snapshot may capture the listener
 /// either materialized or taken-out (depending on where the WAT was
