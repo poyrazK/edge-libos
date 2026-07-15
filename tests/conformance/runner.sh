@@ -149,6 +149,8 @@ expected_syscall() {
         wait4)               echo "wait4" ;;
         futex)               echo "futex" ;;
         snapshot)            echo "snapshot" ;;
+        getaddrinfo_loopback)   echo "resolve" ;;
+        getaddrinfo_eai_noname) echo "resolve" ;;
         *) echo "UNREGISTERED: $1" >&2; return 1 ;;
     esac
 }
