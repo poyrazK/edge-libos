@@ -15,18 +15,27 @@ sandbox, through a single async host function `(import "kernel" "syscall")`.
 The full design spec lives in [`impelementationplan`](./impelementationplan).
 This README is a build-and-run quick reference.
 
-## Status: P1 complete, P2 in progress
+## Status: P3 complete (0.2.0)
 
 **P0** — boots CPython, prints: ✅
 **P1** — serves one HTTP request via the WAT uvicorn+FastAPI syscall sequence
-through the full async pivot (epoll/eventfd): ✅ (`ec911cb`)
-**P2** — production-ish single instance: 🚧 in progress
+through the full async pivot (epoll/eventfd): ✅
+**P2** — production-ish single instance: ✅
+**P3** — multi-fiber, snapshot, live migration: ✅ (0.2.0)
 
-P2 adds pre-init snapshot/restore (sub-5 ms cold start), host-backed DNS
-resolver, default-deny egress policy, epoch-based CPU-ms metering, and
-minimal AF_UNIX support, alongside the literal CPython cross-compile
-pipeline. See [`HANDOFF.md`](./HANDOFF.md) for the running status; see
-the P2 plan for the full breakdown.
+P3 lands the multi-fiber story (wasmtime `wasm_threads` +
+`shared_memory` + `wasm_shared_everything_threads` all enabled —
+PR #12), futex(2) FUTEX_WAIT/WAKE (ADR 0001), futex-table snapshot
+serialization (ADR 0002), `clone(56)` v1 (TID-writeback only),
+`fork(57)` v1 (allocates PID; child-fiber-resume deferred),
+`wait4(61)` v1 with WNOHANG + parked-Waker path, and ADR 0003's
+live x86→ARM migration flow (`edge-cli migrate` subcommand).
+`Kernel.memory_kind` accepts either a regular `Memory` or a
+`SharedMemory`. Format version stays at 1 (ADR 0002 §4).
+
+See [`HANDOFF.md`](./HANDOFF.md) for the running status; see
+[`docs/adr/0003-p3-live-migration.md`](./docs/adr/0003-p3-live-migration.md)
+for the migration contract.
 
 ## P1 DoD (satisfied)
 
@@ -50,20 +59,16 @@ artifact and requires `zig cc` + a git submodule — see `guest/build.sh`.
 
 ## Test totals
 
-- **88** Rust unit tests (in `#[cfg(test)]` modules under `src/`)
-- **161** Rust integration tests (across `tests/*.rs`)
+- **123** Rust unit tests (in `#[cfg(test)]` modules under `src/`)
+- **196** Rust integration tests (across `tests/*.rs`)
 - **105** C conformance tests (`tests/conformance/*.c`, marker-enforced)
-- **Total: 354 tests.** Source of truth: `bash tests/count_tests.sh`.
+- **Total: 424 tests.** Source of truth: `bash tests/count_tests.sh`.
 
-P2-B4 added `statx(2)` + a C test. P2-B5 added `dup/dup2/dup3` +
-shared-state refactor + 5 new C tests. P2-C1+C2+C3 added identity,
-process, signal, time, ioctl, AF_UNIX sockets, sendmsg/recvmsg, ppoll,
-epoll_pwait, eventfd, getrandom, pipe2, close_range, sysinfo, times,
-and a literal CPython DoD gate. P2-D1 added the snapshot foundation
-(`postcard` + serde `KernelSnapshot` roundtrip). P2-D2 overlays the
-linear-memory blob onto snapshots per ADR 0002 (sparse per-page
-layout, `LeU*`/`LeI*` newtypes, `tests/snapshot_roundtrip.rs`
-end-to-end conformance gate).
+P3 adds `futex(2)` conformance (P3 Tier-1), `clone(56)` v1 (P3
+Tier-4), `fork(57)` v1 (P3 Tier-5), `wait4(61)` v1 with parked-Waker
+path (P3 Tier-6), `pthread_mutex_two_fiber_wake_on_unlock`
+(`MemoryKind::Shared` end-to-end), and 3 migration-smoke tests for
+the `edge-cli migrate` subcommand (P3 Tier-7 / ADR 0003 v1 flow).
 
 Source of truth: `bash tests/count_tests.sh`. The conformance runner
 also prints the total at the end of its run.
@@ -183,7 +188,7 @@ DoD #3 (real uvicorn+FastAPI serve), and the canonical test totals.
   - `kernel.rs`, `dispatch.rs` — Kernel state + `kernel.syscall` dispatcher
   - `sys/*.rs` — per-syscall handlers (process, memory, file, socket, …)
   - `vfs.rs`, `fd.rs`, `mm/` — VFS, fd table, memory arena
-  - `bin/` — `edge-cli` binary (subcommands: `run`, `freeze`, `serve`, `bench`, `trace`)
+  - `bin/` — `edge-cli` binary (subcommands: `run`, `freeze`, `serve`, `bench`, `trace`, `migrate`)
   - `cli/` — subcommand implementations + `run_main` dispatcher
 - `tests/` — Rust integration tests + C conformance suite
 - `tests/conformance/` — C conformance (.c files + zig-built .wasm + runner.sh)
