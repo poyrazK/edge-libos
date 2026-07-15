@@ -5,6 +5,11 @@
 //! that `bash tests/conformance/runner.sh` and `tests/strace_baseline_diff.rs`
 //! depend on, so the C conformance gate keeps working unchanged.
 //!
+//! P2-D3.4: `MARKER_ADDR`/`MARKER_LEN` re-homed on `Kernel`. The PENDING
+//! thread-local pairs real entry args with the on_exit ret; the JSON line
+//! now carries the guest's actual call-site args (proven by
+//! `tests/trace_host_smoke.rs::trace_observer_emits_real_args_on_write_syscall`).
+//!
 //! Output format (one line per syscall, then an optional marker line):
 //!
 //! ```text
@@ -13,11 +18,6 @@
 //! ...
 //! {"marker":"PASS"}            # only emitted unless --no-marker
 //! ```
-//!
-//! `args` is `[0; 6]` because `SyscallObserver::on_exit` does not get the
-//! entry args (the deleted `trace-host` also dropped them — preserved
-//! verbatim to keep the runner's expected_syscall asserts green). D3.4
-//! restores entry-args fidelity via the PENDING thread-local.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -27,12 +27,7 @@ use wasmtime::{Linker, Store};
 use crate::cli::error::{CliError, CliResult};
 use crate::dispatch::{install_observer, syscall_name, SyscallObserver};
 use crate::host::{add_to_linker, build_engine, build_store};
-use crate::kernel::Kernel;
-
-/// Marker address the C conformance tests write to (`tests/conformance/syscall.h`).
-/// P2-D3.3: hard-coded here; D3.4 will re-home as a `pub const` on `Kernel`.
-const MARKER_ADDR: usize = 4096;
-const MARKER_LEN: usize = 64;
+use crate::kernel::{Kernel, MARKER_ADDR, MARKER_LEN};
 
 /// One traced syscall.
 #[derive(Debug, Clone)]

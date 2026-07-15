@@ -1,6 +1,11 @@
 //! Smoke test for the trace-host driver: compile a tiny wasm that calls
 //! `write(1, ...)` and verify the JSON output contains a single entry with
 //! the expected shape.
+//!
+//! P2-D3.4: added `trace_observer_emits_real_args_on_write_syscall` —
+//! asserts the on-wire `args[0..5]` matches the guest's syscall call
+//! site (not zeros), proving the `PENDING` thread-local pairing in
+//! `src/cli/trace.rs` works end-to-end.
 
 mod common;
 
@@ -159,5 +164,71 @@ fn trace_host_emits_well_formed_json_for_getpid() -> Result<()> {
     );
     assert!(line.contains("\"nr\":39"), "expected nr=39, got: {line}");
     assert!(line.contains("\"ret\":1"), "expected ret=1, got: {line}");
+    Ok(())
+}
+
+#[test]
+fn trace_observer_emits_real_args_on_write_syscall() -> Result<()> {
+    // P2-D3.4: prove the `PENDING` thread-local in `src/cli/trace.rs`
+    // pairs real `args` from `on_enter` with `ret` from `on_exit`. The
+    // guest calls `write(fd=1, buf=4096, len=8)`; the JSON line must
+    // carry those values, not zeros.
+    let wat = r#"
+        (module
+          (import "kernel" "syscall"
+            (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+          (memory (export "memory") 1)
+          (func (export "_start")
+            (drop (call $syscall
+              (i64.const 1)              ;; NR_WRITE
+              (i64.const 1)              ;; fd = 1
+              (i64.const 4096)           ;; buf = 4096
+              (i64.const 8)              ;; len = 8
+              (i64.const 0) (i64.const 0) (i64.const 0)))
+          )
+        )
+    "#;
+    let tmp = tempfile::tempdir()?;
+    let wasm_path = tmp.path().join("guest.wasm");
+    let bytes = wat::parse_str(wat).expect("compile wat");
+    std::fs::write(&wasm_path, &bytes)?;
+
+    let bin = env!("CARGO_BIN_EXE_edge-cli");
+    let output = Command::new(bin)
+        .arg("trace")
+        .arg("--no-marker")
+        .arg(wasm_path.to_str().unwrap())
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "edge-cli trace exited non-zero: stderr={stderr}"
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        !lines.is_empty(),
+        "expected at least one JSON line, got: {stdout:?}"
+    );
+    let line = lines[0];
+    // Hand-parse the `args` array since the line is JSON-ish (no
+    // dep on serde_json — keep this test light). The expected shape
+    // is `"args":[1,4096,8,0,0,0]`.
+    let args_start = line.find("\"args\":[").expect("args array present");
+    let args_end = line[args_start..].find(']').expect("args array closed");
+    let args_str = &line[args_start + 8..args_start + args_end];
+    let args: Vec<i64> = args_str
+        .split(',')
+        .map(|s| s.trim().parse::<i64>().expect("parse arg"))
+        .collect();
+    assert_eq!(
+        args.len(),
+        6,
+        "args array must have 6 entries, got {args:?}"
+    );
+    assert_eq!(args[0], 1, "args[0] (fd) — PENDING pairing broken?");
+    assert_eq!(args[1], 4096, "args[1] (buf) — PENDING pairing broken?");
+    assert_eq!(args[2], 8, "args[2] (len) — PENDING pairing broken?");
     Ok(())
 }
