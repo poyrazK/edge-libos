@@ -29,6 +29,11 @@ chrono               = { version = "0.4", default-features = false, features = [
 # declaring them direct makes src/snapshot.rs usable.
 serde                = { version = "1", features = ["derive"] }
 postcard             = { version = "1", features = ["alloc"] }
+# P3-D3.5-followup-1: sha256 of freeze-host .wasm bytes; embedded in
+# KernelSnapshot (module_sha256 field) and verified on serve to refuse
+# a mismatched wasm before any apply_snapshot_* call. 0.10 line; sync
+# API (Sha256::new / update / finalize); no features needed.
+sha2                 = "0.10"
 
 [dev-dependencies]
 wat        = "1"
