@@ -1025,10 +1025,10 @@ fn sendto_then_recvfrom_roundtrips_over_loopback() -> Result<()> {
         assert_eq!(n, 5, "recvfrom should return 5 bytes for 'hello'");
 
         // Read the bytes back from the same memory (recv_inst's memory).
-        let mem = store
+        let mem = *store
             .data()
-            .memory
-            .ok_or_else(|| anyhow::anyhow!("no memory"))?;
+            .memory()
+            .map_err(|e| anyhow::anyhow!("no memory: {e}"))?;
         let mut got = [0u8; 5];
         mem.read(&mut store, 4200, &mut got)?;
         assert_eq!(&got, b"hello", "guest buffer should contain 'hello'");
@@ -1039,10 +1039,10 @@ fn sendto_then_recvfrom_roundtrips_over_loopback() -> Result<()> {
         if let Some(mem) = send_inst.get_memory(&mut store, "memory") {
             store.data_mut().attach_memory(mem);
         }
-        let mem = store
+        let mem = *store
             .data()
-            .memory
-            .ok_or_else(|| anyhow::anyhow!("no memory"))?;
+            .memory()
+            .map_err(|e| anyhow::anyhow!("no memory: {e}"))?;
         let to_send = b"world";
         mem.write(&mut store, 4096, to_send)?;
         let sent = call_sendto_reuse(&mut store, &send_inst, accepted, 5).await?;
@@ -1589,10 +1589,10 @@ fn shutdown_wr_then_sendto_returns_epipe() -> Result<()> {
         if let Some(mem) = send_inst.get_memory(&mut store, "memory") {
             store.data_mut().attach_memory(mem);
         }
-        let mem = store
+        let mem = *store
             .data()
-            .memory
-            .ok_or_else(|| anyhow::anyhow!("no memory"))?;
+            .memory()
+            .map_err(|e| anyhow::anyhow!("no memory: {e}"))?;
         mem.write(&mut store, 4096, b"hello")?;
         let n = call_sendto_reuse(&mut store, &send_inst, accepted, 5).await?;
         assert_eq!(
@@ -1654,10 +1654,10 @@ fn poll_unknown_fd_marks_pollnval() -> Result<()> {
             store.data_mut().attach_memory(mem);
         }
         // Write a single pollfd at offset 4096: fd=9999, events=POLLIN, revents=0.
-        let mem = store
+        let mem = *store
             .data()
-            .memory
-            .ok_or_else(|| anyhow::anyhow!("no memory"))?;
+            .memory()
+            .map_err(|e| anyhow::anyhow!("no memory: {e}"))?;
         let mut entry = [0u8; 8];
         entry[0..4].copy_from_slice(&9999u32.to_le_bytes());
         entry[4..6].copy_from_slice(&1u16.to_le_bytes()); // POLLIN
@@ -1706,10 +1706,10 @@ fn poll_ready_pipe_marks_pollin() -> Result<()> {
         if let Some(mem) = inst.get_memory(&mut store, "memory") {
             store.data_mut().attach_memory(mem);
         }
-        let mem = store
+        let mem = *store
             .data()
-            .memory
-            .ok_or_else(|| anyhow::anyhow!("no memory"))?;
+            .memory()
+            .map_err(|e| anyhow::anyhow!("no memory: {e}"))?;
         let mut entry = [0u8; 8];
         entry[0..4].copy_from_slice(&(pipe_fd).to_le_bytes());
         entry[4..6].copy_from_slice(&1u16.to_le_bytes()); // POLLIN
@@ -1967,10 +1967,10 @@ fn epoll_ctl_add_del_roundtrip() -> Result<()> {
         let epfd = call_epoll_create1(&linker, &mut store, &ec1, 0).await?;
 
         // Build an epoll_event { events=EPOLLIN=1, data=0xdeadbeef } at offset 4096.
-        let mem = store
+        let mem = *store
             .data()
-            .memory
-            .ok_or_else(|| anyhow::anyhow!("no memory"))?;
+            .memory()
+            .map_err(|e| anyhow::anyhow!("no memory: {e}"))?;
         let mut ev = [0u8; 12];
         ev[0..4].copy_from_slice(&1u32.to_le_bytes()); // EPOLLIN
         ev[4..12].copy_from_slice(&0xdeadbeefu64.to_le_bytes()); // data

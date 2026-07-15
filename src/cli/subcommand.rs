@@ -1,6 +1,6 @@
 //! `edge-cli` subcommand enum.
 //!
-//! P2-D3.3: every top-level invocation is one of these five subcommands.
+//! P2-D3.3: every top-level invocation is one of these six subcommands.
 //! The mapping from a positional argv string → `Subcommand` lives in
 //! `FromStr for Subcommand`; everything else (parsing per-subcommand
 //! flags, the tokio runtime, the actual work) is in `src/cli/mod.rs`
@@ -15,6 +15,8 @@
 //! - `Freeze` — stub, lands in D3.5.
 //! - `Serve`  — stub, lands in D3.5.
 //! - `Bench`  — stub, lands in D3.7.
+//! - `Migrate`— wired in P3 final-bundle sub-deliverable 6 (ADR 0003
+//!   v1 flow): in-process freeze → encode → decode → serve roundtrip.
 
 use std::str::FromStr;
 
@@ -33,6 +35,10 @@ pub enum Subcommand {
     /// `edge-cli trace <wasm> [--diff <baseline>] [--no-marker]`
     /// — JSON-line syscall tracer. Used by `tests/conformance/runner.sh`.
     Trace,
+    /// `edge-cli migrate <wasm> [--] [args...]` — P3 final-bundle
+    /// sub-deliverable 6: in-process freeze → encode → decode →
+    /// serve migration roundtrip. Realizes ADR 0003's v1 flow.
+    Migrate,
 }
 
 impl FromStr for Subcommand {
@@ -45,6 +51,7 @@ impl FromStr for Subcommand {
             "serve" => Subcommand::Serve,
             "bench" => Subcommand::Bench,
             "trace" => Subcommand::Trace,
+            "migrate" => Subcommand::Migrate,
             other => return Err(CliError::Unknown(other.to_string())),
         })
     }

@@ -258,10 +258,13 @@ pub async fn dispatch(mut caller: wasmtime::Caller<'_, Kernel>, nr: u32, a: [i64
         // support are in place. See ADR 0002 for the fork snapshot story.
         // P3 Tier-1: futex(2) FUTEX_WAIT/FUTEX_WAKE shipped — see ADR 0001.
         // P3 Tier-4: clone(56) v1 supports CLONE_CHILD_SETTID |
-        // CLONE_PARENT_SETTID only; other flags → -EINVAL. fork(57) and
-        // wait4(61) land in PR 4 and PR 3 respectively.
+        // CLONE_PARENT_SETTID only; other flags → -EINVAL. fork(57) ships
+        // as v1 in P3 final-bundle sub-deliverable 5 (allocates PID +
+        // inserts ChildExitStatus, does NOT resume child fiber — see
+        // `fork_syscall` doc for the deferred-resume contract).
+        // P3 Tier-6: wait4(61) supports WNOHANG + blocking parked path.
         sys::process::NR_CLONE => sys::process::clone_syscall(&mut caller, a).await,
-        sys::process::NR_FORK => to_ret(crate::errno::ENOSYS),
+        sys::process::NR_FORK => sys::process::fork_syscall(&mut caller, a).await,
         sys::process::NR_WAIT4 => sys::process::wait4_syscall(&mut caller, a).await,
         sys::futex::NR_FUTEX => sys::futex::futex(&mut caller, a).await,
 

@@ -59,7 +59,7 @@ pub enum CliError {
     /// gate) and wants to fail the run. Maps to exit code 1.
     Bench(String),
 
-    /// Per-request CPU budget exhausted (ADR 0003 §6). The guest
+    /// Per-request CPU budget exhausted (ADR 0004 §6). The guest
     /// trapped on `OutOfFuel`; the message names the consumed vs
     /// budgeted µs. Maps to exit code 1 for `run`; `serve` and
     /// `bench` catch this trap and count it instead of propagating.

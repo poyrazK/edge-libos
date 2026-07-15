@@ -45,7 +45,7 @@ use crate::snapshot::{apply_snapshot_kernel_state, apply_snapshot_to_memory, rea
 /// - `2` — argv error (via `CliError::Args`).
 pub async fn run_main(args: &[String]) -> CliResult<i32> {
     let mut iters: usize = 50;
-    let mut budget_ms: u64 = u64::MAX; // ADR 0003 §2: bench default is unbounded.
+    let mut budget_ms: u64 = u64::MAX; // ADR 0004 §2: bench default is unbounded.
     let mut positional: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -126,7 +126,7 @@ pub async fn run_main(args: &[String]) -> CliResult<i32> {
         let elapsed_us = t0.elapsed().as_micros() as u64;
         samples_us.push(elapsed_us);
 
-        // ADR 0003: also call `_start` and record fuel consumed.
+        // ADR 0004: also call `_start` and record fuel consumed.
         // We do this AFTER the apply so the fuel reading reflects
         // what a real serve-loop request would see — apply is
         // restore, _start is request, and the budget applies to

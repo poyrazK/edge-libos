@@ -18,7 +18,7 @@
 //! - Propagate the guest exit code (`Kernel::exit_code` set by
 //!   NR_EXIT / NR_EXIT_GROUP).
 //!
-//! P2 metering (ADR 0003): `--cpu-budget-ms <ms>` is optional on
+//! P2 metering (ADR 0004): `--cpu-budget-ms <ms>` is optional on
 //! `run` (default: unbounded). When supplied, the Store is
 //! configured with `set_fuel(ms_to_fuel(budget))` BEFORE
 //! `instantiate_async`; a fuel trap during `_start` is classified
@@ -116,7 +116,7 @@ async fn drive_guest(wasm_path: &str, budget_ms: u64, _script_args: &[String]) -
     let kernel = Kernel::new(vec![], vec![]);
 
     let mut store = build_store(&engine, kernel);
-    // ADR 0003 §2: per-instance fuel budget. The default (u64::MAX)
+    // ADR 0004 §2: per-instance fuel budget. The default (u64::MAX)
     // is the unbounded sentinel; a real value is converted via
     // `ms_to_fuel`. Setting fuel on a Store whose engine has
     // `consume_fuel(true)` is the only way to bound guest CPU.
@@ -160,7 +160,7 @@ async fn drive_guest(wasm_path: &str, budget_ms: u64, _script_args: &[String]) -
         )));
     };
 
-    // ADR 0003 §6: distinguish a fuel-exhaustion trap from any other
+    // ADR 0004 §6: distinguish a fuel-exhaustion trap from any other
     // trap. `is_out_of_fuel` matches on the wasmtime Display string,
     // which is stable across 45.0.x.
     if let Err(ref e) = call_result {

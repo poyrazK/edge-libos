@@ -1,4 +1,4 @@
-# ADR 0003 — metering semantics
+# ADR 0004 — metering semantics
 
 - **Status.** Proposed, 2026-07-15. Realized by P2 metering slice on
   branch `p2-metering-hooks`. Promoted Accepted once M7 (DoD step 11)

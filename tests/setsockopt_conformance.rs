@@ -153,10 +153,15 @@ async fn call_fcntl(
 
 /// Read two u32 little-endian fds from offset 4096 in linear memory.
 fn read_fds(store: &mut wasmtime::Store<Kernel>) -> Result<(i64, i64)> {
-    let mem = store
+    // setsockopt test fixture uses a regular `(memory N)` module
+    // (no `shared` flag), so `MemoryKind::Owned` is always the
+    // active variant here. Clone the `Memory` handle (it's `Copy`
+    // per `src/mem.rs:28`) so the `&Kernel` borrow ends before we
+    // re-borrow `store` mutably for the `Memory::read` call.
+    let mem = *store
         .data()
-        .memory
-        .ok_or_else(|| anyhow::anyhow!("no guest memory attached"))?;
+        .memory()
+        .map_err(|e| anyhow::anyhow!("memory not attached: {e}"))?;
     let mut buf = [0u8; 8];
     mem.read(&mut *store, 4096, &mut buf)
         .map_err(|e| anyhow::anyhow!("read failed: {e}"))?;

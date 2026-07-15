@@ -184,7 +184,7 @@ pub struct KernelSnapshot {
     /// rebuild-on-restore contract. Append-only field: snapshot
     /// format version stays at `SNAPSHOT_FORMAT_VERSION = 1`.
     pub futex_table: Vec<crate::sys::futex::FutexAddrSnapshot>,
-    /// ADR 0003 §4: monotonic CPU time consumed by the guest since
+    /// ADR 0004 §4: monotonic CPU time consumed by the guest since
     /// `set_fuel` was last called. Reported by `serve` per-request
     /// and by `bench` per-iter; snapshotted so that the post-restore
     /// loop carries the pre-freeze usage across the boundary. Append
@@ -520,9 +520,14 @@ pub fn try_to_snapshot(
     kernel: &Kernel,
     store: &impl wasmtime::AsContext,
 ) -> Result<KernelSnapshot, SnapshotError> {
-    // Read linear memory (sparse, only non-zero pages).
-    let pages = if let Ok(mem) = kernel.memory() {
-        let data = mem.data(store.as_context());
+    // Read linear memory (sparse, only non-zero pages). P3 Tier-3:
+    // `Kernel::memory_kind` returns the [`MemoryKind`] enum so this
+    // path handles both `Owned(Memory)` and `Shared(SharedMemory)`.
+    let pages = if let Ok(mem_kind) = kernel.memory_kind() {
+        // The Owned variant requires a `Store` (wasmtime's
+        // `Memory::data` signature); the Shared variant ignores
+        // the store. `MemoryKind::data` unifies both.
+        let data = mem_kind.data(store.as_context());
         collect_pages(data)
     } else {
         // No memory attached yet — emit an empty pages list. `apply_snapshot`
@@ -639,7 +644,7 @@ fn build_kernel_snapshot(kernel: &Kernel, pages: Vec<MemoryPageSnapshot>) -> Ker
             let table = kernel.futex_table.lock();
             table.snapshot()
         },
-        // ADR 0003 §4: `cpu_ns` is snapshotted as `LeU64` so the
+        // ADR 0004 §4: `cpu_ns` is snapshotted as `LeU64` so the
         // post-restore loop carries the pre-freeze usage. The field
         // is appended at the end of the struct so the postcard wire
         // format stays backward-compatible with v1 readers.
@@ -706,7 +711,7 @@ pub fn apply_snapshot(
     store: &mut impl wasmtime::AsContextMut<Data = Kernel>,
 ) -> Result<(), SnapshotError> {
     apply_snapshot_kernel_state(&snap, kernel)?;
-    apply_snapshot_to_memory_inner(&snap, kernel, store)
+    dispatch_memory_apply(&snap, kernel, store)
 }
 
 /// Step 1 of `apply_snapshot`: replace kernel-resident state (args,
@@ -762,12 +767,12 @@ pub fn apply_snapshot_kernel_state(
         table.rebuild_from_snapshot(&snap.futex_table);
     }
 
-    // ADR 0003 §4: restore the cpu_ns accumulator verbatim. The fuel
+    // ADR 0004 §4: restore the cpu_ns accumulator verbatim. The fuel
     // counter itself is per-Store and is NOT serialized — it is
     // reset by `serve`/`bench` via `set_fuel(budget)` on the next
     // request. Only the cumulative wall-clock-equivalent is carried
     // across restore, matching the "process-scoped, not request-
-    // scoped" semantics in ADR 0003 §4.
+    // scoped" semantics in ADR 0004 §4.
     kernel.cpu_ns = snap.cpu_ns.0;
 
     // ---- fd table ---------------------------------------------------------
@@ -995,7 +1000,15 @@ pub fn apply_snapshot_kernel_state(
 /// pages, this is a no-op (the memory remains at whatever size the
 /// target store was born with — sufficient for the roundtrip test
 /// fixture, which builds a 32-page module ahead of time).
-fn apply_snapshot_to_memory_inner(
+/// Dispatch memory restore based on the kernel's [`crate::kernel::MemoryKind`].
+///
+/// P3 Tier-3: the `Owned` variant goes through the public
+/// `apply_snapshot_to_memory` (which still takes `Memory` for
+/// backwards compatibility with the existing tests); the `Shared`
+/// variant goes through `apply_snapshot_to_shared_memory` because
+/// `SharedMemory::grow` / `SharedMemory::data` don't take a
+/// `Store` reference.
+fn dispatch_memory_apply(
     snap: &KernelSnapshot,
     kernel: &mut Kernel,
     store: &mut impl wasmtime::AsContextMut<Data = Kernel>,
@@ -1003,16 +1016,77 @@ fn apply_snapshot_to_memory_inner(
     if snap.pages.is_empty() {
         return Ok(());
     }
-    // Clone the `Memory` handle out of kernel (it's `Copy` per
-    // `src/mem.rs:28`). Drop the kernel borrow immediately so we can
-    // re-borrow mutably through `store`.
-    let mem = *kernel.memory().map_err(|e| {
+    let mem_kind = kernel.memory_kind().map_err(|e| {
         SnapshotError::IoError(
             std::io::Error::other(format!("memory not attached: errno={e}")),
-            "kernel.memory()".into(),
+            "kernel.memory_kind()".into(),
         )
     })?;
-    apply_snapshot_to_memory(snap, mem, store)
+    match mem_kind {
+        crate::kernel::MemoryKind::Owned(mem) => {
+            // Drop the kernel borrow before re-borrowing `store` mutably.
+            let mem = *mem;
+            apply_snapshot_to_memory(snap, mem, store)
+        }
+        crate::kernel::MemoryKind::Shared(mem) => apply_snapshot_to_shared_memory(snap, mem),
+    }
+}
+
+/// Memory-only restore driver for the `Shared` variant of
+/// [`crate::kernel::MemoryKind`]. The public [`apply_snapshot_to_memory`] takes
+/// `wasmtime::Memory` (for backwards compatibility with existing
+/// tests); this sibling is the parallel path for shared memory.
+///
+/// `SharedMemory::grow` does not require a `Store` reference
+/// (wasmtime: `pub fn grow(&self, delta: u64) -> Result<u64>`),
+/// and `SharedMemory::data` returns `&[UnsafeCell<u8>]` (also no
+/// store). We unsafely project that to `&mut [u8]` for the
+/// chunk-copy — see the safety contract on [`crate::kernel::MemoryKind::data_mut`].
+///
+/// Public for callers (notably `tests/migration_smoke.rs`) that
+/// want to drive the Shared-memory restore by hand — same
+/// split-phase pattern as `apply_snapshot_to_memory`.
+pub fn apply_snapshot_to_shared_memory(
+    snap: &KernelSnapshot,
+    mem: &wasmtime::SharedMemory,
+) -> Result<(), SnapshotError> {
+    // Grow the shared memory to fit the snapshot's largest page.
+    let target_pages = snap
+        .pages
+        .iter()
+        .map(|p| p.page_index.0 as usize)
+        .max()
+        .unwrap()
+        + 1;
+    let cur_pages: usize = mem.data_size() / PAGE_SIZE_BYTES;
+    if target_pages > cur_pages {
+        let delta: u64 = (target_pages - cur_pages) as u64;
+        mem.grow(delta).map_err(|e| {
+            SnapshotError::IoError(
+                std::io::Error::other(format!("SharedMemory::grow failed: {e}")),
+                "shared mem.grow".into(),
+            )
+        })?;
+    }
+    // Chunk-copy each page's bytes into the right slot.
+    let bytes: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(mem.data().as_ptr() as *mut u8, mem.data_size()) };
+    for page in &snap.pages {
+        let start = page.page_index.0 as usize * PAGE_SIZE_BYTES;
+        let end = start + page.bytes.len();
+        if end > bytes.len() {
+            return Err(SnapshotError::IoError(
+                std::io::Error::other(format!(
+                    "page {} out of bounds: {end} > {}",
+                    page.page_index.0,
+                    bytes.len()
+                )),
+                "page chunk-copy (shared)".into(),
+            ));
+        }
+        bytes[start..end].copy_from_slice(&page.bytes);
+    }
+    Ok(())
 }
 
 /// Memory-only restore driver. Takes the cloned `Memory` handle

@@ -1,6 +1,6 @@
 //! Per-request CPU metering — `fuel` as the budget primitive.
 //!
-//! ADR 0003 §3: Wasmtime 45.0.3 ships two metering primitives
+//! ADR 0004 §3: Wasmtime 45.0.3 ships two metering primitives
 //! (`consume_fuel` and `epoch_interruption`); the ADR picks fuel
 //! because the wasmtime docs explicitly recommend it for
 //! "deterministic interruption of a fixed, finite interval"
@@ -13,7 +13,7 @@
 //! automatically.
 
 /// Provisional fuel-per-millisecond constant. **MUST be overwritten
-/// by the M6 calibration commit** — see ADR 0003 §3.
+/// by the M6 calibration commit** — see ADR 0004 §3.
 ///
 /// 10⁶ fuel/ms ≈ 1 µs/instruction on x86_64 for a typical mix of
 /// arithmetic + control-flow instructions. Empirically tuned by a
