@@ -503,6 +503,20 @@ impl Kernel {
         state.timeout_ms = cfg.timeout_ms;
     }
 
+    /// Test-only: install a custom resolver backend (e.g.
+    /// `StubResolver`). Used by `tests/resolve_conformance.rs` to
+    /// exercise the resolve() handler without depending on real DNS
+    /// or `TokioResolver`. Same pre-fork precondition as
+    /// `attach_resolver_config`.
+    pub fn attach_resolver_backend(
+        &mut self,
+        backend: Arc<dyn crate::sys::resolver::ResolverBackend>,
+    ) {
+        let ps = Arc::get_mut(&mut self.process_state)
+            .expect("attach_resolver_backend: kernel already shared");
+        ps.resolver.lock().backend = Some(backend);
+    }
+
     /// Attach the linear memory. Called from instantiation setup for
     /// guests that declare a regular `(memory N)` (no `shared` flag).
     pub fn attach_memory(&mut self, mem: Memory) {
