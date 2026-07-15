@@ -101,13 +101,25 @@ that the v1 contract defers:
 4. **`Module::serialize` cross-host** — wasmtime's compiled
    `Module` artifact is host-arch-specific. Each host must
    re-compile its own `Module` from the `.wasm`.
-5. **`SmallVec<[Waker; 2]>`** — the plan's preferred waker
-   storage. v1 uses `Option<Waker>` because the typical case
-   is one waiter per child and `SmallVec` is only transitive.
-6. **`CLONE_VM` / `CLONE_THREAD` / `CLONE_FILES`** — rejected
-   with `-EINVAL` per the clone(56) handler; landing the
-   underlying shared-state machinery is behind the same
-   follow-up that adds child-fiber resumption.
+5. **`SmallVec<[Waker; 2]>`** — closed by M5 (`p3-v2-fork-clone-threads`).
+   `ChildExitStatus::waker: Option<Waker>` was replaced with
+   `notify: Arc<Notify>` using the clone-on-lock-out pattern
+   from ADR 0001 §2. Multiple concurrent waiters on the same
+   child PID now all wake via a single
+   `notify.notify_waiters()` fire (v1's single-waiter
+   `Option<Waker>` would have clobbered any second caller).
+   The 1ms polling block in `wait4_syscall` is gone.
+6. **`CLONE_VM` / `CLONE_THREAD` / `CLONE_FILES`** —
+   `CLONE_VM | CLONE_THREAD` are accepted at the
+   flag-validation layer (M4, branch `p3-v2-fork-clone-threads`),
+   with TID writeback working under any combination. The
+   full SharedMemory hand-off + child-thread spawn on
+   `CLONE_VM` lands with the WAT-based integration test in
+   M7 (the first place the engine+module references are
+   reachable through the dispatch path). `CLONE_FILES`,
+   `CLONE_SIGHAND`, `CLONE_FS`, `CLONE_IO`, `CLONE_VFORK`,
+   and the `CLONE_NEW*` namespace flags remain rejected per
+   ADR 0005 §6.
 7. **`WUNTRACED` / `WCONTINUED` / `WNOWAIT` / `WALL`** —
    wait4 flag bits rejected with `-EINVAL`. Signal-aware wait4
    lands with a real signal delivery story.

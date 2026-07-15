@@ -16,3 +16,13 @@ implementation has a contract to honor.
   Pinned the v1 freeze-then-serve migration flow: module portability,
   drain semantics, format-version interaction, accepted-stream +
   abstract-namespace rejection, and the `Subcommand::Migrate` wrapper.
+- [ADR 0004 — metering semantics](0004-metering-semantics.md) — Accepted.
+  Pinned fuel/notify-yield interaction, `cpu_ns` semantics, cold-start
+  bench thresholds (`p50 < 5 ms`), and the bench output format.
+- [ADR 0005 — P3 clone threads (v2 of fork/clone/wait4)](0005-p3-clone-threads.md) — Accepted.
+  Pinned the per-thread Kernel field split (`Arc<ProcessState>`),
+  `Arc<Engine>` + `Arc<Module>` ownership, `Arc<Notify>` clone-on-lock-out
+  multi-waiter pattern (replacing v1's single-waiter `Option<Waker>`),
+  the v2-supported clone flag set (`CLONE_VM | CLONE_THREAD |
+  CLONE_CHILD_SETTID | CLONE_PARENT_SETTID`), tgid/tid routing for
+  `kill` / `tgkill`, and the child-thread panic sentinel (139).
