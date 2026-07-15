@@ -26,7 +26,7 @@ mod common;
 use anyhow::Result;
 use edge_libos::snapshot::{
     apply_snapshot_kernel_state, apply_snapshot_to_memory, apply_snapshot_to_shared_memory,
-    decode_snapshot, encode_snapshot, try_to_snapshot,
+    decode_snapshot, encode_snapshot, try_to_snapshot, SnapshotError,
 };
 use edge_libos::{build_store, Kernel};
 
@@ -338,6 +338,69 @@ fn migration_roundtrip_preserves_shared_memory_state() -> Result<()> {
             restored_marker, SHARED_MARKER_BYTES,
             "marker must roundtrip through the Shared-memory encode/decode/apply path"
         );
+        Ok::<(), anyhow::Error>(())
+    })
+}
+
+/// P3-P0 hardening: `apply_snapshot_to_shared_memory` must surface a
+/// `SnapshotError::Invalid` when handed a snapshot with an empty
+/// `pages` vector, not panic the host. Pre-hardening, the function
+/// did `.max().unwrap()` on `pages` which would panic on a malformed
+/// snapshot. After hardening, it returns a typed error and the serve
+/// subcommand can surface it as a clean message to the operator.
+#[test]
+fn apply_snapshot_to_shared_memory_rejects_empty_pages() -> Result<()> {
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio current_thread runtime");
+        rt.block_on(f)
+    }
+
+    const SHARED_EMPTY_WAT: &str = r#"
+        (module
+          ;; Declares a 1-page shared memory but never writes to it.
+          (memory (export "memory") 1 1 shared))
+    "#;
+
+    block_on(async {
+        let (engine, linker) = common::engine_and_linker()?;
+        let module = common::compile_wat(&engine, SHARED_EMPTY_WAT)?;
+
+        // Phase 1: instantiate the guest and attach shared memory,
+        // but DO NOT write anything — this guarantees `pages` is
+        // empty in the snapshot (sparse-overlay contract).
+        let mut store = build_store(&engine, Kernel::new_without_stdio(vec![], vec![]));
+        let instance = linker.instantiate_async(&mut store, &module).await?;
+        let shared_mem = instance
+            .get_shared_memory(&mut store, "memory")
+            .expect("shared memory export must exist");
+        // Clone so we still have a handle for apply_snapshot_to_shared_memory below.
+        let shared_for_apply = shared_mem.clone();
+        store.data_mut().attach_shared_memory(shared_mem);
+
+        let snap = try_to_snapshot(store.data(), &store)?;
+        assert!(
+            snap.pages.is_empty(),
+            "guest wrote nothing; snapshot.pages must be empty"
+        );
+
+        // Phase 2: apply_snapshot_to_shared_memory must refuse this
+        // snapshot cleanly, not panic. The error must be the typed
+        // Invalid variant introduced by the hardening commit.
+        let result = apply_snapshot_to_shared_memory(&snap, &shared_for_apply);
+        match result {
+            Err(SnapshotError::Invalid(reason)) => {
+                assert!(
+                    reason.contains("empty pages"),
+                    "error message must explain the cause, got: {reason}"
+                );
+            }
+            other => panic!(
+                "expected SnapshotError::Invalid(\"empty pages ...\"), got {other:?}"
+            ),
+        }
         Ok::<(), anyhow::Error>(())
     })
 }
