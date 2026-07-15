@@ -234,6 +234,75 @@ fn sigprocmask_rejects_invalid_how() -> Result<()> {
     Ok(())
 }
 
+/// ADR 0007 §5 — `epoll_wait` with no fds and a long timeout should
+/// return `-EINTR` when a signal is delivered between the time the
+/// blocking point is entered and the call returns. We pre-arm both
+/// `signals_pending` and the per-tid `Notify` (mirroring what `kill`
+/// does in Commit 2), then drive `epoll_wait` from the wasm. The
+/// `Notify::notify_waiters()` permits a subsequent `notified()`
+/// poll to complete immediately, so the signal arm wins the race.
+#[test]
+fn epoll_wait_empty_returns_eintr_when_signal_pre_armed() -> Result<()> {
+    block_on(async {
+        let (engine, linker) = common::engine_and_linker()?;
+        let module = common::compile_wat(&engine, EPOLL_WAIT_TIMEOUT_WAT)?;
+        let (mut store, instance) = common::instantiate_async(&engine, &linker, &module).await?;
+
+        // Pre-arm: install a pending SIGUSR1 for our tid AND fire the
+        // wake primitive so the wasm-side select! arm wins immediately.
+        // `notify_one()` stores a permit consumed by the next
+        // `notified()` poll; `notify_waiters()` only wakes CURRENT
+        // waiters, so it would be lost before epoll_wait enters select!.
+        let tid = store.data().tid;
+        store
+            .data()
+            .process_state
+            .signals_pending
+            .lock()
+            .push(10 /* SIGUSR1 */);
+        store.data().process_state.signal_wake_for(tid).notify_one();
+
+        let f = instance.get_typed_func::<(), i64>(&mut store, "epoll_wait_long")?;
+        let ret = f.call_async(&mut store, ()).await?;
+        // SIGUSR1 has default terminate but our helper is a stub
+        // (Commit 8 wires the actual exit_code). For now Interrupt
+        // path applies (SIGUSR1 default-terminate is what we want —
+        // but Terminate short-circuits to -EINTR via the same code
+        // path). The result is either -EINTR (Interrupt OR Terminate
+        // via stub helper) or the signal dropped by another path.
+        assert_eq!(
+            ret,
+            -edge_libos::errno::EINTR,
+            "epoll_wait must return -EINTR when SIGUSR1 is pending"
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+}
+
+const EPOLL_WAIT_TIMEOUT_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "epoll_wait_long") (result i64)
+        ;; epoll_create1(0) → epfd (returned as i64, written as i32 at offset 0).
+        (i32.store (i32.const 0)
+          (i32.wrap_i64
+            (call $syscall
+              (i64.const 291) ;; NR_EPOLL_CREATE1
+              (i64.const 0) (i64.const 0) (i64.const 0)
+              (i64.const 0) (i64.const 0) (i64.const 0))))
+        ;; epoll_wait(epfd, events@4096, 1, 2000ms) — empty entries,
+        ;; hits the new signal-arm branch.
+        (call $syscall
+          (i64.const 232) ;; NR_EPOLL_WAIT
+          (i64.extend_i32_u (i32.load (i32.const 0)))
+          (i64.const 4096)
+          (i64.const 1)
+          (i64.const 2000)
+          (i64.const 0) (i64.const 0))))
+"#;
+
 #[test]
 fn nr_constants_match_linux_x86_64() {
     assert_eq!(edge_libos::sys::signal::NR_RT_SIGACTION, 13);
