@@ -74,7 +74,7 @@ async fn child_thread_runs_wasm_and_delivers_exit_code_via_mpsc() {
     // runtime-in-runtime check would panic. The OS thread boundary
     // escapes the parent's runtime context cleanly.
     let child_event_for_thread = child_event.clone();
-    let children_for_thread = Arc::clone(&parent_store.data().children);
+    let children_for_thread = Arc::clone(&parent_store.data().process_state.children);
     std::thread::Builder::new()
         .name(format!("edge-test-fork-{child_pid}"))
         .spawn(move || {
@@ -109,7 +109,7 @@ async fn child_thread_runs_wasm_and_delivers_exit_code_via_mpsc() {
     // shared `Arc<Mutex<HashMap>>` plumbing works through the
     // runtime boundary.
     let exit = {
-        let map = parent_store.data().children.lock();
+        let map = parent_store.data().process_state.children.lock();
         map.get(&child_pid)
             .map(|s| (s.exited, s.exit_code))
             .unwrap_or((false, -1))

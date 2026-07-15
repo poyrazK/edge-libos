@@ -139,7 +139,7 @@ async fn wait4_wnohang_with_populated_child_returns_zero() -> Result<()> {
     // Pre-populate a not-yet-exited child into Kernel.children. WNOHANG
     // must return 0 (no child is ready).
     {
-        let mut children = store.data().children.lock();
+        let mut children = store.data().process_state.children.lock();
         children.insert(42, edge_libos::kernel::ChildExitStatus::new(0));
     }
     let r = call_wait4(&mut store, &instance, 42, 0, 0x40).await;
@@ -148,7 +148,7 @@ async fn wait4_wnohang_with_populated_child_returns_zero() -> Result<()> {
         "wait4(42, WNOHANG) with non-exited child must return 0"
     );
     // The entry must still be present — we only reaped, never popped.
-    let children = store.data().children.lock();
+    let children = store.data().process_state.children.lock();
     assert!(children.contains_key(&42));
     Ok(())
 }
@@ -158,7 +158,7 @@ async fn wait4_wnohang_with_reaped_child_returns_pid_and_writes_wstatus() -> Res
     let (mut store, instance) = fresh_store_with_fixture().await?;
     // Pre-populate an exited child with exit code = 7.
     {
-        let mut children = store.data().children.lock();
+        let mut children = store.data().process_state.children.lock();
         children.insert(42, edge_libos::kernel::ChildExitStatus::reaped(7));
     }
     // Allocate a wstatus slot in guest memory at offset 0x200.
@@ -169,7 +169,7 @@ async fn wait4_wnohang_with_reaped_child_returns_pid_and_writes_wstatus() -> Res
     let wstatus = mem_read_i64(&store, 0x200);
     assert_eq!(wstatus, 0x0700, "wait status must be (exit_code << 8)");
     // The child must have been popped from the table.
-    let children = store.data().children.lock();
+    let children = store.data().process_state.children.lock();
     assert!(!children.contains_key(&42));
     Ok(())
 }
@@ -178,7 +178,7 @@ async fn wait4_wnohang_with_reaped_child_returns_pid_and_writes_wstatus() -> Res
 async fn wait4_any_pid_picks_first_reaped_child() -> Result<()> {
     let (mut store, instance) = fresh_store_with_fixture().await?;
     {
-        let mut children = store.data().children.lock();
+        let mut children = store.data().process_state.children.lock();
         children.insert(10, edge_libos::kernel::ChildExitStatus::reaped(3));
         children.insert(11, edge_libos::kernel::ChildExitStatus::new(0));
         children.insert(12, edge_libos::kernel::ChildExitStatus::reaped(5));
@@ -193,7 +193,7 @@ async fn wait4_any_pid_picks_first_reaped_child() -> Result<()> {
     );
     // The picked PID is removed; the other exited child + the
     // not-yet-exited child remain.
-    let children = store.data().children.lock();
+    let children = store.data().process_state.children.lock();
     assert!(
         !children.contains_key(&r_i32),
         "reaped child must be popped"
@@ -230,17 +230,17 @@ async fn wait4_parked_any_pid_wakes_on_notify() -> Result<()> {
     let (mut store, instance) = fresh_store_with_fixture().await?;
     // Populate a child that hasn't exited yet.
     {
-        let mut children = store.data().children.lock();
+        let mut children = store.data().process_state.children.lock();
         children.insert(7, edge_libos::kernel::ChildExitStatus::new(0));
     }
 
     // Fire the notify BEFORE the wait4 call so the parked
     // `child_event.notified().await` resolves immediately.
-    store.data().child_event.notify_waiters();
+    store.data().process_state.child_event.notify_waiters();
     // Now mark the child as exited — without this, wait4 will
     // re-park after the wake and the test would hang.
     {
-        let mut children = store.data().children.lock();
+        let mut children = store.data().process_state.children.lock();
         if let Some(c) = children.get_mut(&7) {
             c.exited = true;
             c.exit_code = 9;
@@ -255,7 +255,7 @@ async fn wait4_parked_any_pid_wakes_on_notify() -> Result<()> {
     );
     let wstatus = mem_read_i64(&store, 0x200);
     assert_eq!(wstatus, 0x0900, "wstatus = (9 << 8)");
-    let children = store.data().children.lock();
+    let children = store.data().process_state.children.lock();
     assert!(!children.contains_key(&7), "child must be popped");
     Ok(())
 }
@@ -282,7 +282,7 @@ async fn wait4_parked_unknown_specific_pid_returns_echild() -> Result<()> {
     let (mut store, instance) = fresh_store_with_fixture().await?;
     // Populate one child.
     {
-        let mut children = store.data().children.lock();
+        let mut children = store.data().process_state.children.lock();
         children.insert(5, edge_libos::kernel::ChildExitStatus::new(0));
     }
     // Block on a PID that doesn't exist.
@@ -303,7 +303,7 @@ async fn wait4_parked_specific_pid_reaps_when_already_exited() -> Result<()> {
     let (mut store, instance) = fresh_store_with_fixture().await?;
     // Pre-populate a reaped child.
     {
-        let mut children = store.data().children.lock();
+        let mut children = store.data().process_state.children.lock();
         children.insert(11, edge_libos::kernel::ChildExitStatus::reaped(4));
     }
     mem_write_i64(&mut store, 0x200, 0);
@@ -311,7 +311,7 @@ async fn wait4_parked_specific_pid_reaps_when_already_exited() -> Result<()> {
     assert_eq!(r, 11, "blocking wait4(11) with reaped child must return 11");
     let wstatus = mem_read_i64(&store, 0x200);
     assert_eq!(wstatus, 0x0400, "wstatus = (4 << 8)");
-    let children = store.data().children.lock();
+    let children = store.data().process_state.children.lock();
     assert!(!children.contains_key(&11));
     Ok(())
 }

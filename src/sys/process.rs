@@ -117,7 +117,7 @@ fn reap_all_children(caller: &mut Caller<'_, Kernel>) {
     // Phase 1: under the lock, mark + drain wakers into a Vec.
     let drained: Vec<std::task::Waker> = {
         let kernel = caller.data();
-        let mut children = kernel.children.lock();
+        let mut children = kernel.process_state.children.lock();
         let mut out = Vec::new();
         for (_, status) in children.iter_mut() {
             status.exited = true;
@@ -133,7 +133,7 @@ fn reap_all_children(caller: &mut Caller<'_, Kernel>) {
     }
     // Phase 3: notify any parked `child_event.notified().await`
     // waiters (any-pid parked wait4 callers).
-    caller.data().child_event.notify_waiters();
+    caller.data().process_state.child_event.notify_waiters();
 }
 
 pub fn getpid() -> i64 {
@@ -192,6 +192,7 @@ pub async fn clone_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 
 
     let child_tid = caller
         .data()
+        .process_state
         .next_pid
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -265,13 +266,14 @@ pub async fn fork_syscall(caller: &mut Caller<'_, Kernel>, _a: [i64; 6]) -> i64 
     // gated on PID order.
     let child_pid = caller
         .data()
+        .process_state
         .next_pid
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Insert the child into the children table. The child is
     // not yet exited; the parent can wait4 for it. See the
     // handler doc comment for the deferred-resume contract.
-    let mut children = caller.data().children.lock();
+    let mut children = caller.data().process_state.children.lock();
     children.insert(child_pid, ChildExitStatus::new(0));
     drop(children);
 
@@ -341,7 +343,7 @@ pub async fn wait4_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 
     // ECHILD fast path — no children at all. WNOHANG vs blocking
     // is irrelevant here because there is nothing to wait for.
     {
-        let children = caller.data().children.lock();
+        let children = caller.data().process_state.children.lock();
         if children.is_empty() {
             return -ECHILD;
         }
@@ -360,7 +362,12 @@ pub async fn wait4_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 
     // Blocking parked path. ECHILD for unknown specific PID — no
     // way to ever satisfy the wait.
     if pid > 0 {
-        let exists = caller.data().children.lock().contains_key(&(pid as i32));
+        let exists = caller
+            .data()
+            .process_state
+            .children
+            .lock()
+            .contains_key(&(pid as i32));
         if !exists {
             return -ECHILD;
         }
@@ -374,7 +381,7 @@ pub async fn wait4_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 
         // Snapshot a fresh notify handle BEFORE we lock — `Arc`
         // clone is cheap and lock-free. We can't take the lock
         // and then construct a future that needs `&caller.data()`.
-        let child_event = caller.data().child_event.clone();
+        let child_event = caller.data().process_state.child_event.clone();
         let specific_waker_pid: Option<i32> = if pid > 0 { Some(pid as i32) } else { None };
 
         if let Some(sp) = specific_waker_pid {
@@ -392,7 +399,7 @@ pub async fn wait4_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 let exit_code_opt: Option<i32> = {
-                    let mut children = caller.data().children.lock();
+                    let mut children = caller.data().process_state.children.lock();
                     match children.get(&sp) {
                         Some(c) if c.exited => {
                             let exit_code = c.exit_code;
@@ -433,7 +440,7 @@ pub async fn wait4_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 
 /// disambiguation (an unknown specific PID is ECHILD; no children
 /// at all is also ECHILD).
 fn try_reap(caller: &mut Caller<'_, Kernel>, pid: i64) -> Option<(i32, i32)> {
-    let mut children = caller.data().children.lock();
+    let mut children = caller.data().process_state.children.lock();
     let target: Option<i32> = if pid > 0 { Some(pid as i32) } else { None };
     let picked: Option<i32> = match target {
         Some(p) => {
@@ -842,13 +849,14 @@ pub fn spawn_child_thread(
     // The drainer task is started on the parent's runtime by the
     // caller (fork_syscall, after returning to user space).
     let (exit_tx, exit_rx) = tokio::sync::mpsc::unbounded_channel::<(i32, i32)>();
-    let child_event = parent_kernel.child_event.clone();
+    let child_event = parent_kernel.process_state.child_event.clone();
     // M2: share the parent's `children` map with the child thread so
     // it can register/update the `ChildExitStatus` entry. Without
     // this, the parent's `wait4(child_pid)` between fork and exit
     // would race the child's update. v1 had the parent register
     // synchronously in `fork_syscall`; M2 is the threaded story.
-    let children_arc = Arc::clone(&parent_kernel.children);
+    // M3: the children map is now under `process_state`.
+    let children_arc = Arc::clone(&parent_kernel.process_state.children);
 
     let handle = std::thread::Builder::new()
         .name(format!("edge-fork-{child_pid}"))

@@ -86,7 +86,7 @@ async fn fork_inserts_child_into_kernel_children_table() -> Result<()> {
     let (mut store, instance) = fresh_store_with_fixture().await?;
     let r = call_fork(&mut store, &instance).await;
     assert!(r > 0);
-    let children = store.data().children.lock();
+    let children = store.data().process_state.children.lock();
     let pid_i32 = r as i32;
     let entry = children
         .get(&pid_i32)
@@ -107,11 +107,13 @@ async fn fork_increments_next_pid_by_one() -> Result<()> {
     let (mut store, instance) = fresh_store_with_fixture().await?;
     let pre = store
         .data()
+        .process_state
         .next_pid
         .load(std::sync::atomic::Ordering::Relaxed);
     let r = call_fork(&mut store, &instance).await;
     let post = store
         .data()
+        .process_state
         .next_pid
         .load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(post - pre, 1, "fork() must increment next_pid by exactly 1");
@@ -141,7 +143,7 @@ async fn fork_does_not_resume_child_fiber_in_v1() -> Result<()> {
     assert!(r1 > 0 && r2 > 0, "both forks must return positive PIDs");
     assert_ne!(r1, r2, "two forks must produce distinct PIDs");
 
-    let children = store.data().children.lock();
+    let children = store.data().process_state.children.lock();
     assert!(children.contains_key(&(r1 as i32)));
     assert!(children.contains_key(&(r2 as i32)));
     // Both still not-yet-exited — the deferred child fiber has

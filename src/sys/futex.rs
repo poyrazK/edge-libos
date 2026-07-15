@@ -206,7 +206,7 @@ async fn futex_wait(
             }
         };
 
-        let mut table = caller.data().futex_table.lock();
+        let mut table = caller.data().process_state.futex_table.lock();
         let entry = table.by_addr.entry(uaddr).or_insert_with(|| FutexEntry {
             notify: Arc::new(Notify::new()),
             waiters: 0,
@@ -258,7 +258,7 @@ async fn futex_wait(
 /// serialization in ADR 0002, fork CoW, etc.) only has to update one
 /// block.
 fn release_waiter(caller: &mut Caller<'_, Kernel>, uaddr: u32) {
-    let mut table = caller.data().futex_table.lock();
+    let mut table = caller.data().process_state.futex_table.lock();
     if let Some(entry) = table.by_addr.get_mut(&uaddr) {
         entry.waiters = entry.waiters.saturating_sub(1);
         if entry.waiters == 0 {
@@ -273,7 +273,7 @@ pub fn futex_wake(caller: &mut Caller<'_, Kernel>, uaddr: u32, val: i32) -> i64 
     // Compute notify count under lock, then drop guard, then notify
     // outside.
     let (notify, to_wake): (Arc<Notify>, usize) = {
-        let mut table = caller.data().futex_table.lock();
+        let mut table = caller.data().process_state.futex_table.lock();
         match table.by_addr.get_mut(&uaddr) {
             Some(entry) => {
                 let to_wake = (val.max(0) as usize).min(entry.waiters);

@@ -333,7 +333,7 @@ fn futex_table_roundtrips_via_snapshot() -> Result<()> {
 
     // Read the entries without going through private fields:
     // `snapshot()` round-trips losslessly and is the public path.
-    let restored = kernel_dst.futex_table.lock().snapshot();
+    let restored = kernel_dst.process_state.futex_table.lock().snapshot();
     let mut sorted = restored.clone();
     sorted.sort_by_key(|f| f.addr.0);
     assert_eq!(sorted.len(), 2, "both entries restored");
@@ -361,7 +361,7 @@ fn futex_table_roundtrips_via_snapshot() -> Result<()> {
     //    "fresh-Notify-pointer" assertion lives in
     //    `src/sys/futex.rs::mod tests` (where `by_addr` is
     //    reachable).
-    let snap_re_roundtrip = kernel_dst.futex_table.lock().snapshot();
+    let snap_re_roundtrip = kernel_dst.process_state.futex_table.lock().snapshot();
     assert_eq!(
         snap_re_roundtrip, sorted,
         "snapshot() on restored table must equal the wire-form input — proves the in-memory rebuild is faithful"
