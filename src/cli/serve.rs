@@ -33,11 +33,11 @@
 //! the parent's OS-level fd number. We `dup` the source fd and
 //! insert the listener at the target slot. See ADR 0004 §2.
 //!
-//! Snapshot portability caveat (NOT addressed): serve trusts the wasm
-//! path matches freeze's. If the user passes a different wasm, apply
-//! will succeed but the guest will mis-execute. Future: embed a
-//! module hash in `KernelSnapshot`, bump `SNAPSHOT_FORMAT_VERSION`.
-//! Tracked as a follow-up.
+//! Snapshot portability (ADR 0005): serve refuses to apply a snapshot
+//! whose frozen-hash (embedded at freeze time) does not match the
+//! SHA-256 of the `.wasm` file the operator is now handing us.
+//! `verify_module_hash` runs BEFORE `apply_snapshot_kernel_state`
+//! so a mismatched wasm can never reach the partial-apply path.
 
 use std::path::PathBuf;
 
@@ -50,7 +50,7 @@ use crate::host::{add_to_linker, build_engine, build_store};
 use crate::kernel::Kernel;
 use crate::snapshot::{
     apply_snapshot_inherited_listeners, apply_snapshot_kernel_state, apply_snapshot_to_memory,
-    read_snapshot_file, KernelSnapshot,
+    read_snapshot_file, verify_module_hash, KernelSnapshot,
 };
 
 /// Prefix for systemd-style socket activation env vars (ADR 0004
@@ -219,6 +219,14 @@ async fn serve_loop(
     if let Some(mem) = instance.get_memory(&mut store, "memory") {
         store.data_mut().attach_memory(mem);
     }
+
+    // ADR 0005: refuse a mismatched wasm BEFORE any apply step.
+    // On `[0u8; 32]` (no recorded hash — pre-existing v1 snapshot
+    // written before ADR 0005), the verify path inside
+    // `verify_module_hash` emits a `tracing::warn!` and returns Ok,
+    // so the operator gets a visible-but-not-blocking warning
+    // instead of a silent skip.
+    verify_module_hash(snap, &bytes)?;
 
     // Three-step apply (ADR 0004 §2):
     //
