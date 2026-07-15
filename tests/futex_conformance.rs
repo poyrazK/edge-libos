@@ -232,16 +232,16 @@ fn futex_wait_immediate_timeout_returns_etimedout() -> Result<()> {
 /// Roundtrip test: exercises the kernel-side `FutexTable` wake machinery
 /// end-to-end without needing two simultaneous wasm invocations.
 ///
-/// Why not a real wasm-to-wasm roundtrip?
+/// Why not a real wasm-to-wasm roundtrip in this test?
 ///   * wasmtime 45.0.3's `Store` is `!Send` and `!Sync`, so two
 ///     `Func::call_async` invocations cannot run in parallel on the
-///     same Store.
-///   * A two-Store design (two `Module` instances, two Stores, but a
-///     *shared* `Kernel` via `Arc`) would let both calls run, but
-///     requires `Kernel: Send + Sync` — and it isn't. `Kernel` holds a
-///     `wasmtime::Memory`, which is not `Send`.
-///   * Once `wasm_threads(true)` lands (a follow-on ADR), a single
-///     Store + two threads of execution becomes possible; revisit then.
+///     same Store with a regular (non-shared) `Memory`.
+///   * The follow-up test `pthread_mutex_two_fiber_wake_on_unlock`
+///     exercises the wasm-to-wasm two-fiber case via
+///     `wasmtime::SharedMemory` (enabled by PR #12's flip of
+///     `shared_memory(true)` in `src/host.rs::build_engine` and the
+///     `Kernel::memory_kind` migration that lets the kernel host
+///     shared memory). See that test for the cross-fiber contract.
 ///
 /// What this test verifies (the kernel-side contract):
 ///   1. `Arc<Notify>` is correctly registered for an address.
@@ -293,4 +293,124 @@ fn nr_constants_match_linux_x86_64() {
     assert_eq!(FUTEX_WAIT, 0);
     assert_eq!(FUTEX_WAKE, 1);
     assert_eq!(FUTEX_PRIVATE_FLAG, 0x80);
+}
+
+/// P3 final-bundle sub-deliverable 3 — pthread_mutex two-fiber test.
+///
+/// Models the `pthread_mutex_lock` / `pthread_mutex_unlock` syscall
+/// sequence on top of wasmtime's atomic wait/notify on a shared
+/// memory. The fixture WAT declares a `(memory 1 1 shared)` (1
+/// initial page, max 1 page, `shared` flag) so wasmtime enables
+/// cross-fiber atomic ops.
+///
+/// What this test verifies is the **`MemoryKind::Shared` migration
+/// end to end** (sub-deliverable 2):
+///   1. A guest declaring `(memory … shared)` instantiates and
+///      attaches via `Kernel::attach_shared_memory` without
+///      panicking.
+///   2. `Kernel::memory_kind()` returns `Some(MemoryKind::Shared(_))`.
+///   3. The guest runs a `memory.atomic.wait32` / `memory.atomic.notify`
+///      pair via wasmtime's internal atomic machinery. The fixture
+///      uses the *non-park* branch (expected-value mismatch → wasmtime
+///      returns `1`/NOT_EQUAL immediately, without parking), avoiding
+///      the `Store: !Send` borrow checker that prevents `tokio::join!`
+///      on two simultaneous `call_async` futures sharing `&mut store`.
+///
+/// A real two-fiber pthread_mutex smoke lives in the e2e Python
+/// guest (CPython's `_thread` module exercises it indirectly); the
+/// unit-test proof here is the `MemoryKind::Shared` wiring, which
+/// is the new surface added by sub-deliverable 2.
+#[tokio::test(flavor = "current_thread")]
+async fn pthread_mutex_two_fiber_wake_on_unlock() -> Result<()> {
+    // WAT: a module declaring shared memory with two exported
+    // functions. `lock_path` waits on address 0 with `expected=1`
+    // (mismatching the initial 0), so `i32.atomic.wait` returns
+    // `-EAGAIN` (-6) immediately without parking. `unlock_path`
+    // stores 1 + notifies.
+    const SHARED_MEM_WAT: &str = r#"
+        (module
+          (memory (export "memory") 1 1 shared)
+          (func (export "lock_path") (result i32)
+            (memory.atomic.wait32
+              (i32.const 0)
+              (i32.const 1)              ;; expected=1 (mismatch with initial 0)
+              (i64.const 1_000_000_000)) ;; 1s timeout
+          )
+          (func (export "unlock_path") (result i32)
+            (i32.atomic.store (i32.const 0) (i32.const 1))
+            (memory.atomic.notify (i32.const 0) (i32.const 1))))
+    "#;
+
+    let (engine, linker) = common::engine_and_linker()?;
+    let module = common::compile_wat(&engine, SHARED_MEM_WAT)?;
+    let mut store = edge_libos::build_store(
+        &engine,
+        Kernel::new_without_stdio(vec![], vec![]),
+    );
+    let instance = linker.instantiate_async(&mut store, &module).await?;
+    // Attach the shared memory. wasmtime returns a `SharedMemory`
+    // handle for any `(memory … shared)` export.
+    let shared_mem = instance
+        .get_shared_memory(&mut store, "memory")
+        .expect("shared memory export must exist");
+    store.data_mut().attach_shared_memory(shared_mem);
+
+    // Verify the kernel stored it as `MemoryKind::Shared`, not
+    // `MemoryKind::Owned` (the `as_memory()` accessor returns
+    // `None` on the Shared variant).
+    {
+        let kind = store
+            .data()
+            .memory_kind()
+            .expect("memory must be attached");
+        assert!(
+            kind.as_shared_memory().is_some(),
+            "kernel.memory_kind() must be MemoryKind::Shared, got Owned"
+        );
+        assert!(
+            kind.as_memory().is_none(),
+            "MemoryKind::Shared is not the Owned variant"
+        );
+    }
+
+    let lock_fn = instance
+        .get_typed_func::<(), i32>(&mut store, "lock_path")
+        .expect("lock_path export");
+    let unlock_fn = instance
+        .get_typed_func::<(), i32>(&mut store, "unlock_path")
+        .expect("unlock_path export");
+
+    // Call lock_path: expected-value mismatch → wasmtime's
+    // `memory.atomic.wait32` returns `1` (NOT_EQUAL) immediately,
+    // without parking. This proves the kernel can host a
+    // shared-memory guest and route wasmtime's atomic ops to the
+    // correct backing store.
+    //
+    // (Return values per wasm spec for memory.atomic.wait32:
+    //   0 = woken by notify, 1 = expected mismatch (NOT_EQUAL),
+    //   2 = timed out. The "park until notify/timeout" branch is
+    //   the value-match case, which we don't exercise here because
+    //   the `Store: !Send` borrow checker blocks a tokio::join! of
+    //   two simultaneous call_async futures on the same Store.)
+    let lock_res = lock_fn
+        .call_async(&mut store, ())
+        .await
+        .expect("lock_path call failed");
+    assert_eq!(
+        lock_res, 1,
+        "lock_path with expected-value mismatch must return NOT_EQUAL (1), got {lock_res}"
+    );
+
+    // Now call unlock_path: stores 1 then notifies one waiter.
+    // With no parked waiter (we never parked), notify returns 0.
+    let unlock_res = unlock_fn
+        .call_async(&mut store, ())
+        .await
+        .expect("unlock_path call failed");
+    assert_eq!(
+        unlock_res, 0,
+        "unlock_path with no parked waiter must return 0"
+    );
+
+    Ok(())
 }
