@@ -127,7 +127,7 @@ run_step 3 "C conformance (marker-enforced)" \
 run_step 4 "strace baseline diff" \
     bash -c 'cargo test --profile ci --test strace_baseline_diff'
 
-run_step 5 "scripts/reproduce_dod.sh (10 steps)" \
+run_step 5 "scripts/reproduce_dod.sh (11 steps)" \
     bash scripts/reproduce_dod.sh
 
 # --- 3. Final summary (mirrors the CI workflow's job summary) ---

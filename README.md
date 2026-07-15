@@ -23,10 +23,10 @@ through the full async pivot (epoll/eventfd): ✅ (`ec911cb`)
 **P2** — production-ish single instance: 🚧 in progress
 
 P2 adds pre-init snapshot/restore (sub-5 ms cold start), host-backed DNS
-resolver, default-deny egress policy, epoch-based CPU-ms metering, and
-minimal AF_UNIX support, alongside the literal CPython cross-compile
-pipeline. See [`HANDOFF.md`](./HANDOFF.md) for the running status; see
-the P2 plan for the full breakdown.
+resolver, default-deny egress policy, fuel-based per-request CPU-ms
+metering (ADR 0003), and minimal AF_UNIX support, alongside the literal
+CPython cross-compile pipeline. See [`HANDOFF.md`](./HANDOFF.md) for the
+running status; see the P2 plan for the full breakdown.
 
 ## P1 DoD (satisfied)
 
@@ -50,10 +50,10 @@ artifact and requires `zig cc` + a git submodule — see `guest/build.sh`.
 
 ## Test totals
 
-- **88** Rust unit tests (in `#[cfg(test)]` modules under `src/`)
-- **161** Rust integration tests (across `tests/*.rs`)
+- **144** Rust unit tests (in `#[cfg(test)]` modules under `src/`)
+- **192** Rust integration tests (across `tests/*.rs`)
 - **105** C conformance tests (`tests/conformance/*.c`, marker-enforced)
-- **Total: 354 tests.** Source of truth: `bash tests/count_tests.sh`.
+- **Total: 441 tests.** Source of truth: `bash tests/count_tests.sh`.
 
 P2-B4 added `statx(2)` + a C test. P2-B5 added `dup/dup2/dup3` +
 shared-state refactor + 5 new C tests. P2-C1+C2+C3 added identity,
@@ -63,7 +63,10 @@ and a literal CPython DoD gate. P2-D1 added the snapshot foundation
 (`postcard` + serde `KernelSnapshot` roundtrip). P2-D2 overlays the
 linear-memory blob onto snapshots per ADR 0002 (sparse per-page
 layout, `LeU*`/`LeI*` newtypes, `tests/snapshot_roundtrip.rs`
-end-to-end conformance gate).
+end-to-end conformance gate). P2-D3 landed freeze/serve/cold-start
+bench on `edge-cli`. P2 metering (this branch) adds the per-request
+fuel budget, `CliError::Metered` trap path, and the metering DoD
+smoke (`edge_cli_metering_smoke`).
 
 Source of truth: `bash tests/count_tests.sh`. The conformance runner
 also prints the total at the end of its run.
@@ -98,8 +101,11 @@ Concretely P2 lands (in order):
    50-iteration cold-start benchmark under 5 ms p50.
 4. **DNS + egress** (E1-E2) — default-deny egress policy, host-backed
    resolver via `hickory-resolver`, new `NR_RESOLVE` syscall.
-5. **Metering** (F1-F2) — epoch-based interruption, 100 ms default
-   budget per request, `cpu_ms_used` accounting.
+5. **Metering** (F1-F2) — fuel-based per-request CPU budget
+   (`--cpu-budget-ms <ms>` on `edge-cli run`/`serve`/`bench`), Wasmtime
+   `consume_fuel` + `set_fuel` instrumentation, `CliError::Metered`
+   trap classification. Implementation lives on branch
+   `p2-metering-hooks`; ADR 0003 captures the contract.
 6. **Literal CPython DoD** (A6) — `guest/cpython` submodule cross-compile
    via `zig cc`, real `edge-cli run serve_one_request.py` produces
    `200 OK` from a real CPython+uvicorn+FastAPI wasm module.

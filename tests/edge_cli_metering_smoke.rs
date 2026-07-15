@@ -47,7 +47,7 @@ fn build_wat_with_iters(iters: u64) -> PathBuf {
         let iters_bytes = iters.to_le_bytes();
         let mut patched = false;
         for off in 0..wasm.len().saturating_sub(8) {
-            if &wasm[off..off + 8] == &[0u8; 8] {
+            if wasm[off..off + 8] == [0u8; 8] {
                 wasm[off..off + 8].copy_from_slice(&iters_bytes);
                 patched = true;
                 break;
@@ -82,13 +82,8 @@ async fn run_traps_on_out_of_fuel_with_tight_budget() {
     // budget 1 ms" message.
     let wasm_path = build_wat_with_iters(0);
 
-    let (status, stderr) = run_edge_cli(&[
-        "run",
-        wasm_path.to_str().unwrap(),
-        "--cpu-budget-ms",
-        "1",
-    ])
-    .await;
+    let (status, stderr) =
+        run_edge_cli(&["run", wasm_path.to_str().unwrap(), "--cpu-budget-ms", "1"]).await;
 
     assert_eq!(
         status.code(),
