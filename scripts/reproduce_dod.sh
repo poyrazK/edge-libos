@@ -13,12 +13,13 @@
 #   8. DoD #3: edge-cli run serve_one_request.py   — real uvicorn+FastAPI HTTP serve
 #   9. bash tests/count_tests.sh                     — print the canonical test totals
 #  10. DoD #4: edge-cli bench                         — 50-iter cold-start, p50 < 5ms gate
+#  11. DoD #5: edge-cli metering smoke                — OutOfFuel → CliError::Metered
 #
 # Steps that require tools not available on the host (no zig, no
 # strace, no CPython submodule) print a SKIP notice and the script
 # continues rather than aborting. A full Linux CI box with the cpython
 # submodule should hit every step green; macOS dev boxes typically
-# hit 1-5, 9-10 and skip 6-8 (no zig + no submodule).
+# hit 1-5, 9-11 and skip 6-8 (no zig + no submodule).
 
 set -uo pipefail
 
@@ -37,6 +38,7 @@ cd "$ROOT" || exit 1
 # SKIP_DOD_SMOKE=1   skip steps 7 + 8 (real python.wasm DoD smokes)
 # SKIP_TEST_TOTALS=1 skip step 9 (count_tests summary)
 # SKIP_BENCH=1       skip step 10 (edge-cli bench cold-start demo)
+# SKIP_METERING=1    skip step 11 (edge-cli metering smoke)
 SKIP_DEV_SETUP="${SKIP_DEV_SETUP:-0}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 SKIP_RUST_TEST="${SKIP_RUST_TEST:-0}"
@@ -46,6 +48,7 @@ SKIP_GUEST="${SKIP_GUEST:-0}"
 SKIP_DOD_SMOKE="${SKIP_DOD_SMOKE:-0}"
 SKIP_TEST_TOTALS="${SKIP_TEST_TOTALS:-0}"
 SKIP_BENCH="${SKIP_BENCH:-0}"
+SKIP_METERING="${SKIP_METERING:-0}"
 
 say()  { echo "==> $*"; }
 skip() { echo "SKIP: $*"; }
@@ -209,12 +212,39 @@ else
     BENCH_RESULT="skipped"
 fi
 
+# 11. DoD #5 — metering smoke (ADR 0003). Runs the
+# `edge_cli_metering_smoke` integration test, which subprocesses
+# `edge-cli run` against `tests/guests/burn_fuel.wat` with
+# `--cpu-budget-ms 1` (trap path) and `--cpu-budget-ms 10000`
+# (clean-exit path). The test asserts `CliError::Metered → exit 1`
+# and "cpu budget exceeded" in stderr — the load-bearing wiring
+# for the per-request CPU budget on `serve` (and the gate that
+# keeps a runaway guest from starving the host runtime).
+say "11/11 DoD #5: edge-cli metering smoke (--cpu-budget-ms → OutOfFuel → CliError::Metered)"
+if [[ "$SKIP_METERING" == "1" ]]; then
+    skip "11 metering (SKIP_METERING=1)"; mark_env_skipped "metering"
+    METERING_RESULT="skipped"
+elif command -v wat2wasm >/dev/null 2>&1; then
+    if cargo test --release --test edge_cli_metering_smoke; then
+        METERING_RESULT="ok"
+        mark_ran "metering"
+    else
+        METERING_RESULT="fail"
+        mark_skip "metering (assertions failed; output above)"
+    fi
+else
+    skip "wat2wasm not on PATH (tests/guests/burn_fuel.wat fixture compile)"
+    mark_skip "metering (no wat2wasm)"
+    METERING_RESULT="skipped"
+fi
+
 say "✅ reproduce_dod.sh complete"
 echo
 echo "Summary:"
 echo "  Ran:     ${ran_steps[*]:-(none)}"
 echo "  Skipped: ${skipped_steps[*]:-(none)}"
 echo "  Bench:   ${BENCH_RESULT:-skipped}"
+echo "  Metering: ${METERING_RESULT:-skipped}"
 echo
 echo "Conformance: bash tests/conformance/runner.sh"
 echo "Test totals: bash tests/count_tests.sh"

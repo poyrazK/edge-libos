@@ -97,6 +97,12 @@ pub struct Kernel {
     /// path). Per-child parking goes through the matching
     /// `ChildExitStatus::waker` instead.
     pub child_event: Arc<Notify>,
+    /// P2 metering (ADR 0004 §4): monotonic CPU time consumed by
+    /// the guest since the last `set_fuel` reset. Reported in `serve`'s
+    /// per-request log line and in `bench`'s per-iter print; snapshotted
+    /// so `serve` carries usage across restore.
+    /// SNAPSHOT: include.
+    pub cpu_ns: u64,
 }
 
 /// P3 Tier-3: the linear-memory handle stored on the kernel.
@@ -344,6 +350,7 @@ impl Kernel {
             next_pid: AtomicI32::new(2),
             children: parking_lot::Mutex::new(HashMap::new()),
             child_event: Arc::new(Notify::new()),
+            cpu_ns: 0,
         }
     }
 
