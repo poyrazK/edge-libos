@@ -20,3 +20,8 @@ implementation has a contract to honor.
   Pins the v1 contract for `NR_SNAPSHOT = 123` (guest-driven quiescence),
   `EDGE_SERVE_FD_<N>` env-var fd-inherit shape, and the subprocess flow
   that `edge-cli migrate` orchestrates via `Command::new(current_exe)`.
+- [ADR 0005 — snapshot module-hash portability check (P3-D3.5-followup-1)](0005-snapshot-module-hash.md) — Accepted.
+  Pins SHA-256 of the freeze-side `.wasm` bytes inside
+  `KernelSnapshot.module_sha256`; `verify_module_hash` refuses to
+  apply on mismatch at the `serve` boundary. Closes the silent
+  mis-execution caveat formerly called out by ADR 0002 §8.

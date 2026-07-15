@@ -316,6 +316,7 @@ fn futex_table_roundtrips_via_snapshot() -> Result<()> {
         comm: [0u8; 16],
         futex_table: futex_wire,
         cpu_ns: LeU64::default(),
+        module_sha256: [0u8; 32],
     };
     let wire = postcard::to_stdvec(&snap).expect("encode snapshot");
     let snap_decoded: KernelSnapshot = postcard::from_bytes(&wire).expect("decode snapshot");

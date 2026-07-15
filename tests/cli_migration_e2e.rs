@@ -300,3 +300,105 @@ async fn freeze_then_serve_with_inherited_listener() {
     let _ = std::fs::remove_file(&snap_path);
     let _ = std::fs::remove_file(&stderr_path);
 }
+
+/// P3-D3.5-followup-1 / ADR 0005 — mismatch rejection on the real
+/// subprocess path. Freezes with the production `serve_forever.wat`,
+/// then runs `edge-cli serve` against a DIFFERENT wasm
+/// (`serve_one_request.wat`). The serve subprocess MUST exit
+/// non-zero before any apply step, with stderr containing
+/// `module hash mismatch` (or the matching `CliError::Snapshot`
+/// display). This is the headlined end-to-end repro of the
+/// silent-mis-execution fix.
+#[tokio::test(flavor = "current_thread")]
+async fn cli_migration_e2e_rejects_mismatched_wasm() {
+    // 1. Build the freeze-side wasm (`serve_forever.wat`) — same
+    //    fixture the happy-path test uses — and the serve-side
+    //    wasm (a deliberately different module, `serve_one_request.wat`).
+    //    They have DIFFERENT byte content so SHA-256 disagrees.
+    let freeze_wasm_path = std::env::temp_dir().join("edge_d35_e2e_mismatch_freeze.wasm");
+    let serve_wasm_path = std::env::temp_dir().join("edge_d35_e2e_mismatch_serve.wasm");
+    let snap_path = std::env::temp_dir().join("edge_d35_e2e_mismatch.snap");
+    let _ = std::fs::remove_file(&freeze_wasm_path);
+    let _ = std::fs::remove_file(&serve_wasm_path);
+    let _ = std::fs::remove_file(&snap_path);
+
+    let freeze_wat = wat::parse_str(include_str!("../tests/guests/serve_forever.wat"))
+        .expect("compile serve_forever.wat");
+    let serve_wat = wat::parse_str(include_str!("../tests/guests/serve_one_request.wat"))
+        .expect("compile serve_one_request.wat");
+    std::fs::write(&freeze_wasm_path, &freeze_wat).expect("write freeze wasm");
+    std::fs::write(&serve_wasm_path, &serve_wat).expect("write serve wasm");
+
+    let cli = edge_cli_path();
+
+    // 2. Freeze the freeze-side wasm. The snapshot's
+    //    `module_sha256` will be SHA-256 of `freeze_wasm_path`'s
+    //    bytes — by design different from the serve-side wasm's
+    //    SHA-256.
+    let freeze_status = std::process::Command::new(&cli)
+        .args([
+            "freeze",
+            freeze_wasm_path.to_str().unwrap(),
+            "--out",
+            snap_path.to_str().unwrap(),
+        ])
+        .status()
+        .expect("spawn freeze");
+    assert!(
+        freeze_status.success(),
+        "freeze must succeed (exit 0): {freeze_status}"
+    );
+    assert!(
+        snap_path.is_file(),
+        "freeze did not write snapshot at {}",
+        snap_path.display()
+    );
+
+    // 3. Run serve with the MISMATCHED serve-side wasm. Capture
+    //    stderr; the dispatcher's exit-1 path for
+    //    `CliError::Snapshot` will fire because the verify call
+    //    rejects the wasm BEFORE any apply step runs.
+    let stderr_path = std::env::temp_dir().join("edge_d35_e2e_mismatch_serve.stderr");
+    let _ = std::fs::remove_file(&stderr_path);
+    let stderr_file = std::fs::File::create(&stderr_path).expect("create stderr file");
+    let mut serve = tokio::process::Command::new(&cli)
+        .args([
+            "serve",
+            snap_path.to_str().unwrap(),
+            serve_wasm_path.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn serve (mismatch)");
+    // The mismatch should fire synchronously inside serve_loop —
+    // no listener is ever bound, so a short timeout is plenty.
+    let serve_status = tokio::time::timeout(Duration::from_secs(5), serve.wait())
+        .await
+        .expect("serve should exit promptly on mismatch")
+        .expect("serve.wait() ok");
+    // Capture stderr for the diagnostic assertion below.
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+
+    assert!(
+        !serve_status.success(),
+        "serve MUST exit non-zero on wasm hash mismatch; got {:?} stderr={stderr:?}",
+        serve_status.code()
+    );
+    assert_eq!(
+        serve_status.code(),
+        Some(1),
+        "serve must exit with code 1 (the dispatcher maps Snapshot → exit 1)"
+    );
+    assert!(
+        stderr.contains("module hash mismatch") || stderr.contains("ModuleHashMismatch"),
+        "expected stderr to mention the module hash mismatch error; got: {stderr:?}"
+    );
+
+    // 4. Cleanup tmpfiles so successive runs don't accumulate.
+    let _ = std::fs::remove_file(&freeze_wasm_path);
+    let _ = std::fs::remove_file(&serve_wasm_path);
+    let _ = std::fs::remove_file(&snap_path);
+    let _ = std::fs::remove_file(&stderr_path);
+}

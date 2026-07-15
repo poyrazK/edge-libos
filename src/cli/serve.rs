@@ -33,11 +33,11 @@
 //! the parent's OS-level fd number. We `dup` the source fd and
 //! insert the listener at the target slot. See ADR 0004 §2.
 //!
-//! Snapshot portability caveat (NOT addressed): serve trusts the wasm
-//! path matches freeze's. If the user passes a different wasm, apply
-//! will succeed but the guest will mis-execute. Future: embed a
-//! module hash in `KernelSnapshot`, bump `SNAPSHOT_FORMAT_VERSION`.
-//! Tracked as a follow-up.
+//! Snapshot portability (ADR 0005): serve refuses to apply a snapshot
+//! whose frozen-hash (embedded at freeze time) does not match the
+//! SHA-256 of the `.wasm` file the operator is now handing us.
+//! `verify_module_hash` runs BEFORE `apply_snapshot_kernel_state`
+//! so a mismatched wasm can never reach the partial-apply path.
 
 use std::path::PathBuf;
 
@@ -50,7 +50,7 @@ use crate::host::{add_to_linker, build_engine, build_store};
 use crate::kernel::Kernel;
 use crate::snapshot::{
     apply_snapshot_inherited_listeners, apply_snapshot_kernel_state, apply_snapshot_to_memory,
-    read_snapshot_file, KernelSnapshot,
+    read_snapshot_file, verify_module_hash, KernelSnapshot,
 };
 
 /// Prefix for systemd-style socket activation env vars (ADR 0004
@@ -220,6 +220,14 @@ async fn serve_loop(
         store.data_mut().attach_memory(mem);
     }
 
+    // ADR 0005: refuse a mismatched wasm BEFORE any apply step.
+    // On `[0u8; 32]` (no recorded hash — pre-existing v1 snapshot
+    // written before ADR 0005), the verify path inside
+    // `verify_module_hash` emits a `tracing::warn!` and returns Ok,
+    // so the operator gets a visible-but-not-blocking warning
+    // instead of a silent skip.
+    verify_module_hash(snap, &bytes)?;
+
     // Three-step apply (ADR 0004 §2):
     //
     // 1. attach_inherited_listeners — wraps the parent's pre-opened
@@ -319,6 +327,7 @@ mod tests {
             comm: [0u8; 16],
             futex_table: vec![],
             cpu_ns: LeU64::default(),
+            module_sha256: [0u8; 32],
         }
     }
 
@@ -471,5 +480,67 @@ mod tests {
         let env = vec![("EDGE_SERVE_FD_0".to_string(), "abc".to_string())];
         let err = parse_inherited_fds(env).unwrap_err();
         assert!(matches!(err, CliError::Args(_)), "got {err:?}");
+    }
+
+    /// P3-D3.5-followup-1 / ADR 0005: `serve_loop` must refuse a
+    /// snapshot whose frozen-hash does not match the serve-side
+    /// wasm bytes. The mismatch becomes a `CliError::Snapshot(
+    /// SnapshotError::ModuleHashMismatch { .. } )` so the operator
+    /// gets a hard failure (exit 1 via the dispatcher) BEFORE any
+    /// apply step runs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn serve_rejects_snapshot_with_wrong_wasm_hash() {
+        // 1. Synth a snapshot with a frozen hash that does NOT match
+        //    the bytes we'll hand to serve_loop. The other fields
+        //    are zero — `apply_snapshot_kernel_state` runs after the
+        //    verify call, so it must NEVER reach with a mismatched
+        //    wasm.
+        let mut snap = synth_snap_with_v4_listener(8080);
+        snap.module_sha256 = [0xAAu8; 32]; // arbitrary nonzero hash
+
+        // 2. Compile a tiny exit-fast wasm and write it to a tmpfile.
+        //    `wat::parse_str` and `std::fs::write` are the only
+        //    inputs to serve_loop's file path.
+        let wat_src = r#"
+            (module
+              (import "kernel" "syscall"
+                (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+              (memory (export "memory") 1)
+              (func (export "_start") (result i64)
+                (call $syscall
+                  (i64.const 60) (i64.const 0)
+                  (i64.const 0) (i64.const 0)
+                  (i64.const 0) (i64.const 0) (i64.const 0))))
+        "#;
+        let wasm_bytes = wat::parse_str(wat_src).expect("compile WAT");
+
+        let pid = std::process::id();
+        let dir = std::path::PathBuf::from(format!("target/ci/serve-hash-tests-{pid}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create tempdir");
+        let wasm_path = dir.join("guest.wasm");
+        std::fs::write(&wasm_path, &wasm_bytes).expect("write wasm");
+
+        // 3. serve_loop must error with Snapshot(ModuleHashMismatch)
+        //    before reaching apply_snapshot_kernel_state.
+        let err = serve_loop(&snap, wasm_path.to_str().expect("utf8"), &[])
+            .await
+            .expect_err("serve_loop must refuse mismatched wasm hash");
+        match err {
+            CliError::Snapshot(crate::snapshot::SnapshotError::ModuleHashMismatch {
+                snap_hash,
+                wasm_hash,
+            }) => {
+                assert_eq!(snap_hash, [0xAAu8; 32]);
+                // The serve-side computed hash must equal SHA-256
+                // of the WAT-compiled bytes we wrote to disk.
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(&wasm_bytes);
+                let expected_computed: [u8; 32] = hasher.finalize().into();
+                assert_eq!(wasm_hash, expected_computed);
+            }
+            other => panic!("expected Snapshot(ModuleHashMismatch), got {other:?}"),
+        }
     }
 }
