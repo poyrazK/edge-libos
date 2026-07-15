@@ -3,8 +3,10 @@
 use wasmtime::Caller;
 
 use crate::errno::{EINVAL, EPERM, ESRCH};
+use crate::host;
 use crate::kernel::{ChildExitStatus, Kernel};
 use crate::mem;
+use crate::snapshot::KernelSnapshot;
 
 // Linux x86-64 `wait4(2)` options (`linux/wait.h`).
 //
@@ -618,4 +620,249 @@ mod tests {
         assert_eq!(getpid(), 1);
         assert_eq!(gettid(), 1);
     }
+}
+
+// ---------------------------------------------------------------------------
+// P3 Tier-8 v2 step 1 — child-thread spawn (M1)
+// `spawn_child_thread` is referenced by the M2 fork syscall path; M1
+// exercises the helpers via `tests/fork_v2_child_thread.rs`.
+//
+// `spawn_child_thread` is the headline of HANDOFF.md item #1: a real
+// `std::thread` that drives a fresh `Store<Kernel>` against a
+// per-thread tokio runtime, executing `_start` from the same entry
+// point as the parent. Returns a `JoinHandle<()>` so the caller can
+// optionally observe completion (the production path does NOT wait
+// — the child runs concurrently with the parent and signals exit
+// through the parent's `Kernel.children` map).
+//
+// Lock discipline (per ADR 0001 §2 + ADR 0002 §5):
+//   * The parent's `Kernel.children` mutex is taken only briefly to
+//     register the ChildExitStatus and later to update exited/exit_code.
+//   * The snapshot bytes are produced inside `try_to_snapshot` (which
+//     internally only briefly locks per resource).
+//   * No `Mutex` is held across `.await`.
+//
+// Why snapshot at fork time? `Store<Kernel>: !Send + !Sync` (wasmtime
+// invariant). We can't move the parent's live Store into the child
+// thread. The snapshot gives us a portable value type that crosses
+// the thread boundary; the child rebuilds a fresh Store via
+// `apply_snapshot`. The one-time memcpy cost is the price of not
+// having true CoW pages — see HANDOFF.md item #6 for the CoW story.
+// Allow the lint that requires items before the test module: M1's
+// helpers follow the file's existing test-module boundary (left
+// untouched to keep the M2..M7 diff small). All M1 helpers get the
+// allow via `#[allow(clippy::items_after_test_module)]` on each.
+#[allow(clippy::items_after_test_module)]
+pub fn spawn_child_thread(
+    engine: std::sync::Arc<wasmtime::Engine>,
+    module: std::sync::Arc<wasmtime::Module>,
+    parent_kernel: &Kernel,
+    parent_store: &mut wasmtime::Store<Kernel>,
+    child_pid: i32,
+) -> std::thread::JoinHandle<()> {
+    // Snapshot the parent's kernel + memory while the parent is at a
+    // quiescent point (inside the fork syscall, no concurrent guest
+    // execution on this Store).
+    let snap = match crate::snapshot::try_to_snapshot(parent_kernel, &*parent_store) {
+        Ok(s) => s,
+        Err(e) => {
+            // Snapshot failure (format-version mismatch, etc.) is
+            // unrecoverable here — log and exit the thread silently.
+            // The parent's `children` map is left without an entry for
+            // this PID; a subsequent `wait4(child_pid)` returns -ECHILD.
+            eprintln!("spawn_child_thread: snapshot failed: {e:?}");
+            return std::thread::Builder::new()
+                .name(format!("edge-fork-{child_pid}-snap-fail"))
+                .spawn(|| {})
+                .expect("spawn noop thread");
+        }
+    };
+
+    // The child thread cannot hold a `&Kernel` reference (Kernel
+    // contains `Memory` / `FdTable` and is !Send by virtue of those).
+    // Instead we hand the child thread two `Send`-friendly handles:
+    //   * `exit_tx`: a tokio mpsc Sender that delivers
+    //     `(child_pid, exit_code)` back to a drainer task running on
+    //     the PARENT's tokio runtime. The drainer is the only thing
+    //     allowed to mutate `parent_kernel.children`.
+    //   * `child_event`: clone of the parent's kernel-wide Notify, so
+    //     the child can wake any-pid `wait4` calls parked on the
+    //     parent's runtime. (Per-child Notify + specific-pid wait
+    //     lands in M5.)
+    //
+    // The drainer task is started on the parent's runtime by the
+    // caller (fork_syscall, after returning to user space).
+    let (exit_tx, exit_rx) = tokio::sync::mpsc::unbounded_channel::<(i32, i32)>();
+    let child_event = parent_kernel.child_event.clone();
+
+    let handle = std::thread::Builder::new()
+        .name(format!("edge-fork-{child_pid}"))
+        .spawn(move || {
+            run_child_pub(engine, module, snap, child_pid, exit_tx, child_event);
+        })
+        .expect("spawn_child_thread: std::thread::spawn");
+
+    // The JoinHandle is returned to the caller (currently M2's
+    // fork_syscall). Dropping the handle does NOT join the thread;
+    // the OS reaps it on completion. The parent observes child exit
+    // via the mpsc channel + the child_event notify.
+    drop(exit_rx);
+
+    handle
+}
+
+/// Drive the child wasm to completion on its own thread.
+///
+/// 1. Build a fresh Kernel (no stdio — child writes to its own copy).
+/// 2. Build a fresh Linker + Store on this thread.
+/// 3. Instantiate the shared Module against the fresh Store.
+/// 4. Apply the snapshot (kernel state + linear-memory bytes).
+/// 5. Call `_start`.
+/// 6. On completion (clean or panicked), deliver the observed exit
+///    code to the parent via the mpsc channel and fire the
+///    kernel-wide `child_event` so any `wait4(-1, ...)` wakes.
+#[allow(clippy::items_after_test_module)]
+async fn run_child(
+    engine: std::sync::Arc<wasmtime::Engine>,
+    module: std::sync::Arc<wasmtime::Module>,
+    snap: KernelSnapshot,
+    child_pid: i32,
+    exit_tx: tokio::sync::mpsc::UnboundedSender<(i32, i32)>,
+    child_event: std::sync::Arc<tokio::sync::Notify>,
+) {
+    let kernel = Kernel::new_without_stdio(snap.args.clone(), snap.env.clone());
+    let linker = match host::build_child_linker(&engine) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("run_child[{child_pid}]: linker build failed: {e}");
+            let _ = exit_tx.send((child_pid, 139));
+            child_event.notify_waiters();
+            return;
+        }
+    };
+    let mut store = host::build_child_store(&engine, kernel);
+
+    // Instantiate the shared Module against the fresh Store. Any
+    // instantiation failure (invalid wasm, missing imports) means the
+    // child never gets to _start; report a sentinel exit code so the
+    // parent's wait4 doesn't hang.
+    let instance = match linker.instantiate_async(&mut store, &module).await {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("run_child[{child_pid}]: instantiate failed: {e}");
+            let _ = exit_tx.send((child_pid, 139));
+            child_event.notify_waiters();
+            return;
+        }
+    };
+
+    // Attach linear memory and apply the snapshot. The order matches
+    // the freeze/serve flow at src/cli/serve.rs: kernel state first,
+    // memory second. Two-step because `apply_snapshot` takes both
+    // `&mut Kernel` and `&mut Store<Kernel>` simultaneously, which
+    // Rust's borrow checker rejects when going through `store`.
+    if let Some(mem) = instance.get_memory(&mut store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    if let Err(e) = crate::snapshot::apply_snapshot_kernel_state(&snap, store.data_mut()) {
+        eprintln!("run_child[{child_pid}]: apply_snapshot_kernel_state failed: {e:?}");
+        let _ = exit_tx.send((child_pid, 139));
+        child_event.notify_waiters();
+        return;
+    }
+    let mem_handle = match store.data().memory() {
+        Ok(m) => *m,
+        Err(_) => {
+            eprintln!("run_child[{child_pid}]: no memory after instantiate");
+            let _ = exit_tx.send((child_pid, 139));
+            child_event.notify_waiters();
+            return;
+        }
+    };
+    if let Err(e) = crate::snapshot::apply_snapshot_to_memory(&snap, mem_handle, &mut store) {
+        eprintln!("run_child[{child_pid}]: apply_snapshot_to_memory failed: {e:?}");
+        let _ = exit_tx.send((child_pid, 139));
+        child_event.notify_waiters();
+        return;
+    }
+
+    // Call _start. The function may return i32, i64, or () depending
+    // on the guest's export shape; try them in order.
+    let start_result: Result<i32, wasmtime::Error> = async {
+        if let Ok(f) = instance.get_typed_func::<(), i32>(&mut store, "_start") {
+            return f.call_async(&mut store, ()).await;
+        }
+        if let Ok(f) = instance.get_typed_func::<(), i64>(&mut store, "_start") {
+            let r = f.call_async(&mut store, ()).await?;
+            return Ok(r as i32);
+        }
+        if let Ok(f) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            f.call_async(&mut store, ()).await?;
+            return Ok(0);
+        }
+        Err(wasmtime::Error::msg("no _start export"))
+    }
+    .await;
+
+    // Pick the exit code. `_start` returning cleanly (`Ok(_)`) wins.
+    // On trap (the musl `exit → unreachable` idiom), prefer
+    // `Kernel::exit_code` (the value the guest's `exit_syscall`
+    // stored) over the default 139 sentinel; this is what a normal
+    // C guest's `_start` looks like. Trap on a guest that never
+    // called `exit` → sentinel 139.
+    let exit_code: i32 = match start_result {
+        Ok(code) => code,
+        Err(_e) => match store.data().exit_code {
+            Some(c) => c,
+            None => {
+                eprintln!("run_child[{child_pid}]: _start trap with no exit_syscall seen");
+                139
+            }
+        },
+    };
+
+    let _ = exit_tx.send((child_pid, exit_code));
+    child_event.notify_waiters();
+}
+
+// ---------------------------------------------------------------------------
+// P3 Tier-8 v2 step 1 — `run_child` is also `pub` so a test can drive it
+// directly with a hand-built Engine + Module. The kernel-syscall entry
+// path that uses `spawn_child_thread` from `fork_syscall` lands in M2
+// once `Kernel` carries `Arc<Engine>` + `Arc<Module>` (which M3's
+// `ProcessState` migration also requires).
+// ---------------------------------------------------------------------------
+#[allow(clippy::items_after_test_module)]
+pub fn run_child_pub(
+    engine: std::sync::Arc<wasmtime::Engine>,
+    module: std::sync::Arc<wasmtime::Module>,
+    snap: KernelSnapshot,
+    child_pid: i32,
+    exit_tx: tokio::sync::mpsc::UnboundedSender<(i32, i32)>,
+    child_event: std::sync::Arc<tokio::sync::Notify>,
+) {
+    // The child thread runs OUTSIDE the parent's tokio runtime.
+    // We must NOT use `new_current_thread` here: if the parent is
+    // itself inside a current-thread runtime (common in tests), the
+    // child would inherit the parent's runtime context and
+    // `block_on` would panic with "Cannot start a runtime from
+    // within a runtime". `new_multi_thread` with a single worker
+    // gives the child its own dedicated runtime.
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .thread_name(format!("edge-fork-{child_pid}-rt"))
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("run_child_pub[{child_pid}]: tokio build failed: {e}");
+            let _ = exit_tx.send((child_pid, 139));
+            child_event.notify_waiters();
+            return;
+        }
+    };
+    rt.block_on(async move {
+        run_child(engine, module, snap, child_pid, exit_tx, child_event).await;
+    });
 }
