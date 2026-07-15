@@ -319,6 +319,7 @@ mod tests {
             comm: [0u8; 16],
             futex_table: vec![],
             cpu_ns: LeU64::default(),
+            module_sha256: [0u8; 32],
         }
     }
 

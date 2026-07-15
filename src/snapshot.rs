@@ -192,6 +192,20 @@ pub struct KernelSnapshot {
     /// backward-compatible (postcard is forgiving of new fields).
     /// Snapshot format version stays at `SNAPSHOT_FORMAT_VERSION = 1`.
     pub cpu_ns: LeU64,
+    /// P3-D3.5-followup-1 (ADR 0005): SHA-256 of the freeze-side
+    /// `.wasm` file bytes, embedded so `serve` can refuse to apply
+    /// a snapshot onto a mismatched wasm (silent mis-execution
+    /// otherwise — see HANDOFF.md D3.5 §1 + ADR 0002 §8).
+    ///
+    /// Appended at end-of-struct with `#[serde(default)]` mirrors
+    /// the `inherited: bool` (ADR 0004 §4) and `cpu_ns` additive
+    /// precedent, so `SNAPSHOT_FORMAT_VERSION` stays at 1.
+    /// Pre-existing v1 snapshots decode with
+    /// `module_sha256 = [0u8; 32]`, which [`verify_module_hash`]
+    /// treats as "no hash recorded → skip verification" (logged via
+    /// `tracing::warn!` so operators see it).
+    #[serde(default)]
+    pub module_sha256: [u8; 32],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -470,6 +484,15 @@ pub enum SnapshotError {
         found: u32,
         supported: u32,
     },
+    /// P3-D3.5-followup-1 (ADR 0005): the `.wasm` bytes the user passed
+    /// to `edge-cli serve` do not match the freeze host's `.wasm`.
+    /// Embedding both hashes lets the operator immediately see which
+    /// snapshot and which wasm disagree (e.g. "frozen by CI build
+    /// #431 vs local dev build").
+    ModuleHashMismatch {
+        snap_hash: [u8; 32],
+        wasm_hash: [u8; 32],
+    },
     /// An underlying `std::fs` call failed during snapshot or restore.
     IoError(std::io::Error, String),
     /// A snapshot referenced a path that no longer exists on restore.
@@ -493,6 +516,12 @@ impl std::fmt::Display for SnapshotError {
                 f,
                 "snapshot format_version={found} does not match supported {supported}"
             ),
+            SnapshotError::ModuleHashMismatch { snap_hash, wasm_hash } => write!(
+                f,
+                "snapshot module hash mismatch: snap={} wasm={}; refusing to apply",
+                hex_lower32(snap_hash),
+                hex_lower32(wasm_hash),
+            ),
             SnapshotError::IoError(e, ctx) => {
                 write!(f, "io error during snapshot ({ctx}): {e}")
             }
@@ -506,6 +535,19 @@ impl std::fmt::Display for SnapshotError {
             SnapshotError::Postcard(s) => write!(f, "postcard error: {s}"),
         }
     }
+}
+
+/// Format a 32-byte hash as 64 lowercase hex chars. No new dep — just
+/// per-byte `{b:02x}` format. Used by [`SnapshotError::Display`] for
+/// `ModuleHashMismatch` so operators can `sha256sum` their file and
+/// see exactly why the snapshot was rejected.
+fn hex_lower32(b: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for byte in b {
+        use std::fmt::Write;
+        let _ = write!(s, "{byte:02x}");
+    }
+    s
 }
 
 impl std::error::Error for SnapshotError {
@@ -664,6 +706,12 @@ fn build_kernel_snapshot(kernel: &Kernel, pages: Vec<MemoryPageSnapshot>) -> Ker
         // is appended at the end of the struct so the postcard wire
         // format stays backward-compatible with v1 readers.
         cpu_ns: LeU64(kernel.cpu_ns),
+        // P3-D3.5-followup-1 (ADR 0005): the freeze CLI sets this
+        // to the real SHA-256 of the wasm bytes after `try_to_snapshot`
+        // returns. The guest-driven `NR_SNAPSHOT` path can't supply a
+        // wasm hash and leaves this at `[0u8; 32]`; `verify_module_hash`
+        // treats that sentinel as "no hash recorded → skip verify".
+        module_sha256: [0u8; 32],
     }
 }
 
@@ -1287,6 +1335,7 @@ mod tests {
             comm: [0u8; 16],
             futex_table: vec![],
             cpu_ns: LeU64::default(),
+            module_sha256: [0u8; 32],
         };
         let bytes = postcard::to_stdvec(&snap).expect("encode");
         let back: KernelSnapshot = postcard::from_bytes(&bytes).expect("decode");
@@ -1881,6 +1930,7 @@ mod tests {
             comm: [0u8; 16],
             futex_table: vec![],
             cpu_ns: LeU64::default(),
+            module_sha256: [0u8; 32],
         }
     }
 
