@@ -273,6 +273,12 @@ pub async fn dispatch(mut caller: wasmtime::Caller<'_, Kernel>, nr: u32, a: [i64
         // to it. See ADR 0004 §1 and `sys::process::snapshot_syscall`.
         sys::process::NR_SNAPSHOT => sys::process::snapshot_syscall(&mut caller, a).await,
 
+        // P2-DNS: NR_RESOLVE — project-private getaddrinfo(3)
+        // replacement (NR 400, upstream-reserved range 387-423). See
+        // ADR 0007. Until commit 3 wires CLI env vars, the denylist /
+        // TTL / timeout come from `ResolverState::default`.
+        sys::resolver::NR_RESOLVE => sys::resolver::resolve(&mut caller, a).await,
+
         // P2-C2: memory
         sys::memory::NR_MREMAP => sys::memory::mremap(&mut caller, a),
 
@@ -435,6 +441,8 @@ pub fn syscall_name(nr: u32) -> &'static str {
         sys::futex::NR_FUTEX => "futex",
         // P2-D3.5: NR_SNAPSHOT (123) — see ADR 0004 §1.
         sys::process::NR_SNAPSHOT => "snapshot",
+        // P2-DNS: NR_RESOLVE (400) — see ADR 0007.
+        sys::resolver::NR_RESOLVE => "resolve",
 
         sys::random::NR_GETRANDOM => "getrandom",
 

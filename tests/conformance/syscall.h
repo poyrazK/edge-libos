@@ -184,6 +184,11 @@ int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
 // P2-D3.5: NR_SNAPSHOT — guest-driven quiescence. See ADR 0004 §1.
 #define NR_SNAPSHOT 123
 
+// P2-DNS: NR_RESOLVE — project-private getaddrinfo(3) replacement.
+// NR 400 sits in the upstream-reserved range 387-423, so it can never
+// collide with a future upstream syscall. See ADR 0007.
+#define NR_RESOLVE 400
+
 // sendmsg / recvmsg flags.
 #define MSG_PEEK 0x2
 #define MSG_DONTWAIT 0x40
