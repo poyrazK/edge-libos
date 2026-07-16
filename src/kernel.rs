@@ -131,12 +131,30 @@ impl ProcessState {
     /// it has ever parked). Mirrors the `reap_all_children`
     /// clone-then-drop-then-notify discipline — the `Arc<Notify>` is
     /// cloned out under the lock, the guard dropped, then
-    /// `notify_waiters()` fires outside the lock (ADR 0001 §2).
+    /// `notify_one()` fires outside the lock (ADR 0001 §2). We
+    /// use `notify_one()` instead of `notify_waiters()` because the
+    /// sender (kill/tgkill) and the target (a blocking syscall's
+    /// select! arm) often race — kill may fire before the target
+    /// has registered its `.notified()` future. `notify_one()`
+    /// stores a permit the *next* `notified()` poll consumes; that
+    /// matches the pre-armed-signal test pattern (kill, then
+    /// nanosleep).
+    ///
+    /// Lazy create: if no Notify exists for `tid` yet (i.e., the
+    /// target hasn't parked in any blocking syscall), we create
+    /// one. Without this, the very first kill before any blocking
+    /// syscall would have nothing to fire on, and the wake would
+    /// be lost. The created Notify is never garbage-collected
+    /// (small constant cost — one Arc per tid that ever had a
+    /// signal delivered) which is acceptable.
     pub fn wake_signal(&self, tid: i32) {
-        let notify = self.signal_wakes.lock().get(&tid).cloned();
-        if let Some(n) = notify {
-            n.notify_waiters();
-        }
+        let notify = self
+            .signal_wakes
+            .lock()
+            .entry(tid)
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone();
+        notify.notify_one();
     }
 }
 

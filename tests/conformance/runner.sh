@@ -149,6 +149,10 @@ expected_syscall() {
         wait4)               echo "wait4" ;;
         futex)               echo "futex" ;;
         snapshot)            echo "snapshot" ;;
+        signal_eintr)              echo "kill" ;;
+        signal_default_terminate)  echo "kill" ;;
+        signal_mask_blocks)        echo "rt_sigprocmask" ;;
+        signal_sigkill_uncatchable) echo "rt_sigaction" ;;
         *) echo "UNREGISTERED: $1" >&2; return 1 ;;
     esac
 }

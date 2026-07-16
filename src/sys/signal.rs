@@ -257,6 +257,73 @@ pub fn handle_signal_arm(kernel: &mut Kernel) -> SignalOutcome {
     }
 }
 
+/// Dispatch-entry drain (ADR 0007 §4).
+///
+/// Three behaviors, applied in order:
+///
+/// 1. **Ignore-class drop**: a SIG_IGN'd signal or a default-ignore
+///    signal (SIGCHLD/SIGCONT/SIGURG/SIGWINCH) is removed from the
+///    queue — there's no syscall-side observer that would otherwise
+///    consume it.
+/// 2. **SIGKILL/SIGSTOP bypass**: these are uncatchable and bypass
+///    the mask. We apply `apply_terminate_if_needed` here so the
+///    `exit_requested` pre-check fires on the very next syscall
+///    (even a sync one), and leave the signal in the queue so a
+///    later blocking syscall's `select!` arm also observes it
+///    (consumption is idempotent for `apply_terminate`).
+/// 3. **Everything else (default-terminate non-SIGKILL/SIGSTOP, or
+///    custom-handler Interrupt)**: leave in queue. The blocking
+///    syscall's `select!` arm consumes it and returns `-EINTR`. Sync
+///    syscalls don't observe these at this layer — they continue
+///    normally and the signal is "delayed" until the next blocking
+///    syscall. (This trade-off is deliberate: applying
+///    `exit_requested` here would prevent blocking syscalls from
+///    returning `-EINTR` — the regression that forced this split.
+///    See the C10 commit message for the failed-experiments
+///    history.)
+pub fn dispatch_signal_drain(kernel: &mut Kernel) {
+    let head = {
+        let q = kernel.process_state.signals_pending.lock();
+        q.first().copied()
+    };
+    let Some(signo) = head else {
+        return;
+    };
+
+    // Masked signals stay queued — the guest will eventually
+    // unblock them via rt_sigprocmask and we'll deliver then.
+    if is_masked(kernel.signals.mask, signo) {
+        return;
+    }
+    let handler = kernel
+        .signals
+        .actions
+        .get(&signo)
+        .map(|a| a.handler)
+        .unwrap_or(SIG_DFL);
+
+    // SIGKILL / SIGSTOP: uncatchable, bypass disposition. Apply
+    // the side effect (exit_requested/exit_code) so the next sync
+    // syscall's pre-check fires — leave in queue so the next
+    // blocking syscall also observes it.
+    if signo == SIGKILL || signo == SIGSTOP {
+        apply_terminate_if_needed(kernel, &Some(DeliveryAction::Terminate(signo)));
+        return;
+    }
+
+    // Ignore-class drop.
+    let is_ignored = handler == SIG_IGN || (handler == SIG_DFL && default_is_ignore(signo));
+    if is_ignored {
+        kernel.process_state.signals_pending.lock().remove(0);
+        return;
+    }
+
+    // Otherwise (default-terminate non-SIGKILL/SIGSTOP, custom-handler
+    // Interrupt): leave in queue for the blocking-syscall select!
+    // arm. Don't apply exit_requested here — see the doc comment
+    // above for why.
+}
+
 /// `rt_sigaction(signum, act, oldact, sigsetsize)`.
 ///
 /// `act` may be NULL to query without changing; `oldact` may be NULL to

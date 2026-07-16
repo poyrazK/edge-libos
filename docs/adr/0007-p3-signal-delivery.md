@@ -2,13 +2,20 @@
 
 ## Status
 
-Proposed 2026-07-15. Realized by the signal-delivery work on branch
+Accepted 2026-07-16. Realized by the signal-delivery work on branch
 `p3-v2-signal-delivery`. Implementation is staged across commits:
 C1 (this ADR + `deliverable()` helper + `ProcessState`/`Kernel` fields),
 C2 (kill/tgkill wake firing + dispatch pre-check), C3–C7 (per-syscall
 `select!` signal arms: epoll, poll/select, futex, bare-await, wait4),
 C8 (terminating default action wiring), C9 (`SIGUSR1` → freeze
 quiescence), C10 (docs + integration sweep).
+
+## Realization
+
+Final test totals after C10: Rust 406 / C 110 / Grand 516 (delta from
+pre-C1: +22 Rust, +4 C — the 4 new C conformance fixtures are
+`signal_eintr.c`, `signal_default_terminate.c`, `signal_mask_blocks.c`,
+`signal_sigkill_uncatchable.c`, registered in `runner.sh`).
 
 ## Context
 
@@ -102,6 +109,19 @@ syscall to `0`, so the guest's libc unwinds and the run path reports
 the code. `exit_requested` is set *only* by signal delivery — an
 explicit `exit(0)` stays `false`.
 
+The dispatch drain runs **on every syscall entry**, not just inside
+blocking-syscall `select!` arms: `handle_signal_arm(caller.data_mut())`
+is called before the `exit_requested` pre-check, so a default-terminating
+signal takes effect on the very next syscall (sync or blocking). Without
+this, `kill(self, SIGTERM)` followed by a sync syscall like `getpid`
+would queue the signal but never observe the `Terminate` action — the
+select! arms are the only path that calls `deliverable()`, and a sync
+syscall never enters one. The drain path keeps the contract simple:
+`signals_pending` is FIFO-drained on every entry; the resulting
+`SignalOutcome` is discarded at dispatch level (sync syscalls don't
+return `-EINTR`); only the side effects (`exit_code`, `exit_requested`)
+matter here.
+
 ### §5. Blocking-syscall integration
 
 Each blocking point gains a signal-wake `select!` arm calling
@@ -115,8 +135,8 @@ Covered call sites: `epoll_wait`/`epoll_pwait`, `poll`/`ppoll`/`select`,
 
 Kept orthogonal to real delivery. `ProcessState.quiesce_notify:
 Option<Arc<Notify>>` is `None` for a normal `run`; `edge-cli freeze`
-installs an `Arc<Notify>` and fires it from a
-`tokio::signal::unix::signal(SignalKind::user_defined1())` listener.
+installs an `Arc<Notify>` and fires it from a dedicated OS thread that
+listens for `SIGUSR1` via raw `libc::sigaction` + self-pipe (see §8).
 Blocking syscalls race `quiesce_notify` as an extra `select!` arm *only*
 when `Some`, and on that wake continue normally (NOT `-EINTR`) — the
 guest is left at a well-defined in-syscall quiescent point. `freeze`'s
@@ -133,6 +153,30 @@ contract (ADR 0002/0004). `signal_wakes` and `quiesce_notify` are
 runtime handles (like `child_event`) and are never serialized. No
 snapshot format-version change. Contract: **pending signals are dropped
 across freeze/serve.**
+
+### §8. SIGUSR1 listener — sigaction + self-pipe, not `tokio::signal`
+
+Initial planning called for `tokio::signal::unix::signal(SignalKind::user_defined1())`
+on a dedicated current-thread runtime spawned from `freeze`. In practice
+this fails: tokio's signal driver registers a process-global `signalfd` /
+`signal-hook` handler for SIGUSR1 keyed off the **first** runtime to call
+`sig(...)`, so when the host `edge-cli` runtime has already registered
+other signals via `enable_all()`, the listener thread's registration is
+either lost or races the host.
+
+We sidestep the driver entirely: install a raw `libc::sigaction(SIGUSR1,
+…)` handler that `write(2)`s 1 byte to a self-pipe, and have the
+listener thread drain the pipe's read end on its dedicated runtime via
+`tokio::net::unix::pipe::Receiver`. Both `sigaction` and `write` are
+async-signal-safe (POSIX.1-2017 §2.4.3), so the handler cannot deadlock
+even if it races the listener thread. `notify.notify_waiters()` then
+fires from the runtime context, not the signal context.
+
+This is the same shape as CPython's `sigchld` self-pipe, the Go runtime's
+pre-`signalfd` signal handler, and Tokio's own `tokio::signal` driver on
+platforms where `signalfd` is unavailable. The dedicated OS thread keeps
+the listener off the host runtime entirely — no `Send`/`Sync` plumbing
+into the `!Send` `Store`.
 
 ## Consequences
 
