@@ -38,6 +38,7 @@ pub const MARKER_LEN: usize = 64;
 use crate::fd::FdTable;
 use crate::mm::LinearAllocator;
 use crate::sys::futex::FutexTable;
+use crate::sys::resolver::{ResolverConfig, ResolverState};
 use crate::sys::signal::SignalState;
 use crate::vfs::Vfs;
 
@@ -111,6 +112,13 @@ pub struct ProcessState {
     /// quiescent point for the snapshot. Runtime-only; never
     /// serialized.
     pub quiesce_notify: Option<Arc<Notify>>,
+    /// P2-DNS (ADR 0007): per-process resolver state. Cache +
+    /// denylist + lazy backend are shared across all threads in the
+    /// same process via this Arc, mirroring `futex_table`. Snapshot
+    /// non-persistent: `apply_snapshot` rebuilds an empty
+    /// `ResolverState::default()` on restore; the first NR_RESOLVE
+    /// call after `serve` rebuilds the backend.
+    pub resolver: parking_lot::Mutex<ResolverState>,
 }
 
 impl ProcessState {
@@ -465,6 +473,7 @@ impl Kernel {
             tgid: 1,
             signal_wakes: parking_lot::Mutex::new(HashMap::new()),
             quiesce_notify: None,
+            resolver: parking_lot::Mutex::new(ResolverState::default()),
         });
 
         Self {
@@ -550,6 +559,39 @@ impl Kernel {
         let mut seed = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut seed);
         seed
+    }
+
+    /// P2-DNS (ADR 0007): apply the operator-supplied resolver
+    /// configuration (denylist, TTL, timeout). Called from
+    /// `src/cli/{run,serve}.rs` after parsing `EDGE_RESOLVER_*`
+    /// env vars but before the guest runs.
+    ///
+    /// Must be called pre-`fork`/`clone` — uses `Arc::get_mut` on
+    /// `process_state` to ensure the per-process resolver state
+    /// isn't already shared with another thread. Mirrors the
+    /// `Arc::get_mut` contract used elsewhere for per-Kernel
+    /// one-shot setters.
+    pub fn attach_resolver_config(&mut self, cfg: ResolverConfig) {
+        let ps = Arc::get_mut(&mut self.process_state)
+            .expect("attach_resolver_config: kernel already shared");
+        let mut state = ps.resolver.lock();
+        state.denylist = cfg.denylist;
+        state.ttl_ms = cfg.ttl_ms;
+        state.timeout_ms = cfg.timeout_ms;
+    }
+
+    /// Test-only: install a custom resolver backend (e.g.
+    /// `StubResolver`). Used by `tests/resolve_conformance.rs` to
+    /// exercise the resolve() handler without depending on real DNS
+    /// or `TokioResolver`. Same pre-fork precondition as
+    /// `attach_resolver_config`.
+    pub fn attach_resolver_backend(
+        &mut self,
+        backend: Arc<dyn crate::sys::resolver::ResolverBackend>,
+    ) {
+        let ps = Arc::get_mut(&mut self.process_state)
+            .expect("attach_resolver_backend: kernel already shared");
+        ps.resolver.lock().backend = Some(backend);
     }
 
     /// Attach the linear memory. Called from instantiation setup for

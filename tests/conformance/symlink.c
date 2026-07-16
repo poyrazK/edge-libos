@@ -9,6 +9,14 @@ void _start(void) {
     for (int i = 0; tgt[i]; i++) buf[i] = tgt[i]; buf[8] = 0;
     for (int i = 0; lnk[i]; i++) buf[64 + i] = lnk[i]; buf[64 + 8] = 0;
 
+    // Pre-clear any leftover from a prior run that didn't reach its
+    // unlink cleanup. We can't know whether sym_link already exists
+    // without an access() call, so just attempt the unlink — it
+    // returns -ENOENT if absent, which we ignore here. If the unlink
+    // itself fails for a different reason, only the symlink() call
+    // below will surface that as a mark_fail.
+    (void)sc1(NR_UNLINK, (int64_t)(intptr_t)(buf + 64));
+
     int64_t s = sc2(NR_SYMLINK, (int64_t)(intptr_t)buf, (int64_t)(intptr_t)(buf + 64));
     if (s != 0) { mark_fail("symlink failed"); return; }
 

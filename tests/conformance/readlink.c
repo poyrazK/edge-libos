@@ -15,6 +15,11 @@ void _start(void) {
     // Output buffer: 64 bytes at offset 128.
     char *out = buf + 128;
 
+    // Self-cleanup: drop any leftover symlink from a prior run that
+    // didn't reach its unlink. NOOP if absent.
+    (void)sc1(NR_UNLINK, (int64_t)(intptr_t)(buf + 64));
+    (void)sc1(NR_UNLINK, (int64_t)(intptr_t)buf);
+
     // Create the symlink.
     int64_t s = sc2(NR_SYMLINK, (int64_t)(intptr_t)buf, (int64_t)(intptr_t)(buf + 64));
     if (s != 0) { mark_fail("symlink failed"); return; }

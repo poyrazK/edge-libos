@@ -230,7 +230,7 @@ async fn run_guest(
     Ok((entries, marker))
 }
 
-/// Read the pass/fail marker that C conformance tests write at
+/// Read the pass/fail/skip marker that C conformance tests write at
 /// `MARKER_ADDR` (offset 4096) before the final `_start` return.
 ///
 /// Returns the marker text. Empty string means "no marker written".
@@ -241,6 +241,7 @@ async fn run_guest(
 /// NOT walk the buffer until the first NUL; we read the literal prefix:
 ///   - bytes 0..4 == b"PASS"         → "PASS"
 ///   - bytes 0..5 == b"FAIL:"        → "FAIL:\<reason up to first NUL>"
+///   - bytes 0..5 == b"SKIP:"        → "SKIP:\<reason up to first NUL>"
 ///   - anything else                 → "" (no marker)
 fn read_marker(store: &Store<Kernel>) -> String {
     let mem = match store.data().memory() {
@@ -262,6 +263,15 @@ fn read_marker(store: &Store<Kernel>) -> String {
             .unwrap_or(buf.len());
         let reason_bytes = &buf[5..end];
         return format!("FAIL:{}", String::from_utf8_lossy(reason_bytes));
+    }
+    if &buf[0..5] == b"SKIP:" {
+        let end = buf[5..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|p| p + 5)
+            .unwrap_or(buf.len());
+        let reason_bytes = &buf[5..end];
+        return format!("SKIP:{}", String::from_utf8_lossy(reason_bytes));
     }
     String::new()
 }
@@ -301,5 +311,91 @@ mod tests {
             &positional[1..]
         };
         assert_eq!(split, &["a".to_string(), "b".to_string()]);
+    }
+
+    /// P3-P1 hardening: the C conformance marker protocol now has
+    /// three prefixes — `PASS`, `FAIL:<reason>`, and the new
+    /// `SKIP:<reason>` added in this PR. read_marker must handle
+    /// each prefix without dropping bytes (PASS) and without
+    /// truncating the reason at the wrong offset (FAIL/SKIP).
+    ///
+    /// We construct a real `Store<Kernel>` via the same shape as
+    /// the integration tests under `tests/`: a tiny WAT fixture
+    /// with `(memory (export "memory") 1)` and the kernel.syscall
+    /// import. We then attach the memory, write each prefix at
+    /// `MARKER_ADDR`, and assert the bridge returns the literal
+    /// expected string.
+    #[test]
+    fn read_marker_handles_pass_fail_skip() {
+        use crate::build_engine;
+        use crate::build_store;
+        use wasmtime::{Linker, Module};
+
+        const MARKER_WAT: &str = r#"
+            (module
+              (import "kernel" "syscall"
+                (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+              (memory (export "memory") 1))
+        "#;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let engine = build_engine().expect("engine");
+            let module = Module::new(&engine, MARKER_WAT).expect("module compiles");
+            let mut linker = Linker::new(&engine);
+            crate::add_to_linker(&mut linker).expect("linker register");
+
+            let mut store = build_store(&engine, Kernel::new(vec![], vec![]));
+            let instance = linker
+                .instantiate_async(&mut store, &module)
+                .await
+                .expect("instantiate");
+            let mem = instance
+                .get_memory(&mut store, "memory")
+                .expect("memory export");
+            store.data_mut().attach_memory(mem);
+
+            // PASS — 4-byte literal, no reason suffix.
+            mem.write(&mut store, MARKER_ADDR, b"PASS\0")
+                .expect("write PASS");
+            assert_eq!(
+                read_marker(&store),
+                "PASS",
+                "PASS prefix should round-trip unchanged"
+            );
+
+            // FAIL:<reason> — 5-byte prefix + reason up to NUL.
+            mem.write(&mut store, MARKER_ADDR, b"FAIL:bad\0")
+                .expect("write FAIL");
+            assert_eq!(
+                read_marker(&store),
+                "FAIL:bad",
+                "FAIL prefix must carry the reason"
+            );
+
+            // SKIP:<reason> — newly added in this PR; pin the
+            // third-prefix code path so a future refactor of
+            // read_marker cannot silently drop it.
+            mem.write(&mut store, MARKER_ADDR, b"SKIP:env\0")
+                .expect("write SKIP");
+            assert_eq!(
+                read_marker(&store),
+                "SKIP:env",
+                "SKIP prefix must carry the reason"
+            );
+
+            // Garbage in the prefix should return "" (no marker).
+            mem.write(&mut store, MARKER_ADDR, b"GARB\0")
+                .expect("write GARB");
+            assert_eq!(
+                read_marker(&store),
+                "",
+                "unrecognized prefix must return empty (no marker)"
+            );
+        });
     }
 }

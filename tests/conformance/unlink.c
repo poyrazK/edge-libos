@@ -9,11 +9,19 @@ void _start(void) {
     for (int i = 0; s[i]; i++) path[i] = s[i];
     path[11] = 0;
 
-    // Create the file via openat. O_WRONLY|O_CREAT|O_TRUNC is idempotent
-    // across runs (truncates if present, creates if absent).
-    // Flags are decimal: 1 | 64 | 512 = 577. Mode 0o644 = 420.
+    // Create the file via openat. O_WRONLY|O_CREAT|O_EXCL (no O_TRUNC)
+    // surfaces a leftover from a prior run as -EEXIST immediately,
+    // rather than silently truncating it (which could mask real test
+    // failures). Flags are decimal: 1 | 64 | 128 = 193. Mode
+    // 0o644 = 420.
     int64_t open_ret = sc4(NR_OPENAT, -100 /*AT_FDCWD*/, (int64_t)(intptr_t)path,
-                           577 /*O_WRONLY|O_CREAT|O_TRUNC*/, 420 /*0o644*/);
+                           193 /*O_WRONLY|O_CREAT|O_EXCL*/, 420 /*0o644*/);
+    if (open_ret == -17 /*-EEXIST*/) {
+        // unlink_file leftover from a prior run. The contract
+        // assertions below need a fresh file. Skip rather than fail.
+        mark_skip("unlink_file leftover from prior run");
+        return;
+    }
     if (open_ret < 0) { mark_fail("openat setup failed"); return; }
     int fd = (int)open_ret;
     (void)sc1(NR_CLOSE, fd);

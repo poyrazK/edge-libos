@@ -19,6 +19,8 @@ pub mod path;
 pub mod poll;
 pub mod process;
 pub mod random;
+pub mod resolver;
 pub mod signal;
 pub mod socket;
 pub mod time;
+pub mod udp;

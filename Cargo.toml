@@ -34,6 +34,19 @@ postcard             = { version = "1", features = ["alloc"] }
 # a mismatched wasm before any apply_snapshot_* call. 0.10 line; sync
 # API (Sha256::new / update / finalize); no features needed.
 sha2                 = "0.10"
+# P2-DNS: project-private NR_RESOLVE (NR 400) — ADR 0007.
+# `TokioResolver` wraps a tokio-backed UDP/TCP socket pool that
+# resolves DNS against the host's /etc/resolv.conf. Default-features
+# off keeps the dep graph lean (no DNS-over-TLS / DNS-over-HTTPS by
+# default — both can be added in a follow-up if operators want them).
+# `system-config` reads /etc/resolv.conf on Unix; `tokio` is the
+# runtime integration. (The `resolver` feature from older versions
+# was renamed/inlined; v0.25 builds the resolver by default.)
+hickory-resolver      = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
+# P3-T9 (ADR 0008): pre-bind setsockopt on UDP sockets (SO_REUSEADDR,
+# IPV6_V6ONLY). Already transitive (used by hickory), declared direct
+# so src/sys/udp.rs can import `socket2::Socket` directly.
+socket2               = "0.6"
 
 [dev-dependencies]
 wat        = "1"

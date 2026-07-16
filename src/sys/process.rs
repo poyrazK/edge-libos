@@ -90,11 +90,19 @@ pub const NR_FORK: u32 = 57;
 pub const NR_WAIT4: u32 = 61;
 
 // P2-D3.5: NR_SNAPSHOT — guest-driven quiescence for the
-// freeze/snapshot path. See ADR 0004 §1. The number (123) is
-// a reserved range in the Linux x86-64 NR space (post-
-// 4-bit-namespace collapse; some older kernels report
-// numbers in this range as `sys_set_tid_address` etc. but
-// 123 is currently unused on a stock x86-64 5.x+ kernel).
+// freeze/snapshot path. See ADR 0004 §1.
+//
+// Why 123 is project-private: the upstream
+// `arch/x86/entry/syscalls/syscall_64.tbl` lists NR 123 as
+// `setfsuid` (an NR we don't implement, and a kernel that
+// ever does will need to go through a deprecation cycle).
+// The project-private contract is "an NR adjacent to
+// upstream that we own and the host kernel won't fill in
+// by accident" — NOT "an upstream-unused NR." NR 400
+// (NR_RESOLVE, P2-DNS) sits inside the explicit
+// upstream-reserved range 387–423 for the same reason;
+// both are documented in ADR 0007.
+//
 // v1 is a synchronous guest→host call: the kernel encodes
 // the live `KernelSnapshot`, writes the bytes to the
 // guest-provided path, and returns the byte count.

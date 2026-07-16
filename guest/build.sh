@@ -99,6 +99,21 @@ for src in musl_syscall.c main.c; do
     ENTRY_OBJS+=("$obj")
 done
 
+# 4b. P2-DNS: compile the getaddrinfo/freeaddrinfo musl overrides
+# (ADR 0007). These objects appear in ENTRY_OBJS so they precede
+# libpython + musl on the link line — wasm-ld resolves duplicate
+# symbols by first-definition-wins, so our getaddrinfo shadows the
+# libc one for any caller that pulls it in via CPython's socket
+# module or httpx's resolver path.
+GUEST_RESOLVER="$GUEST/resolver"
+for src in getaddrinfo.c freeaddrinfo.c; do
+    obj="$ROOT/target/build-resolver-${src%.c}.o"
+    "$ZIG" cc -target wasm32-freestanding -O2 -c \
+        -I"$GUEST_RESOLVER" \
+        "$GUEST_RESOLVER/$src" -o "$obj"
+    ENTRY_OBJS+=("$obj")
+done
+
 # 5. Link.
 mkdir -p "$(dirname "$OUT")"
 "$ZIG" cc -target wasm32-freestanding -O2 \

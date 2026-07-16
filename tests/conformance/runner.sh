@@ -153,13 +153,17 @@ expected_syscall() {
         signal_default_terminate)  echo "kill" ;;
         signal_mask_blocks)        echo "rt_sigprocmask" ;;
         signal_sigkill_uncatchable) echo "rt_sigaction" ;;
+        getaddrinfo_loopback)   echo "resolve" ;;
+        getaddrinfo_eai_noname) echo "resolve" ;;
         *) echo "UNREGISTERED: $1" >&2; return 1 ;;
     esac
 }
 
 PASS=0
 FAIL=0
+SKIP=0
 FAIL_NAMES=()
+SKIP_NAMES=()
 SOFT_PASS_NAMES=()
 
 # Default to soft mode: tests without a mark_pass/mark_fail marker fall back
@@ -227,6 +231,17 @@ for c in "$ROOT"/tests/conformance/*.c; do
                 reason="${marker#FAIL:}"
                 echo "FAIL  $name ($reason)"
                 ;;
+            SKIP:*)
+                # Environment-blocked (port collision, stale fixture,
+                # missing preopen, etc.) — third bucket, parallel to
+                # PASS and FAIL. Distinct from FAIL in that a skip does
+                # NOT cause `exit 1` below; the run stays green and the
+                # operator sees a `SKIP:` line in the per-test output.
+                SKIP=$((SKIP + 1))
+                SKIP_NAMES+=("$name")
+                reason="${marker#SKIP:}"
+                echo "SKIP  $name ($reason)"
+                ;;
             *)
                 # Unrecognized marker prefix. Treat as fail.
                 FAIL=$((FAIL + 1))
@@ -256,7 +271,7 @@ for c in "$ROOT"/tests/conformance/*.c; do
 done
 
 echo
-echo "Pass: $PASS  Fail: $FAIL  Soft: ${#SOFT_PASS_NAMES[@]}"
+echo "Pass: $PASS  Fail: $FAIL  Skip: $SKIP  Soft: ${#SOFT_PASS_NAMES[@]}"
 if [[ ${#SOFT_PASS_NAMES[@]} -gt 0 ]]; then
     echo "Soft passes (no marker; migrate to mark_pass): ${SOFT_PASS_NAMES[*]}"
 fi

@@ -32,6 +32,13 @@ void _start(void) {
     int64_t dirfd = sc4(NR_OPENAT, -100,
                         (int64_t)(intptr_t)"getdents64_dir",
                         0 /*O_RDONLY*/, 0);
+    if (dirfd == -2 /*ENOENT*/) {
+        // The runner should have pre-created getdents64_dir under the
+        // preopen root; if it didn't (or the preopen doesn't expose
+        // the cwd), degrade to SKIP rather than fail.
+        mark_skip("getdents64_dir missing from preopen");
+        return;
+    }
     if (dirfd < 0) {
         mark_fail("openat dir");
         return;

@@ -113,7 +113,14 @@ async fn drive_guest(wasm_path: &str, budget_ms: u64, _script_args: &[String]) -
     // Set up stdio. Default to buffered pipes so we can drain them at the
     // end. Real Wasi-style stdio (TtyFile) is out of scope for P0; tests
     // inspect the buffers directly.
-    let kernel = Kernel::new(vec![], vec![]);
+    let mut kernel = Kernel::new(vec![], vec![]);
+
+    // P2-DNS: attach operator-supplied resolver config (denylist /
+    // TTL / timeout) from EDGE_RESOLVER_* env vars. See ADR 0007.
+    // No-op if no vars are set — defaults from `ResolverState::default`.
+    let resolver_cfg =
+        crate::sys::resolver::ResolverConfig::from_env(&std::env::vars().collect::<Vec<_>>());
+    kernel.attach_resolver_config(resolver_cfg);
 
     let mut store = build_store(&engine, kernel);
     // ADR 0004 §2: per-instance fuel budget. The default (u64::MAX)

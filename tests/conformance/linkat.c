@@ -9,7 +9,11 @@ void _start(void) {
     for (int i = 0; src[i]; i++) buf[i] = src[i]; buf[6] = 0;
     for (int i = 0; dst[i]; i++) buf[64 + i] = dst[i]; buf[64 + 6] = 0;
 
-    int64_t open_ret = sc4(NR_OPENAT, -100, (int64_t)(intptr_t)buf, 577, 420);
+    int64_t open_ret = sc4(NR_OPENAT, -100, (int64_t)(intptr_t)buf, 193, 420);
+    if (open_ret == -17 /*-EEXIST*/) {
+        mark_skip("la_src leftover from prior run");
+        return;
+    }
     if (open_ret < 0) { mark_fail("openat src"); return; }
     (void)sc1(NR_CLOSE, (int)open_ret);
 

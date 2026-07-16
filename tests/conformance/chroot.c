@@ -11,9 +11,15 @@ void _start(void) {
     const char *s = "chroot_sub_xx";
     for (int i = 0; s[i]; i++) buf[i] = s[i]; buf[13] = 0;
 
-    // mkdir; tolerate -EEXIST (cleanup from prior run).
+    // mkdir; -EEXIST means a leftover from a prior run that the
+    // cleanup in this kernel can't reach (chroot is permanent). Skip
+    // rather than silently tolerate.
     int64_t m = sc2(NR_MKDIR, (int64_t)(intptr_t)buf, 0755);
-    if (m != 0 && m != -17) { mark_fail("mkdir"); return; }
+    if (m == -17 /*-EEXIST*/) {
+        mark_skip("chroot_sub_xx leftover from prior run");
+        return;
+    }
+    if (m != 0) { mark_fail("mkdir"); return; }
 
     int64_t c = sc1(NR_CHROOT, (int64_t)(intptr_t)buf);
     if (c != 0) { mark_fail("chroot failed"); return; }

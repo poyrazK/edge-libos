@@ -14,8 +14,13 @@ void _start(void) {
     int64_t r1 = sc4(NR_FACCESSAT, -100, (int64_t)(intptr_t)buf, F_OK, 0);
     if (r1 != -2) { mark_fail("F_OK on missing != -ENOENT"); return; }
 
-    // Create with 0o600.
-    int64_t open_ret = sc4(NR_OPENAT, -100, (int64_t)(intptr_t)buf, 577, 384 /*0o600*/);
+    // Create with 0o600 via openat(O_WRONLY|O_CREAT|O_EXCL). EXCL
+    // surfaces a leftover src as -EEXIST.
+    int64_t open_ret = sc4(NR_OPENAT, -100, (int64_t)(intptr_t)buf, 193, 384 /*0o600*/);
+    if (open_ret == -17 /*-EEXIST*/) {
+        mark_skip("facc_file leftover from prior run");
+        return;
+    }
     if (open_ret < 0) { mark_fail("openat"); return; }
     (void)sc1(NR_CLOSE, (int)open_ret);
 

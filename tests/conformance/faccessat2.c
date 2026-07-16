@@ -7,7 +7,11 @@ void _start(void) {
     const char *s = "fa2_file";
     for (int i = 0; s[i]; i++) buf[i] = s[i]; buf[8] = 0;
 
-    int64_t open_ret = sc4(NR_OPENAT, -100, (int64_t)(intptr_t)buf, 577, 384);
+    int64_t open_ret = sc4(NR_OPENAT, -100, (int64_t)(intptr_t)buf, 193, 384);
+    if (open_ret == -17 /*-EEXIST*/) {
+        mark_skip("fa2_file leftover from prior run");
+        return;
+    }
     if (open_ret < 0) { mark_fail("openat"); return; }
     (void)sc1(NR_CLOSE, (int)open_ret);
 

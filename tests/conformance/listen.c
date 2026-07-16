@@ -17,6 +17,13 @@ void _start(void) {
     for (int i = 8; i < 16; i++) p[i] = 0;
 
     int64_t rc = sc3(NR_BIND, fd, (int64_t)(intptr_t)4100, 16);
+    if (rc == -98 /*EADDRINUSE*/) {
+        // Same env-class as bind.c — port 8080 collision. SKIP here
+        // too so the listen contract assertion is only reached when
+        // bind actually succeeded (i.e. on a host where 8080 was free).
+        mark_skip("port 8080 in use");
+        return;
+    }
     if (rc != 0) {
         mark_fail("bind returned non-zero");
         return;

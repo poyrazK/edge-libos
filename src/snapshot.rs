@@ -507,6 +507,11 @@ pub enum SnapshotError {
     /// Unknown resource variant encountered during decode.
     UnknownResource,
     Postcard(String),
+    /// Operator supplied a malformed snapshot — e.g. empty `pages`
+    /// vector when one was structurally required. Spec §8 forbids
+    /// panicking on host input; surface it as a typed error so
+    /// `edge-cli serve` exits with a clean message.
+    Invalid(&'static str),
 }
 
 impl std::fmt::Display for SnapshotError {
@@ -536,6 +541,7 @@ impl std::fmt::Display for SnapshotError {
             SnapshotError::AbstractUnixNamespace => write!(f, "abstract unix namespace"),
             SnapshotError::UnknownResource => write!(f, "unknown resource variant"),
             SnapshotError::Postcard(s) => write!(f, "postcard error: {s}"),
+            SnapshotError::Invalid(s) => write!(f, "invalid snapshot: {s}"),
         }
     }
 }
@@ -1241,13 +1247,15 @@ pub fn apply_snapshot_to_shared_memory(
     mem: &wasmtime::SharedMemory,
 ) -> Result<(), SnapshotError> {
     // Grow the shared memory to fit the snapshot's largest page.
-    let target_pages = snap
-        .pages
-        .iter()
-        .map(|p| p.page_index.0 as usize)
-        .max()
-        .unwrap()
-        + 1;
+    let target_pages = {
+        let max_idx = snap
+            .pages
+            .iter()
+            .map(|p| p.page_index.0 as usize)
+            .max()
+            .ok_or(SnapshotError::Invalid("empty pages in snapshot"))?;
+        max_idx + 1
+    };
     let cur_pages: usize = mem.data_size() / PAGE_SIZE_BYTES;
     if target_pages > cur_pages {
         let delta: u64 = (target_pages - cur_pages) as u64;
@@ -1297,13 +1305,19 @@ pub fn apply_snapshot_to_memory(
         return Ok(());
     }
     // How many wasm pages does this snapshot need?
-    let target_pages = snap
-        .pages
-        .iter()
-        .map(|p| p.page_index.0 as usize)
-        .max()
-        .unwrap()
-        + 1;
+    // `is_empty()` is checked above, so `max()` cannot return None — but
+    // we use `ok_or_else` defensively so a future refactor that removes
+    // or reorders the early return cannot regress this into a host panic
+    // (spec §8).
+    let target_pages = {
+        let max_idx = snap
+            .pages
+            .iter()
+            .map(|p| p.page_index.0 as usize)
+            .max()
+            .ok_or(SnapshotError::Invalid("empty pages in snapshot"))?;
+        max_idx + 1
+    };
     let cur_pages: usize = mem.data_size(store.as_context()) / PAGE_SIZE_BYTES;
     if target_pages > cur_pages {
         let delta: u64 = (target_pages - cur_pages) as u64;
@@ -2133,5 +2147,178 @@ mod tests {
             sock.is_acceptor,
             "is_acceptor must round-trip through snapshot"
         );
+    }
+
+    /// P3-P1 hardening (Commit 5 sibling #1): the drift fix must rewrite
+    /// `bound.port` only when it's currently zero. If a caller has
+    /// already populated `bound.port` to a non-zero value (e.g. after
+    /// an explicit guest bind to a known port), the drift fix MUST
+    /// NOT overwrite it with the materialized listener's port. Pins the
+    /// `*port == 0` check at `src/snapshot.rs:635-659` so a future
+    /// refactor that drops the `0` guard can't silently mismap a
+    /// rewrite onto a real port.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ephemeral_port_drift_fix_preserves_nonzero_port() {
+        use crate::fd::{Resource, SocketInner, SocketKind};
+        use parking_lot::Mutex;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind 127.0.0.1:0");
+        let actual_port = listener
+            .local_addr()
+            .expect("listener has local_addr")
+            .port();
+
+        // Pre-populate bound.port to a non-zero value distinct from
+        // actual_port so we can detect an incorrect rewrite.
+        const KNOWN_PORT: u16 = 9999;
+        assert_ne!(KNOWN_PORT, actual_port, "test setup invariant");
+
+        let mut inner = SocketInner::new(SocketKind::Stream, false);
+        inner.bound = Some(crate::fd::SockAddr::V4 {
+            port: KNOWN_PORT,
+            addr: [127, 0, 0, 1],
+        });
+        inner.listen_backlog = Some(0);
+        inner.listener = Some(listener);
+        inner.is_acceptor = true;
+
+        let mut kernel = Kernel::new_without_stdio(vec![], vec![]);
+        let fd = kernel
+            .fds
+            .insert(Resource::Socket(Arc::new(Mutex::new(inner))));
+        let snap = build_kernel_snapshot(&kernel, vec![]);
+
+        let entry = snap
+            .fds
+            .entries
+            .iter()
+            .find(|e| e.fd.0 == fd)
+            .expect("snapshot has no entry for our fd");
+        let sock = entry
+            .kind
+            .body
+            .socket
+            .as_ref()
+            .expect("entry body.socket is None");
+        match &sock.bound {
+            Some(crate::fd::SockAddr::V4 { port, .. }) => {
+                assert_eq!(
+                    *port, KNOWN_PORT,
+                    "drift fix MUST NOT rewrite a non-zero bound.port; \
+                     expected {KNOWN_PORT}, got {port} (actual listener port was {actual_port})"
+                );
+            }
+            other => panic!("expected V4 bound at {KNOWN_PORT}, got {other:?}"),
+        }
+    }
+
+    /// P3-P1 hardening (Commit 5 sibling #2): the drift fix must
+    /// require a materialized listener. If the listener was taken
+    /// out by `accept4`'s Phase 1b (or any other path), the snapshot
+    /// must retain `bound.port == 0` — the kernel lets later `read()`
+    /// calls discover the no-listener state on its own. The drift-fix
+    /// branch only fires on `guard.listener.is_some()`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ephemeral_port_drift_fix_no_rewrite_when_listener_is_none() {
+        use crate::fd::{Resource, SocketInner, SocketKind};
+        use parking_lot::Mutex;
+
+        let mut inner = SocketInner::new(SocketKind::Stream, false);
+        inner.bound = Some(crate::fd::SockAddr::V4 {
+            port: 0,
+            addr: [127, 0, 0, 1],
+        });
+        inner.listen_backlog = Some(0);
+        inner.listener = None; // <-- the condition the fix relies on
+        inner.is_acceptor = true;
+
+        let mut kernel = Kernel::new_without_stdio(vec![], vec![]);
+        let fd = kernel
+            .fds
+            .insert(Resource::Socket(Arc::new(Mutex::new(inner))));
+        let snap = build_kernel_snapshot(&kernel, vec![]);
+
+        let entry = snap
+            .fds
+            .entries
+            .iter()
+            .find(|e| e.fd.0 == fd)
+            .expect("snapshot has no entry for our fd");
+        let sock = entry
+            .kind
+            .body
+            .socket
+            .as_ref()
+            .expect("entry body.socket is None");
+        match &sock.bound {
+            Some(crate::fd::SockAddr::V4 { port, .. }) => {
+                assert_eq!(
+                    *port, 0,
+                    "drift fix MUST NOT rewrite bound.port when listener is None; \
+                     expected 0, got {port}"
+                );
+            }
+            other => panic!("expected V4 bound with port=0, got {other:?}"),
+        }
+    }
+
+    /// P3-P1 hardening (Commit 5 sibling #3): the drift fix is gated
+    /// on `SockAddr::V4`. AF_UNIX sockets carry no port and must NOT
+    /// be touched by the rewrite branch. AF_INET6 sockets similarly
+    /// carry their port in the V6 sockaddr; the docstring at the fix
+    /// says V4-only on purpose. This sibling pins that boundary
+    /// against any future widening.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ephemeral_port_drift_fix_no_rewrite_for_unix_socket() {
+        use crate::fd::{Resource, SockAddr, SocketInner, SocketKind};
+        use parking_lot::Mutex;
+
+        // Use a synthetic bound address; the listener field stays
+        // None because we are not exercising the listener-bake path.
+        // The drift fix's `guard.listener` + V4 match combined will
+        // not fire here — both conditions fail.
+        let mut inner = SocketInner::new(SocketKind::Stream, false);
+        inner.bound = Some(SockAddr::Unix {
+            path: "/tmp/drift_fix_probe".into(),
+        });
+        inner.listen_backlog = None;
+        inner.listener = None;
+        inner.is_acceptor = true;
+
+        let mut kernel = Kernel::new_without_stdio(vec![], vec![]);
+        let fd = kernel
+            .fds
+            .insert(Resource::Socket(Arc::new(Mutex::new(inner))));
+        let snap = build_kernel_snapshot(&kernel, vec![]);
+
+        let entry = snap
+            .fds
+            .entries
+            .iter()
+            .find(|e| e.fd.0 == fd)
+            .expect("snapshot has no entry for our fd");
+        let sock = entry
+            .kind
+            .body
+            .socket
+            .as_ref()
+            .expect("entry body.socket is None");
+        // The bound field must round-trip unchanged. The drift-fix
+        // branch is `match SockAddr::V4 { port, addr }` — Unix is a
+        // non-matching arm, so the Unix variant passes through
+        // whatever the kernel set.
+        match &sock.bound {
+            Some(SockAddr::Unix { path }) => {
+                assert_eq!(
+                    path.to_str(),
+                    Some("/tmp/drift_fix_probe"),
+                    "drift fix MUST NOT touch AF_UNIX sockets"
+                );
+            }
+            other => panic!("expected Unix bound unchanged, got {other:?}"),
+        }
     }
 }

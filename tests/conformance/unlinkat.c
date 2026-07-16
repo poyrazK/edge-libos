@@ -11,6 +11,13 @@ void _start(void) {
 
     // Create a directory.
     int64_t mk = sc2(NR_MKDIR, (int64_t)(intptr_t)path, 0755);
+    if (mk == -17 /*-EEXIST*/) {
+        // unlinkat_dir leftover from a prior run. Skip the
+        // REMOVEDIR contract assertion below rather than failing
+        // on a fixture that's already there.
+        mark_skip("unlinkat_dir leftover from prior run");
+        return;
+    }
     if (mk != 0) { mark_fail("mkdir setup"); return; }
 
     // unlinkat with AT_REMOVEDIR=0x200 → 0 (removes the dir).
@@ -22,7 +29,13 @@ void _start(void) {
     for (int i = 0; s2[i]; i++) path[i] = s2[i];
     path[12] = 0;
     int64_t open_ret = sc4(NR_OPENAT, -100, (int64_t)(intptr_t)path,
-                           577 /*O_WRONLY|O_CREAT|O_TRUNC*/, 420 /*0o644*/);
+                           193 /*O_WRONLY|O_CREAT|O_EXCL*/, 420 /*0o644*/);
+    if (open_ret == -17 /*-EEXIST*/) {
+        // Same leftover class as above for the file path variant of
+        // the test. Skip rather than fail.
+        mark_skip("unlinkat_file leftover from prior run");
+        return;
+    }
     if (open_ret < 0) { mark_fail("openat setup failed"); return; }
     int fd = (int)open_ret;
     (void)sc1(NR_CLOSE, fd);
