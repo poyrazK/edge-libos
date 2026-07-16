@@ -261,6 +261,41 @@ impl UdpSocketState {
     pub fn local_addr(&self) -> Option<SocketAddr> {
         *self.bound_addr.lock()
     }
+
+    // ----- C2: send / recv -----
+
+    /// Clone the host `Arc<UdpSocket>` so the caller can `.await`
+    /// outside any parking_lot guard. Returns `None` if no host socket
+    /// has been bound yet (the caller should run `ensure_bound` first).
+    pub fn clone_socket(&self) -> Option<Arc<UdpSocket>> {
+        self.socket.lock().as_ref().cloned()
+    }
+
+    /// True if `shutdown_flags` has bit 1 (SHUT_WR) set — sends must
+    /// fail with EPIPE. v1 doesn't fully model shutdown for UDP, but
+    /// `shutdown(WR)` on a UDP socket does return -ENOTCONN on send
+    /// in Linux; we match by checking the flag.
+    pub fn is_write_shut(&self) -> bool {
+        *self.shutdown_flags.lock() & 0b10 != 0
+    }
+
+    /// True if `shutdown_flags` has bit 0 (SHUT_RD) set — recvs must
+    /// fail. Linux returns EOF (0 bytes read) once SHUT_RD is set;
+    /// we use a future EINVAL-or-similar surfacing in C4.
+    pub fn is_read_shut(&self) -> bool {
+        *self.shutdown_flags.lock() & 0b01 != 0
+    }
+
+    /// Set the peer address for connected UDP. Future `send` (without
+    /// an explicit destination) goes to this peer.
+    pub fn set_peer(&self, peer: SocketAddr) {
+        *self.peer_addr.lock() = Some(peer);
+    }
+
+    /// Read the current peer address. `None` for connectionless UDP.
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        *self.peer_addr.lock()
+    }
 }
 
 impl Drop for UdpSocketState {

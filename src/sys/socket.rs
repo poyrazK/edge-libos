@@ -1074,6 +1074,21 @@ pub async fn sendto(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         return sendto_unix(caller, fd, buf_ptr, buf_len_raw).await;
     }
 
+    // P3-T9 (ADR 0008): UDP branch — read kind, route to the UDP send
+    // path before the TCP write. The existing TCP path below uses
+    // gs.stream.take() which doesn't apply to UDP.
+    let kind = {
+        let fds = &caller.data().fds;
+        match fds.get(fd) {
+            Ok(Resource::Socket(s)) => s.lock().kind,
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    };
+    if kind == SocketKind::Datagram {
+        return sendto_udp(caller, fd, buf_ptr, buf_len_raw, a[4], a[5]).await;
+    }
+
     let len = match usize::try_from(buf_len_raw) {
         Ok(n) => n,
         Err(_) => return -EFAULT,
@@ -1173,6 +1188,20 @@ pub async fn recvfrom(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         return recvfrom_unix(caller, fd, buf_ptr, buf_len_raw).await;
     }
     let _ = (addr_ptr, addrlen_ptr); // unused on the unix branch
+
+    // P3-T9 (ADR 0008): UDP dispatch — branches to recvfrom_udp before
+    // the TCP path (which uses gs.stream.take()).
+    let kind = {
+        let fds = &caller.data().fds;
+        match fds.get(fd) {
+            Ok(Resource::Socket(s)) => s.lock().kind,
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    };
+    if kind == SocketKind::Datagram {
+        return recvfrom_udp(caller, fd, buf_ptr, buf_len_raw, addr_ptr, addrlen_ptr).await;
+    }
 
     let len = match usize::try_from(buf_len_raw) {
         Ok(n) => n,
@@ -2418,6 +2447,226 @@ async fn recvfrom_unix(
         };
         dst[..n].copy_from_slice(&buf[..n]);
     }
+    n as i64
+}
+
+// ===== P3-T9 (ADR 0008) UDP data-path helpers (C2) =======================
+//
+// sendto_udp / recvfrom_udp are invoked from the dispatch arms of
+// sendto/recvfrom when SocketInner.kind == Datagram. They share the
+// existing parse_sockaddr helper (V4/V6 sockaddr_in → SockAddr) and
+// use UdpSocketState::clone_socket to extract the host handle without
+// holding a parking_lot guard across .await.
+
+/// P3-T9 (ADR 0008): UDP sendto. Reads `buf` from guest memory,
+/// parses the optional destination sockaddr (V4/V6), then either:
+///   - sends to the explicit destination (sendto semantics), or
+///   - sends to the connected peer (peer_addr), or
+///   - returns -EDESTADDRREQ if neither is set.
+///
+/// The host `Arc<UdpSocket>` is cloned out of the SocketInner lock
+/// before the `.await` (lock discipline per ADR 0001 §2).
+async fn sendto_udp(
+    caller: &mut Caller<'_, Kernel>,
+    fd: u32,
+    buf_ptr: i64,
+    buf_len_raw: i64,
+    addr_ptr: i64,
+    addrlen_raw: i64,
+) -> i64 {
+    // Snapshot what we need from the socket under a brief lock.
+    let sock_arc: std::sync::Arc<tokio::net::UdpSocket>;
+    let connected_peer: Option<std::net::SocketAddr>;
+    let write_shut: bool;
+    {
+        let fds = &caller.data().fds;
+        match fds.get(fd) {
+            Ok(Resource::Socket(s)) => {
+                let gs = s.lock();
+                let udp = match gs.udp.as_ref() {
+                    Some(u) => u,
+                    None => return -crate::errno::ENOTCONN, // no host socket yet
+                };
+                sock_arc = match udp.clone_socket() {
+                    Some(arc) => arc,
+                    None => return -crate::errno::ENOTCONN,
+                };
+                write_shut = udp.is_write_shut();
+                // Snapshot the connected peer (if any). The explicit
+                // destination sockaddr is parsed below, outside the
+                // lock, since parse_sockaddr needs a mutable borrow
+                // on `caller`.
+                connected_peer = udp.peer_addr();
+            }
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    }
+
+    // Resolve destination outside the lock. parse_sockaddr needs a
+    // mutable borrow on caller that conflicts with the immutable
+    // `caller.data().fds` borrow held above.
+    let dest: std::net::SocketAddr = if addr_ptr != 0 && addrlen_raw != 0 {
+        let parsed = match parse_sockaddr(caller, addr_ptr, addrlen_raw) {
+            Ok(a) => a,
+            Err(e) => return e,
+        };
+        match parsed.as_std() {
+            Some(a) => a,
+            None => return -EINVAL,
+        }
+    } else {
+        match connected_peer {
+            Some(p) => p,
+            None => return -crate::errno::EDESTADDRREQ,
+        }
+    };
+
+    if write_shut {
+        return -crate::errno::EPIPE;
+    }
+
+    let bytes = match mem::guest_slice(caller, buf_ptr, buf_len_raw) {
+        Ok(b) => b.to_vec(),
+        Err(e) => return e,
+    };
+
+    let n: i64 = match sock_arc.send_to(&bytes, dest).await {
+        Ok(n) => n as i64,
+        Err(e) => match e.kind() {
+            std::io::ErrorKind::PermissionDenied => -crate::errno::EACCES,
+            std::io::ErrorKind::InvalidInput => -crate::errno::EINVAL,
+            std::io::ErrorKind::ConnectionReset => -crate::errno::ECONNRESET,
+            _ => -crate::errno::EIO,
+        },
+    };
+    n
+}
+
+/// P3-T9 (ADR 0008): UDP recvfrom. Reads up to `len` bytes from the
+/// host socket and writes them to `buf_ptr`. If `addr_ptr` is non-zero,
+/// writes the source sockaddr back. The host `Arc<UdpSocket>` is cloned
+/// out of the lock before the `.await`.
+async fn recvfrom_udp(
+    caller: &mut Caller<'_, Kernel>,
+    fd: u32,
+    buf_ptr: i64,
+    buf_len_raw: i64,
+    addr_ptr: i64,
+    addrlen_ptr: i64,
+) -> i64 {
+    let len = match usize::try_from(buf_len_raw) {
+        Ok(n) => n,
+        Err(_) => return -EFAULT,
+    };
+    if len == 0 {
+        return -EINVAL;
+    }
+    // Validate the buffer up front so a bad ptr returns -EFAULT
+    // without allocating the host Vec.
+    if let Err(e) = mem::guest_slice_mut(caller, buf_ptr, buf_len_raw) {
+        return e;
+    }
+
+    let sock_arc: std::sync::Arc<tokio::net::UdpSocket>;
+    let read_shut: bool;
+    {
+        let fds = &caller.data().fds;
+        match fds.get(fd) {
+            Ok(Resource::Socket(s)) => {
+                let gs = s.lock();
+                let udp = match gs.udp.as_ref() {
+                    Some(u) => u,
+                    None => return -crate::errno::ENOTCONN,
+                };
+                sock_arc = match udp.clone_socket() {
+                    Some(arc) => arc,
+                    None => return -crate::errno::ENOTCONN,
+                };
+                read_shut = udp.is_read_shut();
+            }
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    }
+
+    if read_shut {
+        return 0; // EOF
+    }
+
+    let mut host_buf = vec![0u8; len];
+    let (n, src) = match sock_arc.recv_from(&mut host_buf).await {
+        Ok((n, src)) => (n, src),
+        Err(e) => match e.kind() {
+            std::io::ErrorKind::PermissionDenied => return -crate::errno::EACCES,
+            std::io::ErrorKind::InvalidInput => return -crate::errno::EINVAL,
+            std::io::ErrorKind::ConnectionReset => return -crate::errno::ECONNRESET,
+            _ => return -crate::errno::EIO,
+        },
+    };
+
+    // Write back the bytes.
+    {
+        let dst = match mem::guest_slice_mut(caller, buf_ptr, n as i64) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        dst[..n].copy_from_slice(&host_buf[..n]);
+    }
+
+    // Write back the source sockaddr if the guest supplied a pointer.
+    if addr_ptr != 0 {
+        // Reuse the same V4/V6 writeback logic as getsockname. Validate
+        // the larger of the two sizes so V6 doesn't EFAULT on a guest
+        // that pre-allocated 28 bytes.
+        if let Err(e) = mem::guest_slice_mut(caller, addr_ptr, SOCKADDR_IN6_SIZE as i64) {
+            return e;
+        }
+        if addrlen_ptr != 0 {
+            if let Err(e) = mem::guest_slice_mut(caller, addrlen_ptr, 4) {
+                return e;
+            }
+        }
+        if let Ok(buf) = mem::guest_slice_mut(caller, addr_ptr, SOCKADDR_IN6_SIZE as i64) {
+            match src {
+                std::net::SocketAddr::V4(v4) => {
+                    let ip = v4.ip().octets();
+                    let port = v4.port();
+                    buf[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+                    buf[2..4].copy_from_slice(&port.to_be_bytes());
+                    buf[4..8].copy_from_slice(&ip);
+                    for b in &mut buf[8..16] {
+                        *b = 0;
+                    }
+                }
+                std::net::SocketAddr::V6(v6) => {
+                    if let Ok(buf6) =
+                        mem::guest_slice_mut(caller, addr_ptr, SOCKADDR_IN6_SIZE as i64)
+                    {
+                        buf6[0..2].copy_from_slice(&(AF_INET6 as u16).to_le_bytes());
+                        buf6[2..4].copy_from_slice(&v6.port().to_be_bytes());
+                        for b in &mut buf6[4..8] {
+                            *b = 0;
+                        }
+                        buf6[8..24].copy_from_slice(&v6.ip().octets());
+                        for b in &mut buf6[24..28] {
+                            *b = 0;
+                        }
+                    }
+                }
+            }
+        }
+        if addrlen_ptr != 0 {
+            if let Ok(len_buf) = mem::guest_slice_mut(caller, addrlen_ptr, 4) {
+                let alen: u32 = match src {
+                    std::net::SocketAddr::V4(_) => 16,
+                    std::net::SocketAddr::V6(_) => 28,
+                };
+                len_buf[0..4].copy_from_slice(&alen.to_le_bytes());
+            }
+        }
+    }
+
     n as i64
 }
 
