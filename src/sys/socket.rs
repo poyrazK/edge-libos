@@ -529,8 +529,22 @@ pub async fn accept4(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         }
     };
 
-    // Phase 2: await a connection. This may suspend.
-    let (stream, peer) = match listener.accept().await {
+    // Phase 2: await a connection. ADR 0007 §5: race the accept against
+    // the per-tid signal wake so a delivered signal returns -EINTR.
+    let signal_wake = crate::sys::signal::signal_wake_for(caller.data());
+    let accept_outcome: Result<(tokio::net::TcpStream, std::net::SocketAddr), ()> = tokio::select! {
+        r = listener.accept() => r.map_err(|_| ()),
+        _ = signal_wake.notified() => {
+            if crate::sys::signal::handle_signal_arm(caller.data())
+                == crate::sys::signal::SignalOutcome::Interrupted
+            {
+                return -crate::errno::EINTR;
+            }
+            // Ignore — fall through to a real accept attempt.
+            std::future::pending().await
+        }
+    };
+    let (stream, peer) = match accept_outcome {
         Ok(pair) => pair,
         Err(_) => return -crate::errno::EIO,
     };
@@ -647,8 +661,21 @@ async fn accept4_unix(
         }
     };
 
-    // Phase 2: await a connection.
-    let (stream, peer) = match listener.accept().await {
+    // Phase 2: await a connection. ADR 0007 §5: race the accept against
+    // the per-tid signal wake so a delivered signal returns -EINTR.
+    let signal_wake = crate::sys::signal::signal_wake_for(caller.data());
+    let accept_outcome: Result<(tokio::net::UnixStream, tokio::net::unix::SocketAddr), ()> = tokio::select! {
+        r = listener.accept() => r.map_err(|_| ()),
+        _ = signal_wake.notified() => {
+            if crate::sys::signal::handle_signal_arm(caller.data())
+                == crate::sys::signal::SignalOutcome::Interrupted
+            {
+                return -crate::errno::EINTR;
+            }
+            std::future::pending().await
+        }
+    };
+    let (stream, peer) = match accept_outcome {
         Ok(pair) => pair,
         Err(_) => return -crate::errno::EIO,
     };
@@ -1082,7 +1109,32 @@ pub async fn recvfrom(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 
     use tokio::io::AsyncReadExt;
     let mut buf = vec![0u8; len];
-    let n = match stream.read(&mut buf).await {
+
+    // ADR 0007 §5: race the recv read against the per-tid signal wake
+    // so a delivered signal returns -EINTR. On -EINTR we restore the
+    // stream and propagate. Ignore → spurious-wake re-arm.
+    let signal_wake = crate::sys::signal::signal_wake_for(caller.data());
+    let read_outcome: Result<usize, ()> = tokio::select! {
+        r = stream.read(&mut buf) => r.map_err(|_| ()),
+        _ = signal_wake.notified() => {
+            if crate::sys::signal::handle_signal_arm(caller.data())
+                == crate::sys::signal::SignalOutcome::Interrupted
+            {
+                // Restore the stream before returning.
+                let fds = &mut caller.data_mut().fds;
+                if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
+                    let mut gs = s.lock();
+                    if gs.stream.is_none() {
+                        gs.stream = Some(stream);
+                    }
+                }
+                return -crate::errno::EINTR;
+            }
+            // Ignore — pending → re-arm by re-polling the read.
+            std::future::pending().await
+        }
+    };
+    let n = match read_outcome {
         Ok(0) => 0, // EOF
         Ok(n) => n,
         Err(_) => {
@@ -2010,7 +2062,29 @@ pub async fn recvmsg(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     use tokio::io::AsyncReadExt;
     let want = total_cap;
     let mut buf = vec![0u8; want];
-    let read_result = stream.read(&mut buf).await;
+
+    // ADR 0007 §5: race the read against the per-tid signal wake.
+    let signal_wake = crate::sys::signal::signal_wake_for(caller.data());
+    let read_result: Result<usize, std::io::Error> = tokio::select! {
+        r = stream.read(&mut buf) => r,
+        _ = signal_wake.notified() => {
+            if crate::sys::signal::handle_signal_arm(caller.data())
+                == crate::sys::signal::SignalOutcome::Interrupted
+            {
+                // Restore the stream before returning.
+                let fds = &mut caller.data_mut().fds;
+                if let Ok(Resource::Socket(s)) = fds.get_mut(fd) {
+                    let mut gs = s.lock();
+                    if gs.stream.is_none() {
+                        gs.stream = Some(stream);
+                    }
+                }
+                restore_nonblock(caller, fd, was_nonblock);
+                return -crate::errno::EINTR;
+            }
+            std::future::pending().await
+        }
+    };
 
     // Restore stream.
     {

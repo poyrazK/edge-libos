@@ -414,6 +414,54 @@ const EPOLL_WAIT_TIMEOUT_WAT: &str = r#"
           (i64.const 0) (i64.const 0))))
 "#;
 
+/// ADR 0007 §5 — `nanosleep(req)` with a long duration must return
+/// `-EINTR` when a signal is delivered mid-sleep. Pre-arm + notify_one.
+#[test]
+fn nanosleep_returns_eintr_when_signal_pre_armed() -> Result<()> {
+    block_on(async {
+        let (engine, linker) = common::engine_and_linker()?;
+        let module = common::compile_wat(&engine, NANOSLEEP_LONG_WAT)?;
+        let (mut store, instance) = common::instantiate_async(&engine, &linker, &module).await?;
+
+        let tid = store.data().tid;
+        store
+            .data()
+            .process_state
+            .signals_pending
+            .lock()
+            .push(10 /* SIGUSR1 */);
+        store.data().process_state.signal_wake_for(tid).notify_one();
+
+        let f = instance.get_typed_func::<(), i64>(&mut store, "nanosleep_long")?;
+        let ret = f.call_async(&mut store, ()).await?;
+        assert_eq!(
+            ret,
+            -edge_libos::errno::EINTR,
+            "nanosleep must return -EINTR when SIGUSR1 is pending"
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+}
+
+const NANOSLEEP_LONG_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "nanosleep_long") (result i64)
+        ;; req @ 4096: tv_sec = 2, tv_nsec = 0 → 2s sleep.
+        (i64.store (i32.const 4096) (i64.const 2))
+        (i64.store (i32.const 4104) (i64.const 0))
+        (call $syscall
+          (i64.const 35)
+          (i64.const 4096)
+          (i64.const 0)
+          (i64.const 0)
+          (i64.const 0)
+          (i64.const 0)
+          (i64.const 0))))
+"#;
+
 #[test]
 fn nr_constants_match_linux_x86_64() {
     assert_eq!(edge_libos::sys::signal::NR_RT_SIGACTION, 13);
