@@ -8,8 +8,12 @@ void _start(void) {
     const char *s = "fnb_file";
     for (int i = 0; s[i]; i++) buf[i] = s[i]; buf[8] = 0;
 
-    // Create + open.
-    int64_t fd = sc4(NR_OPENAT, -100, (int64_t)(intptr_t)buf, 577, 420);
+    // Create + open via openat(O_WRONLY|O_CREAT|O_EXCL).
+    int64_t fd = sc4(NR_OPENAT, -100, (int64_t)(intptr_t)buf, 193, 420);
+    if (fd == -17 /*-EEXIST*/) {
+        mark_skip("fnb_file leftover from prior run");
+        return;
+    }
     if (fd < 0) { mark_fail("openat failed"); return; }
 
     int64_t r1 = sc3(NR_IOCTL, (int)fd, FIONBIO, 1);

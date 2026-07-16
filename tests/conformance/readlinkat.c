@@ -9,6 +9,10 @@ void _start(void) {
     for (int i = 0; tgt[i]; i++) buf[i] = tgt[i]; buf[7] = 0;
     for (int i = 0; lnk[i]; i++) buf[64 + i] = lnk[i]; buf[64 + 7] = 0;
 
+    // Self-cleanup of a leftover symlink from a prior run that didn't
+    // reach its unlink. NOOP if absent.
+    (void)sc1(NR_UNLINK, (int64_t)(intptr_t)(buf + 64));
+
     int64_t s = sc2(NR_SYMLINK, (int64_t)(intptr_t)buf, (int64_t)(intptr_t)(buf + 64));
     if (s != 0) { mark_fail("symlink"); return; }
 

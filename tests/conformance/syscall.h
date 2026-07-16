@@ -231,8 +231,13 @@ int64_t __kernel_syscall(int64_t nr, int64_t a1, int64_t a2, int64_t a3,
 // Standard *at() dirfd values. AT_FDCWD = -100 means "use cwd".
 #define AT_FDCWD (-100)
 
-// Pass/fail markers. Placed at offset 4096 in linear memory. The runner
-// reads back the bytes at 4096 after the run.
+// Pass/fail/skip markers. Placed at offset 4096 in linear memory. The
+// runner reads back the bytes at 4096 after the run. Three prefixes:
+//   - "PASS"               → counted as pass
+//   - "FAIL:<reason>"      → counted as fail (and `edge-cli trace` exits 1)
+//   - "SKIP:<reason>"      → counted as skip (env-blocked, not a bug);
+//                           the runner keeps its `exit 0` since SKIPs do
+//                           not flip the pass/fail exit policy
 #define MARKER_ADDR 4096
 
 // Write `s` to the marker region. Max 63 bytes + NUL.
@@ -249,6 +254,20 @@ static inline void mark_fail(const char *reason) {
     char buf[64];
     int i = 0;
     for (; i < 5 && "FAIL:"[i]; i++) buf[i] = "FAIL:"[i];
+    for (int j = 0; reason[j] && i < 63; j++, i++) buf[i] = reason[j];
+    buf[i] = 0;
+    mark(buf);
+}
+
+// mark_skip: environment-blocked test (e.g. port collision, stale
+// filesystem fixture, missing preopen). The C conformance runner counts
+// it as a separate bucket (not a pass, not a fail) and does NOT flip the
+// run's exit code. Internally identical to mark_fail but with the
+// "SKIP:" prefix — the runner dispatches on the prefix.
+static inline void mark_skip(const char *reason) {
+    char buf[64];
+    int i = 0;
+    for (; i < 5 && "SKIP:"[i]; i++) buf[i] = "SKIP:"[i];
     for (int j = 0; reason[j] && i < 63; j++, i++) buf[i] = reason[j];
     buf[i] = 0;
     mark(buf);

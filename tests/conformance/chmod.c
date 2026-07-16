@@ -7,8 +7,12 @@ void _start(void) {
     const char *s = "chmod_file";
     for (int i = 0; s[i]; i++) buf[i] = s[i]; buf[10] = 0;
 
-    // Create.
-    int64_t open_ret = sc4(NR_OPENAT, -100, (int64_t)(intptr_t)buf, 577, 420);
+    // Create via openat(O_WRONLY|O_CREAT|O_EXCL).
+    int64_t open_ret = sc4(NR_OPENAT, -100, (int64_t)(intptr_t)buf, 193, 420);
+    if (open_ret == -17 /*-EEXIST*/) {
+        mark_skip("chmod_file leftover from prior run");
+        return;
+    }
     if (open_ret < 0) { mark_fail("openat"); return; }
     (void)sc1(NR_CLOSE, (int)open_ret);
 

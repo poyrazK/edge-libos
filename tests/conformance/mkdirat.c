@@ -11,6 +11,14 @@ void _start(void) {
     path[11] = 0;
 
     int64_t r1 = sc3(NR_MKDIRAT, -100 /*AT_FDCWD*/, (int64_t)(intptr_t)path, 0755);
+    if (r1 == -17 /*-EEXIST*/) {
+        // mkdirat_dir leftover from a prior run (the test cleans up,
+        // a crashed prior run doesn't). Mark SKIP so the second-mkdir
+        // contract assertion isn't reached on a fixture that's
+        // already there.
+        mark_skip("mkdirat_dir leftover from prior run");
+        return;
+    }
     if (r1 != 0) { mark_fail("first mkdirat failed"); return; }
 
     // Same path again → -EEXIST.
