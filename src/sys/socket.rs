@@ -131,7 +131,16 @@ pub async fn socket(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
             kind, nonblock,
         )))
     } else {
-        std::sync::Arc::new(parking_lot::Mutex::new(SocketInner::new(kind, nonblock)))
+        let mut si = SocketInner::new(kind, nonblock);
+        // P3-T9 (ADR 0008): tag AF_INET6 sockets so bind/setsockopt can
+        // branch on family without re-parsing `bound`. Linux default for
+        // freshly-created AF_INET6 + SOCK_DGRAM is IPV6_V6ONLY=1 — match
+        // that so a guest gets the same semantics as on the host.
+        if family == AF_INET6 {
+            si.family_v6 = true;
+            si.ipv6_v6only = true;
+        }
+        std::sync::Arc::new(parking_lot::Mutex::new(si))
     };
     let fd = caller.data_mut().fds.insert(Resource::Socket(inner));
     fd as i64
@@ -164,7 +173,15 @@ pub fn socket_for_test(
     let inner = if family == AF_UNIX {
         SocketInner::new_unix(kind, false)
     } else {
-        SocketInner::new(kind, false)
+        let mut si = SocketInner::new(kind, false);
+        // P3-T9 (ADR 0008): mirror the runtime `socket()` path —
+        // AF_INET6 + SOCK_DGRAM gets IPV6_V6ONLY=1 by default (matches
+        // Linux). C4 lets the guest flip this via setsockopt.
+        if family == AF_INET6 {
+            si.family_v6 = true;
+            si.ipv6_v6only = true;
+        }
+        si
     };
     Ok(fds.insert(Resource::Socket(std::sync::Arc::new(
         parking_lot::Mutex::new(inner),
