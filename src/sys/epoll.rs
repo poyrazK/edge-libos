@@ -280,7 +280,7 @@ pub async fn epoll_wait(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
             tokio::select! {
                 _ = tokio::time::sleep(timeout_dur) => {}
                 _ = signal_wake.notified() => {
-                    signal_outcome = handle_signal_arm(caller.data());
+                    signal_outcome = handle_signal_arm(caller.data_mut());
                 }
             }
             return if signal_outcome == SignalOutcome::Interrupted {
@@ -327,7 +327,7 @@ pub async fn epoll_wait(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         _ = wait_any(&wakes) => {}
         _ = cancel_for_wait.notified() => {}
         _ = signal_wake.notified() => {
-            signal_outcome = handle_signal_arm(caller.data());
+            signal_outcome = handle_signal_arm(caller.data_mut());
         }
     }
 

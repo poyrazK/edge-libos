@@ -204,10 +204,21 @@ pub fn deliverable(kernel: &Kernel) -> DeliveryAction {
 /// `exit_requested = true` so the dispatch pre-check (Commit 2)
 /// short-circuits subsequent syscalls. No-op for non-terminating
 /// actions. Centralized here so every blocking-syscall integration
-/// point calls the same helper. The actual `128 + signo` arithmetic
-/// lands in Commit 8 — the stub returns silently today.
-pub fn apply_terminate_if_needed(_kernel: &Kernel, _action: &Option<DeliveryAction>) {
-    // Filled in by Commit 8 (terminating default action).
+/// point calls the same helper.
+///
+/// ADR 0007 §4: `exit`/`exit_group` already set `kernel.exit_code` and
+/// return 0 (no trap); the run path surfaces `exit_code.unwrap_or(0)`.
+/// We reuse this exact mechanism — terminating signals set exit_code +
+/// exit_requested, then the syscall that observes Terminate returns
+/// `-EINTR` (still a normal return through dispatch, which sees
+/// exit_requested on the NEXT call and short-circuits).
+pub fn apply_terminate_if_needed(kernel: &mut Kernel, action: &Option<DeliveryAction>) {
+    if let Some(DeliveryAction::Terminate(signo)) = action {
+        kernel.exit_code = Some(128 + signo);
+        kernel
+            .exit_requested
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Re-arm a `tokio::select!` block on the calling thread's per-tid
@@ -235,7 +246,7 @@ pub enum SignalOutcome {
 /// (Terminate is treated as `Interrupted` for return-value purposes
 /// because the dispatch pre-check will unwind the guest; the
 /// exit-code side-effect is applied via [`apply_terminate_if_needed`].)
-pub fn handle_signal_arm(kernel: &Kernel) -> SignalOutcome {
+pub fn handle_signal_arm(kernel: &mut Kernel) -> SignalOutcome {
     let action = deliverable(kernel);
     match action {
         DeliveryAction::Ignore => SignalOutcome::None,
@@ -433,6 +444,46 @@ mod tests {
         assert_eq!(NR_RT_SIGPROCMASK, 14);
         assert_eq!(NR_SIGALTSTACK, 131);
         assert_eq!(NR_RT_SIGRETURN, 15);
+    }
+
+    /// ADR 0007 §4: Terminate(signo) → exit_code = 128 + signo +
+    /// exit_requested = true. Verified by apply_terminate_if_needed,
+    /// which is the single sink every blocking syscall calls.
+    #[test]
+    fn apply_terminate_sets_exit_code_and_flag_for_sigterm() {
+        let mut k = crate::kernel::Kernel::new_without_stdio(vec![], vec![]);
+        assert!(k.exit_code.is_none(), "fresh kernel has no exit code");
+        assert!(
+            !k.exit_requested.load(std::sync::atomic::Ordering::Relaxed),
+            "fresh kernel has exit_requested=false"
+        );
+        apply_terminate_if_needed(&mut k, &Some(DeliveryAction::Terminate(15)));
+        assert_eq!(k.exit_code, Some(128 + 15));
+        assert!(k.exit_requested.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn apply_terminate_noop_for_interrupt_action() {
+        let mut k = crate::kernel::Kernel::new_without_stdio(vec![], vec![]);
+        apply_terminate_if_needed(&mut k, &Some(DeliveryAction::Interrupt));
+        assert!(k.exit_code.is_none());
+        assert!(!k.exit_requested.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn apply_terminate_noop_for_ignore_action() {
+        let mut k = crate::kernel::Kernel::new_without_stdio(vec![], vec![]);
+        apply_terminate_if_needed(&mut k, &Some(DeliveryAction::Ignore));
+        assert!(k.exit_code.is_none());
+        assert!(!k.exit_requested.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn apply_terminate_noop_for_none() {
+        let mut k = crate::kernel::Kernel::new_without_stdio(vec![], vec![]);
+        apply_terminate_if_needed(&mut k, &None);
+        assert!(k.exit_code.is_none());
+        assert!(!k.exit_requested.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]

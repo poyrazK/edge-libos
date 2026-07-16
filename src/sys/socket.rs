@@ -535,7 +535,7 @@ pub async fn accept4(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let accept_outcome: Result<(tokio::net::TcpStream, std::net::SocketAddr), ()> = tokio::select! {
         r = listener.accept() => r.map_err(|_| ()),
         _ = signal_wake.notified() => {
-            if crate::sys::signal::handle_signal_arm(caller.data())
+            if crate::sys::signal::handle_signal_arm(caller.data_mut())
                 == crate::sys::signal::SignalOutcome::Interrupted
             {
                 return -crate::errno::EINTR;
@@ -667,7 +667,7 @@ async fn accept4_unix(
     let accept_outcome: Result<(tokio::net::UnixStream, tokio::net::unix::SocketAddr), ()> = tokio::select! {
         r = listener.accept() => r.map_err(|_| ()),
         _ = signal_wake.notified() => {
-            if crate::sys::signal::handle_signal_arm(caller.data())
+            if crate::sys::signal::handle_signal_arm(caller.data_mut())
                 == crate::sys::signal::SignalOutcome::Interrupted
             {
                 return -crate::errno::EINTR;
@@ -1117,7 +1117,7 @@ pub async fn recvfrom(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let read_outcome: Result<usize, ()> = tokio::select! {
         r = stream.read(&mut buf) => r.map_err(|_| ()),
         _ = signal_wake.notified() => {
-            if crate::sys::signal::handle_signal_arm(caller.data())
+            if crate::sys::signal::handle_signal_arm(caller.data_mut())
                 == crate::sys::signal::SignalOutcome::Interrupted
             {
                 // Restore the stream before returning.
@@ -2068,7 +2068,7 @@ pub async fn recvmsg(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let read_result: Result<usize, std::io::Error> = tokio::select! {
         r = stream.read(&mut buf) => r,
         _ = signal_wake.notified() => {
-            if crate::sys::signal::handle_signal_arm(caller.data())
+            if crate::sys::signal::handle_signal_arm(caller.data_mut())
                 == crate::sys::signal::SignalOutcome::Interrupted
             {
                 // Restore the stream before returning.

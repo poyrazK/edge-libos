@@ -239,7 +239,7 @@ async fn futex_wait(
             tokio::select! {
                 _ = notify.notified() => WakeOutcome::Futex,
                 _ = signal_wake.notified() => {
-                    signal_outcome = crate::sys::signal::handle_signal_arm(caller.data());
+                    signal_outcome = crate::sys::signal::handle_signal_arm(caller.data_mut());
                     if signal_outcome == crate::sys::signal::SignalOutcome::Interrupted {
                         WakeOutcome::Signal
                     } else {
@@ -262,7 +262,7 @@ async fn futex_wait(
                 _ = notify.notified() => WakeOutcome::Futex,
                 _ = tokio::time::sleep_until(deadline_instant) => WakeOutcome::Timeout,
                 _ = signal_wake.notified() => {
-                    signal_outcome = crate::sys::signal::handle_signal_arm(caller.data());
+                    signal_outcome = crate::sys::signal::handle_signal_arm(caller.data_mut());
                     if signal_outcome == crate::sys::signal::SignalOutcome::Interrupted {
                         WakeOutcome::Signal
                     } else {

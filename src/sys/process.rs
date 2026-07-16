@@ -518,7 +518,7 @@ pub async fn wait4_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 
             tokio::select! {
                 _ = specific.notified() => {}
                 _ = signal_wake.notified() => {
-                    signal_outcome = crate::sys::signal::handle_signal_arm(caller.data());
+                    signal_outcome = crate::sys::signal::handle_signal_arm(caller.data_mut());
                 }
             }
             if signal_outcome == crate::sys::signal::SignalOutcome::Interrupted {
@@ -539,7 +539,7 @@ pub async fn wait4_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 
             tokio::select! {
                 _ = child_event.notified() => {}
                 _ = signal_wake.notified() => {
-                    signal_outcome = crate::sys::signal::handle_signal_arm(caller.data());
+                    signal_outcome = crate::sys::signal::handle_signal_arm(caller.data_mut());
                 }
             }
             if signal_outcome == crate::sys::signal::SignalOutcome::Interrupted {

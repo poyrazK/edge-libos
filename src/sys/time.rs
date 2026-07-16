@@ -186,7 +186,7 @@ pub async fn clock_nanosleep(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i6
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_nanos(wait_ns)) => {}
             _ = signal_wake.notified() => {
-                signal_outcome = handle_signal_arm(caller.data());
+                signal_outcome = handle_signal_arm(caller.data_mut());
             }
         }
         if signal_outcome == SignalOutcome::Interrupted {
@@ -202,7 +202,7 @@ pub async fn clock_nanosleep(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i6
         tokio::select! {
             _ = tokio::time::sleep(dur) => {}
             _ = signal_wake.notified() => {
-                signal_outcome = handle_signal_arm(caller.data());
+                signal_outcome = handle_signal_arm(caller.data_mut());
             }
         }
         if signal_outcome == SignalOutcome::Interrupted {
@@ -268,7 +268,7 @@ pub async fn nanosleep(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     tokio::select! {
         _ = tokio::time::sleep(dur) => {}
         _ = signal_wake.notified() => {
-            signal_outcome = handle_signal_arm(caller.data());
+            signal_outcome = handle_signal_arm(caller.data_mut());
         }
     }
     if signal_outcome == SignalOutcome::Interrupted {

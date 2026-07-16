@@ -176,7 +176,7 @@ pub async fn poll(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                     continue;
                 }
                 _ = signal_wake.notified() => {
-                    signal_outcome = handle_signal_arm(caller.data());
+                    signal_outcome = handle_signal_arm(caller.data_mut());
                 }
             }
             if signal_outcome == SignalOutcome::Interrupted {
@@ -191,7 +191,7 @@ pub async fn poll(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                 biased;
                 _ = wait_any(&wakes) => {}
                 _ = signal_wake.notified() => {
-                    signal_outcome = handle_signal_arm(caller.data());
+                    signal_outcome = handle_signal_arm(caller.data_mut());
                 }
             }
             if signal_outcome == SignalOutcome::Interrupted {
