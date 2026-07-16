@@ -387,14 +387,128 @@ pub async fn bind(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
             Err(e) => e,
         }
     } else {
-        let fds = &mut caller.data_mut().fds;
-        match fds.get_mut(fd) {
-            Ok(Resource::Socket(s)) => {
-                s.lock().bound = Some(addr);
-                0
+        // P3-T9 (ADR 0008): V4/V6 UDP bind path. Materialize
+        // `UdpSocketState` lazily (the field starts as `None`); then
+        // call `ensure_bound` which uses `socket2` to set
+        // `SO_REUSEADDR` + `IPV6_V6ONLY` and binds the host socket
+        // (purely sync, no awaits). `kind == Stream` (TCP) keeps the
+        // original P1 behavior of just recording `bound`.
+        let kind = {
+            let fds = &mut caller.data_mut().fds;
+            match fds.get(fd) {
+                Ok(Resource::Socket(s)) => s.lock().kind,
+                Ok(_) => return -EBADF,
+                Err(e) => return e,
             }
-            Ok(_) => -EBADF,
-            Err(e) => e,
+        };
+
+        if kind == SocketKind::Datagram {
+            // For UDP, the host bind is real (we need an actual
+            // socket). Reject V4 over V6 and vice-versa (Linux does
+            // the V4-mapped-IPv6 translation only when IPV6_V6ONLY=0
+            // AND the socket is AF_INET6; v1 requires the guest to
+            // pass the matching family explicitly).
+            let std_addr = match addr.as_std() {
+                Some(a) => a,
+                None => return -EINVAL,
+            };
+            match addr {
+                SockAddr::V4 { .. }
+                    if {
+                        let fds = &mut caller.data_mut().fds;
+                        match fds.get(fd) {
+                            Ok(Resource::Socket(s)) => s.lock().family_v6,
+                            _ => false,
+                        }
+                    } =>
+                {
+                    return -EINVAL
+                }
+                SockAddr::V6 { .. }
+                    if {
+                        let fds = &mut caller.data_mut().fds;
+                        match fds.get(fd) {
+                            Ok(Resource::Socket(s)) => !s.lock().family_v6,
+                            _ => false,
+                        }
+                    } =>
+                {
+                    return -EINVAL
+                }
+                _ => {}
+            }
+
+            // Read construction params, drop the lock, then call
+            // ensure_bound (which locks internal mutexes but does NOT
+            // .await). Then re-lock to install `udp` + record `bound`.
+            let (so_reuseaddr, ipv6_v6only, family_v6) = {
+                let fds = &mut caller.data_mut().fds;
+                match fds.get(fd) {
+                    Ok(Resource::Socket(s)) => {
+                        let gs = s.lock();
+                        (gs.so_reuseaddr, gs.ipv6_v6only, gs.family_v6)
+                    }
+                    Ok(_) => return -EBADF,
+                    Err(e) => return e,
+                }
+            };
+            let family = if family_v6 {
+                crate::sys::udp::Family::V6
+            } else {
+                crate::sys::udp::Family::V4
+            };
+
+            // Build the state + bind in one expression — `ensure_bound`
+            // is sync, so we can hold `gs` lock for the whole thing.
+            let fds = &mut caller.data_mut().fds;
+            match fds.get_mut(fd) {
+                Ok(Resource::Socket(s)) => {
+                    let mut gs = s.lock();
+                    let state = gs.udp.get_or_insert_with(|| {
+                        crate::sys::udp::UdpSocketState::new(family, ipv6_v6only, so_reuseaddr)
+                    });
+                    match state.ensure_bound(std_addr) {
+                        Ok(_actual_bound) => {
+                            // Persist the actual bound addr (which may
+                            // differ from requested when port=0 → OS
+                            // picks an ephemeral port). The SocketAddr
+                            // form (V4/V6) is reconstructed from the
+                            // bind result so getsockname returns the
+                            // OS-assigned port.
+                            let actual = match state.local_addr() {
+                                Some(a) => a,
+                                None => return -crate::errno::EIO,
+                            };
+                            gs.bound = match actual {
+                                std::net::SocketAddr::V4(v4) => Some(SockAddr::V4 {
+                                    port: v4.port(),
+                                    addr: v4.ip().octets(),
+                                }),
+                                std::net::SocketAddr::V6(v6) => Some(SockAddr::V6 {
+                                    port: v6.port(),
+                                    addr: v6.ip().octets(),
+                                }),
+                            };
+                            0
+                        }
+                        Err(e) => e,
+                    }
+                }
+                Ok(_) => -EBADF,
+                Err(e) => e,
+            }
+        } else {
+            // TCP path (P1): just record `bound` — accept4 will
+            // materialize the actual TcpListener lazily.
+            let fds = &mut caller.data_mut().fds;
+            match fds.get_mut(fd) {
+                Ok(Resource::Socket(s)) => {
+                    s.lock().bound = Some(addr);
+                    0
+                }
+                Ok(_) => -EBADF,
+                Err(e) => e,
+            }
         }
     }
 }
@@ -1402,8 +1516,10 @@ pub async fn getsockname(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         return 0;
     }
 
-    // Pre-validate pointers.
-    if let Err(e) = mem::guest_slice_mut(caller, addr_ptr, SOCKADDR_IN_SIZE as i64) {
+    // Pre-validate pointers. V6 needs SOCKADDR_IN6_SIZE=28; we
+    // always validate the larger of the two so V6 reads don't EFAULT
+    // on a guest that pre-allocated 28 bytes.
+    if let Err(e) = mem::guest_slice_mut(caller, addr_ptr, SOCKADDR_IN6_SIZE as i64) {
         return e;
     }
     if addrlen_ptr != 0 {
@@ -1422,10 +1538,9 @@ pub async fn getsockname(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                     Some(crate::fd::SockAddr::V4 { port, addr }) => std::net::SocketAddr::V4(
                         std::net::SocketAddrV4::new(std::net::Ipv4Addr::from(*addr), *port),
                     ),
-                    Some(crate::fd::SockAddr::V6 { .. }) => {
-                        // IPv6 support is P2; report EINVAL for now.
-                        return -EINVAL;
-                    }
+                    Some(crate::fd::SockAddr::V6 { port, addr }) => std::net::SocketAddr::V6(
+                        std::net::SocketAddrV6::new(std::net::Ipv6Addr::from(*addr), *port, 0, 0),
+                    ),
                     Some(crate::fd::SockAddr::Unix { .. }) => return -EINVAL,
                     None => match &gs.peer_addr {
                         // No bind yet — fall back to the peer's family so
@@ -1443,7 +1558,7 @@ pub async fn getsockname(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         }
     };
 
-    if let Ok(buf) = mem::guest_slice_mut(caller, addr_ptr, SOCKADDR_IN_SIZE as i64) {
+    if let Ok(buf) = mem::guest_slice_mut(caller, addr_ptr, SOCKADDR_IN6_SIZE as i64) {
         match local_addr {
             std::net::SocketAddr::V4(v4) => {
                 let ip = v4.ip().octets();
@@ -1455,12 +1570,34 @@ pub async fn getsockname(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                     *b = 0;
                 }
             }
-            std::net::SocketAddr::V6(_) => return -EINVAL,
+            std::net::SocketAddr::V6(v6) => {
+                // P3-T9 (ADR 0008): V6 bind writes back a
+                // sockaddr_in6. The buffer was pre-validated above at
+                // SOCKADDR_IN_SIZE=16; V6 needs SOCKADDR_IN6_SIZE=28,
+                // so re-validate the larger slice.
+                if let Ok(buf6) = mem::guest_slice_mut(caller, addr_ptr, SOCKADDR_IN6_SIZE as i64) {
+                    buf6[0..2].copy_from_slice(&(AF_INET6 as u16).to_le_bytes());
+                    buf6[2..4].copy_from_slice(&v6.port().to_be_bytes());
+                    // flowinfo (4 bytes) — 0
+                    for b in &mut buf6[4..8] {
+                        *b = 0;
+                    }
+                    buf6[8..24].copy_from_slice(&v6.ip().octets());
+                    // scope_id (4 bytes) — 0
+                    for b in &mut buf6[24..28] {
+                        *b = 0;
+                    }
+                }
+            }
         }
     }
     if addrlen_ptr != 0 {
         if let Ok(buf) = mem::guest_slice_mut(caller, addrlen_ptr, 4) {
-            buf[0..4].copy_from_slice(&(16u32).to_le_bytes());
+            let len = match local_addr {
+                std::net::SocketAddr::V4(_) => 16u32,
+                std::net::SocketAddr::V6(_) => 28u32,
+            };
+            buf[0..4].copy_from_slice(&len.to_le_bytes());
         }
     }
     0

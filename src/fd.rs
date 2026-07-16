@@ -187,6 +187,34 @@ impl SockAddr {
             SockAddr::V6 { .. } | SockAddr::Unix { .. } => None,
         }
     }
+
+    /// Build a `SocketAddrV6` from a `SockAddr::V6`. Returns `None` for
+    /// V4 and Unix. P3-T9 (ADR 0008): UDP bind path needs the full
+    /// `std::net::SocketAddr` for `socket2::Socket::bind`. P1 TCP
+    /// listener path stays on `as_v4` until V6 listener lands.
+    pub fn as_v6(&self) -> Option<std::net::SocketAddrV6> {
+        match self {
+            SockAddr::V6 { port, addr } => {
+                std::net::SocketAddrV6::new(std::net::Ipv6Addr::from(*addr), *port, 0, 0).into()
+            }
+            SockAddr::V4 { .. } | SockAddr::Unix { .. } => None,
+        }
+    }
+
+    /// Convert to a std `SocketAddr` for V4/V6 only. Returns `None` for
+    /// Unix (Unix sockets don't bind via a `SocketAddr`; they bind via
+    /// a path). Used by the UDP bind path (C1) and snapshot apply (C7).
+    pub fn as_std(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            SockAddr::V4 { port, addr } => {
+                Some(std::net::SocketAddrV4::new(std::net::Ipv4Addr::from(*addr), *port).into())
+            }
+            SockAddr::V6 { port, addr } => Some(
+                std::net::SocketAddrV6::new(std::net::Ipv6Addr::from(*addr), *port, 0, 0).into(),
+            ),
+            SockAddr::Unix { .. } => None,
+        }
+    }
 }
 
 /// A freshly-created socket fd (P1-1). No connection state yet.
