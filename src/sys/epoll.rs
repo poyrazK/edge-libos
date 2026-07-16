@@ -37,7 +37,7 @@ use crate::errno::{EBADF, EINTR, EINVAL};
 use crate::fd::{EpollEntry, EpollInner, Resource};
 use crate::kernel::Kernel;
 use crate::mem;
-use crate::sys::signal::{deliverable, DeliveryAction};
+use crate::sys::signal::{handle_signal_arm, signal_wake_for, SignalOutcome};
 
 // Linux x86-64 syscall NRs.
 pub const NR_EPOLL_CREATE1: u32 = 291;
@@ -273,25 +273,20 @@ pub async fn epoll_wait(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         // No registrations — just sleep the timeout (or wait forever).
         // We still race a signal-wake arm so a delivered signal returns
         // -EINTR even when there's nothing else to wait for.
-        let signal_wake = caller
-            .data()
-            .process_state
-            .signal_wake_for(caller.data().tid);
+        let signal_wake = signal_wake_for(caller.data());
         if timeout_ms > 0 {
             let timeout_dur = std::time::Duration::from_millis(timeout_ms as u64);
-            let mut signal_action: Option<DeliveryAction> = None;
+            let mut signal_outcome = SignalOutcome::None;
             tokio::select! {
                 _ = tokio::time::sleep(timeout_dur) => {}
                 _ = signal_wake.notified() => {
-                    signal_action = Some(deliverable(caller.data()));
+                    signal_outcome = handle_signal_arm(caller.data());
                 }
             }
-            return match signal_action {
-                Some(DeliveryAction::Interrupt) | Some(DeliveryAction::Terminate(_)) => {
-                    apply_terminate_if_needed(caller.data(), &signal_action);
-                    -EINTR
-                }
-                _ => 0,
+            return if signal_outcome == SignalOutcome::Interrupted {
+                -EINTR
+            } else {
+                0
             };
         } else if timeout_ms < 0 {
             // Wait forever — but we have nothing to wake us, so we'd hang.
@@ -318,12 +313,9 @@ pub async fn epoll_wait(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let wakes: Vec<Arc<tokio::sync::Notify>> =
         entries_snapshot.values().map(|e| e.wake.clone()).collect();
     let cancel_for_wait = cancel.clone();
-    let signal_wake = caller
-        .data()
-        .process_state
-        .signal_wake_for(caller.data().tid);
+    let signal_wake = signal_wake_for(caller.data());
 
-    let mut signal_action: Option<DeliveryAction> = None;
+    let mut signal_outcome = SignalOutcome::None;
     tokio::select! {
         _ = async {
             if let Some(d) = timeout_dur {
@@ -335,33 +327,20 @@ pub async fn epoll_wait(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         _ = wait_any(&wakes) => {}
         _ = cancel_for_wait.notified() => {}
         _ = signal_wake.notified() => {
-            signal_action = Some(deliverable(caller.data()));
+            signal_outcome = handle_signal_arm(caller.data());
         }
     }
 
     // ADR 0007 §5: a delivered signal interrupts a blocking syscall with
     // -EINTR. Terminate also sets exit_code + exit_requested so the
     // dispatch pre-check short-circuits subsequent syscalls.
-    if matches!(
-        signal_action,
-        Some(DeliveryAction::Interrupt) | Some(DeliveryAction::Terminate(_))
-    ) {
-        apply_terminate_if_needed(caller.data(), &signal_action);
+    if signal_outcome == SignalOutcome::Interrupted {
         return -EINTR;
     }
 
     // Phase 3: re-snapshot readiness post-wake.
     let ready = snapshot_readiness(&entries_snapshot, caller);
     pack_events(caller, events_ptr, maxevents, &ready)
-}
-
-/// Set `exit_code` + `exit_requested` on a default-terminate signal so the
-/// dispatch pre-check (C2) and run.rs unwinding surface exit code
-/// `128 + signo`. No-op for other actions. Wiring lives here so every
-/// blocking-syscall integration point calls the same helper; Commit 8
-/// finalizes the `128 + signo` arithmetic.
-fn apply_terminate_if_needed(_kernel: &Kernel, _action: &Option<DeliveryAction>) {
-    // Filled in by Commit 8 (terminating default action).
 }
 
 /// Wait until any of the supplied Notifies fires. Polled once per branch

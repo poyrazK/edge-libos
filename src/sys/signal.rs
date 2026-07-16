@@ -199,6 +199,53 @@ pub fn deliverable(kernel: &Kernel) -> DeliveryAction {
     result
 }
 
+/// Apply the terminating side-effect of a [`DeliveryAction::Terminate`]
+/// to the kernel: set `exit_code = 128 + signo` and flip
+/// `exit_requested = true` so the dispatch pre-check (Commit 2)
+/// short-circuits subsequent syscalls. No-op for non-terminating
+/// actions. Centralized here so every blocking-syscall integration
+/// point calls the same helper. The actual `128 + signo` arithmetic
+/// lands in Commit 8 — the stub returns silently today.
+pub fn apply_terminate_if_needed(_kernel: &Kernel, _action: &Option<DeliveryAction>) {
+    // Filled in by Commit 8 (terminating default action).
+}
+
+/// Re-arm a `tokio::select!` block on the calling thread's per-tid
+/// signal-wake `Notify`. Returns the `Notify` clone so the caller
+/// can add it as a `select!` arm. Centralizes the lazy-get-or-create
+/// pattern (Commit 1 §3) so each blocking syscall site is one line.
+pub fn signal_wake_for(kernel: &Kernel) -> std::sync::Arc<tokio::sync::Notify> {
+    kernel.process_state.signal_wake_for(kernel.tid)
+}
+
+/// Result of [`handle_signal_arm`]: whether the caller's blocked
+/// syscall should return now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalOutcome {
+    /// No signal delivered; the caller's select! arm was spurious.
+    /// Caller should re-park (wait4-style loop).
+    None,
+    /// An unmasked signal was pending; caller should return `-EINTR`.
+    /// Also drives [`apply_terminate_if_needed`] internally.
+    Interrupted,
+}
+
+/// Run `deliverable()` against `kernel` and translate the result into
+/// a [`SignalOutcome`]. Used by every blocking-syscall signal arm.
+/// (Terminate is treated as `Interrupted` for return-value purposes
+/// because the dispatch pre-check will unwind the guest; the
+/// exit-code side-effect is applied via [`apply_terminate_if_needed`].)
+pub fn handle_signal_arm(kernel: &Kernel) -> SignalOutcome {
+    let action = deliverable(kernel);
+    match action {
+        DeliveryAction::Ignore => SignalOutcome::None,
+        DeliveryAction::Interrupt | DeliveryAction::Terminate(_) => {
+            apply_terminate_if_needed(kernel, &Some(action));
+            SignalOutcome::Interrupted
+        }
+    }
+}
+
 /// `rt_sigaction(signum, act, oldact, sigsetsize)`.
 ///
 /// `act` may be NULL to query without changing; `oldact` may be NULL to

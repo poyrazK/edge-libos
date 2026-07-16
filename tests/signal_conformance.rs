@@ -279,6 +279,70 @@ fn epoll_wait_empty_returns_eintr_when_signal_pre_armed() -> Result<()> {
     })
 }
 
+/// ADR 0007 §5 — `poll` with a long timeout should return `-EINTR`
+/// when a signal is delivered. Same pre-arm + notify_one pattern as
+/// the epoll_wait test (C3).
+#[test]
+fn poll_long_timeout_returns_eintr_when_signal_pre_armed() -> Result<()> {
+    block_on(async {
+        let (engine, linker) = common::engine_and_linker()?;
+        let module = common::compile_wat(&engine, POLL_LONG_WAT)?;
+        let (mut store, instance) = common::instantiate_async(&engine, &linker, &module).await?;
+
+        // Pre-arm: SIGUSR1 + notify_one (consumed by next notified()).
+        let tid = store.data().tid;
+        store
+            .data()
+            .process_state
+            .signals_pending
+            .lock()
+            .push(10 /* SIGUSR1 */);
+        store.data().process_state.signal_wake_for(tid).notify_one();
+
+        let f = instance.get_typed_func::<(), i64>(&mut store, "poll_long")?;
+        let ret = f.call_async(&mut store, ()).await?;
+        assert_eq!(
+            ret,
+            -edge_libos::errno::EINTR,
+            "poll must return -EINTR when SIGUSR1 is pending"
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+}
+
+const POLL_LONG_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "poll_long") (result i64)
+        ;; pipe2(out @ 4096) → returns 0; out[0..4] = read_fd, out[4..8] = write_fd.
+        (drop
+          (call $syscall
+            (i64.const 293) (i64.const 4096) (i64.const 0)
+            (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+        ;; pollfd @ 8192: fd = read_fd (4 bytes at 4096), events = POLLIN.
+        (i32.store (i32.const 8192) (i32.load (i32.const 4096)))
+        (i32.store (i32.const 8196) (i32.const 1))
+        (i32.store (i32.const 8200) (i32.const 0))
+        ;; Close the write end (read end has nothing → block in poll).
+        (drop
+          (call $syscall
+            (i64.const 3) ;; NR_CLOSE
+            (i64.extend_i32_u (i32.load (i32.const 4100)))
+            (i64.const 0) (i64.const 0) (i64.const 0)
+            (i64.const 0) (i64.const 0)))
+        ;; poll(fds@8192, 1, 2000ms) — must park; signal arm returns -EINTR.
+        (call $syscall
+          (i64.const 7)
+          (i64.const 8192)
+          (i64.const 1)
+          (i64.const 2000)
+          (i64.const 0)
+          (i64.const 0)
+          (i64.const 0))))
+"#;
+
 const EPOLL_WAIT_TIMEOUT_WAT: &str = r#"
     (module
       (import "kernel" "syscall"
