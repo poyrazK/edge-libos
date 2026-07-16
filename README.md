@@ -38,12 +38,20 @@ live x86→ARM migration flow (`edge-cli migrate` subcommand).
 `Kernel.memory_kind` accepts either a regular `Memory` or a
 `SharedMemory`. Format version stays at 1 (ADR 0002 §4).
 
+P3 Tier-9 adds **signal delivery** ([ADR 0007](./docs/adr/0007-p3-signal-delivery.md)):
+guest-sent signals interrupt blocking syscalls (`-EINTR`),
+default-terminating signals stop the guest with exit code `128+signo`,
+and a `SIGUSR1` to `edge-cli freeze` snapshots a parked server guest
+via a self-pipe listener. v1 scope is **EINTR + default actions** —
+guest `sa_handler` invocation is documented as future work.
+
 See [`HANDOFF.md`](./HANDOFF.md) for the running status. The
 ADR index is at [`docs/adr/README.md`](./docs/adr/README.md);
 specific contracts: [0001 futex](./docs/adr/0001-p3-futex-semantics.md),
 [0002 snapshot](./docs/adr/0002-snapshot-wire-format.md),
 [0003 migration](./docs/adr/0003-p3-live-migration.md),
-[0004 metering](./docs/adr/0004-metering-semantics.md).
+[0004 metering](./docs/adr/0004-metering-semantics.md),
+[0007 signal delivery](./docs/adr/0007-p3-signal-delivery.md).
 
 ## P1 DoD (satisfied)
 

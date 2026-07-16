@@ -15,9 +15,12 @@
 //! `bound.port = 0` and `apply_snapshot` would bind a DIFFERENT ephemeral
 //! port than the snapshot says, breaking `serve`.
 
+use std::os::fd::FromRawFd;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Notify;
 use wasmtime::Linker;
 
 use crate::cli::error::{CliError, CliResult};
@@ -107,13 +110,33 @@ async fn freeze_snapshot(wasm_path: &str, guest_args: &[String]) -> CliResult<Ke
         store.data_mut().attach_memory(mem);
     }
 
-    // Drive the guest with a bounded timeout. The guest parks in
-    // accept4 (or epoll_wait) on a real server; we take the snapshot
-    // either when the guest returns (short-lived guest) or after the
-    // timeout (server-style guest). `build_kernel_snapshot` does the
-    // ephemeral-port-drift fix inline (see `src/snapshot.rs:561`),
-    // rewriting `bound.port` to the materialized listener's
-    // `local_addr().port()` if `bound.port == 0`.
+    // ADR 0007 §6: install a quiesce_notify so a SIGUSR1 to this
+    // process can interrupt a parked server-style guest at the next
+    // blocking syscall and let freeze take a snapshot. The notify
+    // is Send+Sync so the listener thread can fire it without
+    // touching the !Send Store.
+    let quiesce = Arc::new(Notify::new());
+    // `process_state` is `Arc<ProcessState>` (shared across threads
+    // post-fork per ADR 0006). Right after `Kernel::new` it has
+    // strong_count==1 so we can get_mut; if that ever changes, the
+    // right move is to add a `Kernel::set_quiesce_notify` helper
+    // that handles the contention case rather than open-coding here.
+    Arc::get_mut(&mut store.data_mut().process_state)
+        .expect("process_state must be uniquely owned at freeze setup")
+        .quiesce_notify = Some(quiesce.clone());
+
+    // Spawn a dedicated thread that listens for SIGUSR1 and fires the
+    // notify. The listener never touches the Store; it only pokes
+    // the Send+Sync Arc<Notify>.
+    spawn_sigusr1_listener(quiesce.clone())?;
+
+    // Drive the guest. Three arms:
+    //   1. call_start returns (short-lived guest exited)
+    //   2. SIGUSR1 fires the quiesce_notify (operator-driven snapshot)
+    //   3. 10-second outer timeout (server-style guest still parked)
+    // `build_kernel_snapshot` does the ephemeral-port-drift fix inline
+    // (see `src/snapshot.rs:561`), rewriting `bound.port` to the
+    // materialized listener's `local_addr().port()` if `bound.port == 0`.
     //
     // We can't poll kernel state mid-_start because `call_start` holds
     // an exclusive borrow of `Store` for the lifetime of the future —
@@ -122,10 +145,11 @@ async fn freeze_snapshot(wasm_path: &str, guest_args: &[String]) -> CliResult<Ke
     // and never across `.await`) is the clean place to observe the
     // materialized port without racing the guest task.
     let timeout = Duration::from_secs(10);
-    // Both arms (guest returned vs. outer timeout fired on a parked
-    // server-style guest) want the same snapshot of the live store, so
-    // we drop the timeout future's result and unconditionally snap.
-    let _ = tokio::time::timeout(timeout, call_start(&instance, &mut store)).await;
+    tokio::select! {
+        _ = call_start(&instance, &mut store) => {}
+        _ = quiesce.notified() => {}
+        _ = tokio::time::sleep(timeout) => {}
+    };
     let mut snap = try_to_snapshot(store.data(), &store)?;
     // Embed the freeze-side wasm hash on the snapshot. `try_to_snapshot`
     // builds with module_sha256 = [0u8; 32] because the guest-driven
@@ -133,6 +157,148 @@ async fn freeze_snapshot(wasm_path: &str, guest_args: &[String]) -> CliResult<Ke
     // CLI path. (See ADR 0005 D5 design rationale.)
     snap.module_sha256 = module_sha256;
     Ok(snap)
+}
+
+/// Spawn a dedicated OS thread that listens for `SIGUSR1` and fires
+/// `notify.notify_waiters()` on receipt. Uses a `signalfd`-style
+/// approach via a self-pipe:
+///
+/// 1. Create a pipe; the read end goes to a tokio listener task
+///    (drained on a dedicated current-thread runtime so we don't
+///    fight the host runtime's signal driver), the write end is
+///    captured by a `libc::sigaction` handler.
+/// 2. On SIGUSR1, the handler `write(2)`s 1 byte into the pipe.
+/// 3. The listener task reads the byte and calls `notify.notify_waiters()`,
+///    waking the freeze `select!` arm.
+///
+/// We avoid `tokio::signal::unix::signal(SignalKind::user_defined1())`
+/// because two tokio runtimes in the same process can't both register
+/// SIGUSR1 handlers — tokio's signal driver is keyed off the first
+/// runtime to register. Raw `sigaction` + self-pipe sidesteps the
+/// driver entirely.
+///
+/// Returns an `Err` only if the pipe / thread can't be set up; the
+/// listener itself is infallible from the caller's perspective.
+fn spawn_sigusr1_listener(notify: Arc<Notify>) -> CliResult<()> {
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    // Shared fd storage: set once by the spawning thread (parent)
+    // before installing the handler, read on every signal. The
+    // spawning fence on `Ordering::Release` pairs with the
+    // `Ordering::Acquire` in the handler to ensure the fd is
+    // visible.
+    static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+
+    // Create the self-pipe. `pipe2(O_CLOEXEC)` would be cleaner but
+    // isn't in the `libc` crate's portable bindings; use plain
+    // `pipe(2)` and rely on the fact that nothing in this process
+    // forks.
+    let mut fds = [0i32; 2];
+    // SAFETY: fds is a valid [i32; 2]; pipe(2) initializes it.
+    let pr = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if pr != 0 {
+        return Err(CliError::Args(format!(
+            "freeze: SIGUSR1 self-pipe failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let read_fd = fds[0];
+    let write_fd = fds[1];
+
+    // Publish write_fd to the handler BEFORE installing sigaction.
+    WRITE_FD.store(write_fd, Ordering::Release);
+
+    // SAFETY: handler is async-signal-safe (only libc::write to a
+    // known-good pipe fd).
+    unsafe extern "C" fn sigusr1_handler(_sig: libc::c_int) {
+        let fd = WRITE_FD.load(Ordering::Acquire);
+        if fd < 0 {
+            return;
+        }
+        let b: u8 = 1;
+        // SAFETY: fd is a live pipe write end; ignore short writes
+        // and EAGAIN (1-byte writes don't short, and the pipe won't
+        // fill from operator-driven signals).
+        unsafe {
+            libc::write(fd, &b as *const u8 as *const libc::c_void, 1);
+        }
+    }
+
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = sigusr1_handler as *const () as libc::sighandler_t;
+    // No SA_RESTART — we WANT the signal to interrupt syscalls.
+    sa.sa_flags = 0;
+    sa.sa_mask = unsafe { std::mem::zeroed() };
+    // SAFETY: sa is initialized; sigaction(2) is async-signal-safe.
+    let rc = unsafe { libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut()) };
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        // SAFETY: close both fds we own before returning.
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+        WRITE_FD.store(-1, Ordering::Release);
+        return Err(CliError::Args(format!(
+            "freeze: SIGUSR1 sigaction failed: {e}"
+        )));
+    }
+
+    // Spawn a thread that drives a dedicated current-thread tokio
+    // runtime, wrapping read_fd in a `tokio::net::unix::pipe` and
+    // draining it. When a byte arrives, fire the notify.
+    std::thread::Builder::new()
+        .name("edge-cli-freeze-sigusr1".to_string())
+        .spawn(move || {
+            // Catch any panic so it doesn't take down the process —
+            // we'd rather fail the freeze than the entire edge-cli.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // SAFETY: read_fd is a live pipe read end owned by this thread.
+                let owned_pipe = unsafe { std::os::fd::OwnedFd::from_raw_fd(read_fd) };
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        eprintln!("edge-cli freeze: SIGUSR1 listener runtime failed: {e}");
+                        drop(owned_pipe);
+                        return;
+                    }
+                };
+                rt.block_on(async move {
+                    let pipe = tokio::net::unix::pipe::Receiver::from_owned_fd(owned_pipe)
+                        .expect("tokio pipe from_owned_fd");
+                    use tokio::io::AsyncReadExt;
+                    let mut pipe = pipe;
+                    let mut buf = [0u8; 64];
+                    loop {
+                        match pipe.read(&mut buf).await {
+                            Ok(0) => break, // EOF — write end closed, process exiting.
+                            Ok(_) => {
+                                notify.notify_waiters();
+                            }
+                            Err(e) => {
+                                eprintln!("edge-cli freeze: SIGUSR1 pipe read failed: {e}");
+                                break;
+                            }
+                        }
+                    }
+                    // SAFETY: close write_fd on the way out so the
+                    // reader hits EOF and exits. The handler is still
+                    // installed but fd == -1 short-circuits; if a stray
+                    // SIGUSR1 arrives after this, it's a no-op.
+                    unsafe {
+                        libc::close(write_fd);
+                    }
+                });
+            }));
+            if let Err(e) = result {
+                eprintln!("edge-cli freeze: SIGUSR1 listener thread panicked: {e:?}");
+            }
+        })
+        .map_err(|e| CliError::Args(format!("freeze: SIGUSR1 listener spawn failed: {e}")))?;
+    Ok(())
 }
 
 #[cfg(test)]

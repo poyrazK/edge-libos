@@ -7,9 +7,10 @@ use std::time::Duration;
 use chrono::Utc;
 use wasmtime::Caller;
 
-use crate::errno::EINVAL;
+use crate::errno::{EINTR, EINVAL};
 use crate::kernel::Kernel;
 use crate::mem;
+use crate::sys::signal::{handle_signal_arm, signal_wake_for, SignalOutcome};
 
 pub const NR_CLOCK_GETTIME: u32 = 228;
 pub const NR_GETTIMEOFDAY: u32 = 96;
@@ -178,11 +179,36 @@ pub async fn clock_nanosleep(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i6
             return 0;
         }
         let wait_ns = (req_total_ns - cur_total_ns) as u64;
-        tokio::time::sleep(Duration::from_nanos(wait_ns)).await;
+
+        // ADR 0007 §5: race the sleep against the per-tid signal wake.
+        let signal_wake = signal_wake_for(caller.data());
+        let mut signal_outcome = SignalOutcome::None;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_nanos(wait_ns)) => {}
+            _ = signal_wake.notified() => {
+                signal_outcome = handle_signal_arm(caller.data_mut());
+            }
+        }
+        if signal_outcome == SignalOutcome::Interrupted {
+            return -EINTR;
+        }
         0
     } else {
         let dur = Duration::from_nanos((sec as u64).saturating_mul(1_000_000_000) + nsec as u64);
-        tokio::time::sleep(dur).await;
+
+        // ADR 0007 §5: race the sleep against the per-tid signal wake.
+        let signal_wake = signal_wake_for(caller.data());
+        let mut signal_outcome = SignalOutcome::None;
+        tokio::select! {
+            _ = tokio::time::sleep(dur) => {}
+            _ = signal_wake.notified() => {
+                signal_outcome = handle_signal_arm(caller.data_mut());
+            }
+        }
+        if signal_outcome == SignalOutcome::Interrupted {
+            return -EINTR;
+        }
+
         if rem != 0 {
             let bytes = match mem::guest_slice_mut(caller, rem, TIMESPEC_SIZE) {
                 Ok(b) => b,
@@ -220,7 +246,8 @@ pub async fn gettimeofday(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
 
 /// `nanosleep(req *, rem *)`. Reads 16 bytes from `*req`, sleeps for that
 /// duration, writes the unslept remainder to `*rem` (we always write 0
-/// since we don't get interrupted). Returns 0 on success.
+/// since we don't get interrupted). Returns 0 on success, -EINTR if a
+/// signal was delivered (ADR 0007 §5).
 pub async fn nanosleep(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
     let req = a[0];
     let rem = a[1];
@@ -234,7 +261,19 @@ pub async fn nanosleep(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         return -EINVAL;
     }
     let dur = Duration::from_nanos((sec as u64).saturating_mul(1_000_000_000) + nsec as u64);
-    tokio::time::sleep(dur).await;
+
+    // ADR 0007 §5: race the sleep against the per-tid signal wake.
+    let signal_wake = signal_wake_for(caller.data());
+    let mut signal_outcome = SignalOutcome::None;
+    tokio::select! {
+        _ = tokio::time::sleep(dur) => {}
+        _ = signal_wake.notified() => {
+            signal_outcome = handle_signal_arm(caller.data_mut());
+        }
+    }
+    if signal_outcome == SignalOutcome::Interrupted {
+        return -EINTR;
+    }
 
     // Write the "unslept remainder" if rem != NULL.
     if rem != 0 {

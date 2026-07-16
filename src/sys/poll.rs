@@ -22,10 +22,11 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 use wasmtime::Caller;
 
-use crate::errno::EINVAL;
+use crate::errno::{EINTR, EINVAL};
 use crate::fd::{FdTable, Resource, SockAddr};
 use crate::kernel::Kernel;
 use crate::mem;
+use crate::sys::signal::{handle_signal_arm, signal_wake_for, SignalOutcome};
 
 // Linux x86-64 syscall NR.
 pub const NR_POLL: u32 = 7;
@@ -131,6 +132,10 @@ pub async fn poll(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         None
     };
 
+    // Per-tid signal wake — hoisted so every select! arm races it
+    // (ADR 0007 §5). Cloned once, then dropped at function return.
+    let signal_wake = signal_wake_for(caller.data());
+
     loop {
         // Snapshot readiness now.
         let readiness: Vec<i16> = {
@@ -148,9 +153,11 @@ pub async fn poll(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         if timeout_ms == 0 {
             return write_revents(caller, fds_ptr, &readiness);
         }
-        // Build the select! over wakes + (optional) timer.
+        // Build the select! over wakes + (optional) timer + signal arm.
         if let Some(dl) = deadline {
             let timeout_fut = tokio::time::sleep_until(dl);
+            #[allow(unused_assignments)]
+            let mut signal_outcome = SignalOutcome::None;
             tokio::select! {
                 biased;
                 _ = timeout_fut => {
@@ -168,10 +175,28 @@ pub async fn poll(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
                     // A wake fired; loop and re-check.
                     continue;
                 }
+                _ = signal_wake.notified() => {
+                    signal_outcome = handle_signal_arm(caller.data_mut());
+                }
             }
+            if signal_outcome == SignalOutcome::Interrupted {
+                return -EINTR;
+            }
+            // Spurious / Ignore signal — loop and re-check.
+            continue;
         } else {
-            // No timeout → wait indefinitely on any wake.
-            wait_any(&wakes).await;
+            // No timeout → wait indefinitely on any wake or signal.
+            let mut signal_outcome = SignalOutcome::None;
+            tokio::select! {
+                biased;
+                _ = wait_any(&wakes) => {}
+                _ = signal_wake.notified() => {
+                    signal_outcome = handle_signal_arm(caller.data_mut());
+                }
+            }
+            if signal_outcome == SignalOutcome::Interrupted {
+                return -EINTR;
+            }
             continue;
         }
     }

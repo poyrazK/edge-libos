@@ -7,7 +7,7 @@
 //! Step 4 of the P0 build order fleshes this out; the skeleton here is what
 //! the dispatch table needs to compile.
 
-use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::time::Instant;
 
 use std::collections::{HashMap, HashSet};
@@ -93,6 +93,25 @@ pub struct ProcessState {
     /// process. All threads in the same process share the same
     /// tgid; the init kernel has `tgid = 1`.
     pub tgid: i32,
+    /// Signal-delivery (ADR 0007): per-tid wake handles. When a
+    /// thread parks in a blocking syscall it clones its tid's
+    /// `Arc<Notify>` out (lazy-created here) and adds it as a
+    /// `select!` arm; `kill` / `tgkill` fire it after enqueuing the
+    /// signal so the parked syscall re-checks `deliverable()` and
+    /// returns `-EINTR`. Per-process scope is required because the
+    /// signal *sender* runs on a different fiber than the target
+    /// and cannot reach the target's `Kernel`. Runtime-only; never
+    /// serialized (like `child_event`).
+    pub signal_wakes: parking_lot::Mutex<HashMap<i32, Arc<Notify>>>,
+    /// Signal-delivery (ADR 0007): host-driven freeze quiescence.
+    /// `None` for a normal `run`; `edge-cli freeze` installs an
+    /// `Arc<Notify>` here and fires it from a `SIGUSR1` listener.
+    /// Blocking syscalls race it as an extra `select!` arm *only*
+    /// when `Some`, and on that wake continue normally (NOT
+    /// `-EINTR`) — the guest is left at a well-defined in-syscall
+    /// quiescent point for the snapshot. Runtime-only; never
+    /// serialized.
+    pub quiesce_notify: Option<Arc<Notify>>,
     /// P2-DNS (ADR 0007): per-process resolver state. Cache +
     /// denylist + lazy backend are shared across all threads in the
     /// same process via this Arc, mirroring `futex_table`. Snapshot
@@ -100,6 +119,51 @@ pub struct ProcessState {
     /// `ResolverState::default()` on restore; the first NR_RESOLVE
     /// call after `serve` rebuilds the backend.
     pub resolver: parking_lot::Mutex<ResolverState>,
+}
+
+impl ProcessState {
+    /// Signal-delivery (ADR 0007 §3): return the `Arc<Notify>` a thread
+    /// with tid `tid` parks on, creating it on first use. A blocking
+    /// syscall clones this out before `.await`ing so `kill`/`tgkill` can
+    /// wake it; the sender and the target run on different fibers, so the
+    /// handle must live on the shared `ProcessState`.
+    pub fn signal_wake_for(&self, tid: i32) -> Arc<Notify> {
+        self.signal_wakes
+            .lock()
+            .entry(tid)
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone()
+    }
+
+    /// Signal-delivery (ADR 0007 §3): wake the thread with tid `tid` (if
+    /// it has ever parked). Mirrors the `reap_all_children`
+    /// clone-then-drop-then-notify discipline — the `Arc<Notify>` is
+    /// cloned out under the lock, the guard dropped, then
+    /// `notify_one()` fires outside the lock (ADR 0001 §2). We
+    /// use `notify_one()` instead of `notify_waiters()` because the
+    /// sender (kill/tgkill) and the target (a blocking syscall's
+    /// select! arm) often race — kill may fire before the target
+    /// has registered its `.notified()` future. `notify_one()`
+    /// stores a permit the *next* `notified()` poll consumes; that
+    /// matches the pre-armed-signal test pattern (kill, then
+    /// nanosleep).
+    ///
+    /// Lazy create: if no Notify exists for `tid` yet (i.e., the
+    /// target hasn't parked in any blocking syscall), we create
+    /// one. Without this, the very first kill before any blocking
+    /// syscall would have nothing to fire on, and the wake would
+    /// be lost. The created Notify is never garbage-collected
+    /// (small constant cost — one Arc per tid that ever had a
+    /// signal delivered) which is acceptable.
+    pub fn wake_signal(&self, tid: i32) {
+        let notify = self
+            .signal_wakes
+            .lock()
+            .entry(tid)
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone();
+        notify.notify_one();
+    }
 }
 
 pub struct Kernel {
@@ -129,6 +193,15 @@ pub struct Kernel {
     /// Set by exit() / exit_group() syscalls. The host driver inspects this
     /// after each call returns and surfaces the code in its own exit code.
     pub exit_code: Option<i32>,
+    /// Signal-delivery (ADR 0007): set to `true` when a
+    /// default-terminating signal is delivered. `dispatch()` checks
+    /// it at the top and short-circuits every subsequent syscall to
+    /// `0`, so the guest's libc unwinds and the run path surfaces
+    /// `exit_code` (`128 + signo`). Distinct from `exit_code`
+    /// because an explicit `exit(0)` must NOT be treated as a
+    /// signal-termination (this flag stays `false` for normal exit).
+    /// Per-thread; not serialized.
+    pub exit_requested: AtomicBool,
     /// P2-C2: prctl(PR_SET_NAME) writes here; PR_GET_NAME reads from here.
     pub comm: [u8; 16],
     /// P3 Tier-8 v2 / M3: per-thread thread id. `gettid()` reads
@@ -398,6 +471,8 @@ impl Kernel {
             signals_pending: parking_lot::Mutex::new(Vec::new()),
             tgid_registry: parking_lot::Mutex::new(HashSet::from([1])),
             tgid: 1,
+            signal_wakes: parking_lot::Mutex::new(HashMap::new()),
+            quiesce_notify: None,
             resolver: parking_lot::Mutex::new(ResolverState::default()),
         });
 
@@ -417,6 +492,7 @@ impl Kernel {
             signals: SignalState::new(),
             started_at: now,
             exit_code: None,
+            exit_requested: AtomicBool::new(false),
             comm: [0; 16],
             tid: 1,
             tgid: 1,
@@ -469,6 +545,7 @@ impl Kernel {
             signals: SignalState::new(),
             started_at: now,
             exit_code: None,
+            exit_requested: AtomicBool::new(false),
             comm: [0; 16],
             tid,
             tgid,

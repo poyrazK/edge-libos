@@ -234,6 +234,289 @@ fn sigprocmask_rejects_invalid_how() -> Result<()> {
     Ok(())
 }
 
+/// ADR 0007 §5 — `epoll_wait` with no fds and a long timeout should
+/// return `-EINTR` when a signal is delivered between the time the
+/// blocking point is entered and the call returns. We pre-arm both
+/// `signals_pending` and the per-tid `Notify` (mirroring what `kill`
+/// does in Commit 2), then drive `epoll_wait` from the wasm. The
+/// `Notify::notify_waiters()` permits a subsequent `notified()`
+/// poll to complete immediately, so the signal arm wins the race.
+#[test]
+fn epoll_wait_empty_returns_eintr_when_signal_pre_armed() -> Result<()> {
+    block_on(async {
+        let (engine, linker) = common::engine_and_linker()?;
+        let module = common::compile_wat(&engine, EPOLL_WAIT_TIMEOUT_WAT)?;
+        let (mut store, instance) = common::instantiate_async(&engine, &linker, &module).await?;
+
+        // Pre-arm: install a pending SIGUSR1 for our tid AND fire the
+        // wake primitive so the wasm-side select! arm wins immediately.
+        // `notify_one()` stores a permit consumed by the next
+        // `notified()` poll; `notify_waiters()` only wakes CURRENT
+        // waiters, so it would be lost before epoll_wait enters select!.
+        let tid = store.data().tid;
+        store
+            .data()
+            .process_state
+            .signals_pending
+            .lock()
+            .push(10 /* SIGUSR1 */);
+        store.data().process_state.signal_wake_for(tid).notify_one();
+
+        let f = instance.get_typed_func::<(), i64>(&mut store, "epoll_wait_long")?;
+        let ret = f.call_async(&mut store, ()).await?;
+        // SIGUSR1 has default terminate but our helper is a stub
+        // (Commit 8 wires the actual exit_code). For now Interrupt
+        // path applies (SIGUSR1 default-terminate is what we want —
+        // but Terminate short-circuits to -EINTR via the same code
+        // path). The result is either -EINTR (Interrupt OR Terminate
+        // via stub helper) or the signal dropped by another path.
+        assert_eq!(
+            ret,
+            -edge_libos::errno::EINTR,
+            "epoll_wait must return -EINTR when SIGUSR1 is pending"
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+}
+
+/// ADR 0007 §5 — `poll` with a long timeout should return `-EINTR`
+/// when a signal is delivered. Same pre-arm + notify_one pattern as
+/// the epoll_wait test (C3).
+#[test]
+fn poll_long_timeout_returns_eintr_when_signal_pre_armed() -> Result<()> {
+    block_on(async {
+        let (engine, linker) = common::engine_and_linker()?;
+        let module = common::compile_wat(&engine, POLL_LONG_WAT)?;
+        let (mut store, instance) = common::instantiate_async(&engine, &linker, &module).await?;
+
+        // Pre-arm: SIGUSR1 + notify_one (consumed by next notified()).
+        let tid = store.data().tid;
+        store
+            .data()
+            .process_state
+            .signals_pending
+            .lock()
+            .push(10 /* SIGUSR1 */);
+        store.data().process_state.signal_wake_for(tid).notify_one();
+
+        let f = instance.get_typed_func::<(), i64>(&mut store, "poll_long")?;
+        let ret = f.call_async(&mut store, ()).await?;
+        assert_eq!(
+            ret,
+            -edge_libos::errno::EINTR,
+            "poll must return -EINTR when SIGUSR1 is pending"
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+}
+
+const POLL_LONG_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "poll_long") (result i64)
+        ;; pipe2(out @ 4096) → returns 0; out[0..4] = read_fd, out[4..8] = write_fd.
+        (drop
+          (call $syscall
+            (i64.const 293) (i64.const 4096) (i64.const 0)
+            (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+        ;; pollfd @ 8192: fd = read_fd (4 bytes at 4096), events = POLLIN.
+        (i32.store (i32.const 8192) (i32.load (i32.const 4096)))
+        (i32.store (i32.const 8196) (i32.const 1))
+        (i32.store (i32.const 8200) (i32.const 0))
+        ;; Close the write end (read end has nothing → block in poll).
+        (drop
+          (call $syscall
+            (i64.const 3) ;; NR_CLOSE
+            (i64.extend_i32_u (i32.load (i32.const 4100)))
+            (i64.const 0) (i64.const 0) (i64.const 0)
+            (i64.const 0) (i64.const 0)))
+        ;; poll(fds@8192, 1, 2000ms) — must park; signal arm returns -EINTR.
+        (call $syscall
+          (i64.const 7)
+          (i64.const 8192)
+          (i64.const 1)
+          (i64.const 2000)
+          (i64.const 0)
+          (i64.const 0)
+          (i64.const 0))))
+"#;
+
+/// ADR 0007 §5 — `futex(FUTEX_WAIT)` with no wake must return `-EINTR`
+/// when a signal is delivered. Pre-arm + notify_one pattern.
+#[test]
+fn futex_wait_returns_eintr_when_signal_pre_armed() -> Result<()> {
+    block_on(async {
+        let (engine, linker) = common::engine_and_linker()?;
+        let module = common::compile_wat(&engine, FUTEX_WAIT_LONG_WAT)?;
+        let (mut store, instance) = common::instantiate_async(&engine, &linker, &module).await?;
+
+        let tid = store.data().tid;
+        store
+            .data()
+            .process_state
+            .signals_pending
+            .lock()
+            .push(10 /* SIGUSR1 */);
+        store.data().process_state.signal_wake_for(tid).notify_one();
+
+        let f = instance.get_typed_func::<(), i64>(&mut store, "futex_wait_long")?;
+        let ret = f.call_async(&mut store, ()).await?;
+        assert_eq!(
+            ret,
+            -edge_libos::errno::EINTR,
+            "futex_wait must return -EINTR when SIGUSR1 is pending"
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+}
+
+const FUTEX_WAIT_LONG_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "futex_wait_long") (result i64)
+        ;; futex(0x1000, FUTEX_WAIT=0, val=0, NULL, NULL, NULL) — parks
+        ;; on *0x1000 == 0 until a FUTEX_WAKE or signal. *0x1000 is 0,
+        ;; so the value check passes and we enter the wait.
+        (call $syscall
+          (i64.const 202) ;; NR_FUTEX
+          (i64.const 4096)
+          (i64.const 0) ;; FUTEX_WAIT
+          (i64.const 0) ;; val
+          (i64.const 0) ;; timeout_ptr (NULL → no timeout)
+          (i64.const 0) (i64.const 0))))
+"#;
+
+const EPOLL_WAIT_TIMEOUT_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "epoll_wait_long") (result i64)
+        ;; epoll_create1(0) → epfd (returned as i64, written as i32 at offset 0).
+        (i32.store (i32.const 0)
+          (i32.wrap_i64
+            (call $syscall
+              (i64.const 291) ;; NR_EPOLL_CREATE1
+              (i64.const 0) (i64.const 0) (i64.const 0)
+              (i64.const 0) (i64.const 0) (i64.const 0))))
+        ;; epoll_wait(epfd, events@4096, 1, 2000ms) — empty entries,
+        ;; hits the new signal-arm branch.
+        (call $syscall
+          (i64.const 232) ;; NR_EPOLL_WAIT
+          (i64.extend_i32_u (i32.load (i32.const 0)))
+          (i64.const 4096)
+          (i64.const 1)
+          (i64.const 2000)
+          (i64.const 0) (i64.const 0))))
+"#;
+
+/// ADR 0007 §5 — `nanosleep(req)` with a long duration must return
+/// `-EINTR` when a signal is delivered mid-sleep. Pre-arm + notify_one.
+#[test]
+fn nanosleep_returns_eintr_when_signal_pre_armed() -> Result<()> {
+    block_on(async {
+        let (engine, linker) = common::engine_and_linker()?;
+        let module = common::compile_wat(&engine, NANOSLEEP_LONG_WAT)?;
+        let (mut store, instance) = common::instantiate_async(&engine, &linker, &module).await?;
+
+        let tid = store.data().tid;
+        store
+            .data()
+            .process_state
+            .signals_pending
+            .lock()
+            .push(10 /* SIGUSR1 */);
+        store.data().process_state.signal_wake_for(tid).notify_one();
+
+        let f = instance.get_typed_func::<(), i64>(&mut store, "nanosleep_long")?;
+        let ret = f.call_async(&mut store, ()).await?;
+        assert_eq!(
+            ret,
+            -edge_libos::errno::EINTR,
+            "nanosleep must return -EINTR when SIGUSR1 is pending"
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+}
+
+const NANOSLEEP_LONG_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "nanosleep_long") (result i64)
+        ;; req @ 4096: tv_sec = 2, tv_nsec = 0 → 2s sleep.
+        (i64.store (i32.const 4096) (i64.const 2))
+        (i64.store (i32.const 4104) (i64.const 0))
+        (call $syscall
+          (i64.const 35)
+          (i64.const 4096)
+          (i64.const 0)
+          (i64.const 0)
+          (i64.const 0)
+          (i64.const 0)
+          (i64.const 0))))
+"#;
+
+/// ADR 0007 §5 — `wait4(-1, ..., 0)` blocked in any-pid parking must
+/// return `-EINTR` when a signal is delivered. Pre-arm + notify_one.
+#[test]
+fn wait4_any_pid_returns_eintr_when_signal_pre_armed() -> Result<()> {
+    block_on(async {
+        let (engine, linker) = common::engine_and_linker()?;
+        let module = common::compile_wat(&engine, WAIT4_ANY_PID_WAT)?;
+        let (mut store, instance) = common::instantiate_async(&engine, &linker, &module).await?;
+
+        // Seed a fake UN-exited child so wait4 enters the parking path
+        // (it has at least one child, so ECHILD fast path is bypassed,
+        // and try_reap returns None until we re-arm `exited = true`).
+        let child_pid: i32 = 9999;
+        {
+            let mut children = store.data().process_state.children.lock();
+            children.insert(child_pid, edge_libos::kernel::ChildExitStatus::new(0));
+        }
+
+        let tid = store.data().tid;
+        store
+            .data()
+            .process_state
+            .signals_pending
+            .lock()
+            .push(10 /* SIGUSR1 */);
+        store.data().process_state.signal_wake_for(tid).notify_one();
+
+        let f = instance.get_typed_func::<(), i64>(&mut store, "wait4_any_pid")?;
+        let ret = f.call_async(&mut store, ()).await?;
+        assert_eq!(
+            ret,
+            -edge_libos::errno::EINTR,
+            "wait4 must return -EINTR when SIGUSR1 is pending"
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+}
+
+const WAIT4_ANY_PID_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "wait4_any_pid") (result i64)
+        ;; wait4(-1, NULL, 0, NULL) — any-pid blocking park.
+        (call $syscall
+          (i64.const 61) ;; NR_WAIT4
+          (i64.const -1)
+          (i64.const 0)
+          (i64.const 0)
+          (i64.const 0)
+          (i64.const 0)
+          (i64.const 0))))
+"#;
+
 #[test]
 fn nr_constants_match_linux_x86_64() {
     assert_eq!(edge_libos::sys::signal::NR_RT_SIGACTION, 13);

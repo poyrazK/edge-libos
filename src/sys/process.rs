@@ -514,16 +514,24 @@ pub async fn wait4_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 
             None
         };
 
+        // ADR 0007 §5: race the child-exit wake against the per-tid
+        // signal wake so a delivered signal returns -EINTR.
+        let signal_wake = crate::sys::signal::signal_wake_for(caller.data());
+        let mut signal_outcome = crate::sys::signal::SignalOutcome::None;
+
         if let Some(specific) = specific_notify {
             // Specific-pid parked path: clone the per-child
             // `Arc<Notify>` out of the children map (already done
-            // above), drop the lock, then `notified().await`. The
-            // exit-side `reap_all_children` fires
-            // `notify.notify_waiters()` after dropping the children
-            // lock, so the wake itself does not happen under the
-            // lock. Per ADR 0001 §2 — never hold `Mutex` across
-            // `.await`.
-            specific.notified().await;
+            // above), drop the lock, then race against signal arm.
+            tokio::select! {
+                _ = specific.notified() => {}
+                _ = signal_wake.notified() => {
+                    signal_outcome = crate::sys::signal::handle_signal_arm(caller.data_mut());
+                }
+            }
+            if signal_outcome == crate::sys::signal::SignalOutcome::Interrupted {
+                return -crate::errno::EINTR;
+            }
             // Re-try the synchronous reap (the child may have
             // exited AND been reaped already; we still try).
             if let Some((picked, exit_code)) = try_reap(caller, pid) {
@@ -534,10 +542,17 @@ pub async fn wait4_syscall(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 
             // waiter; the next iteration's ECHILD check at the
             // top of the function handles that.)
         } else {
-            // Any-pid parked path: block on child_event.notified().
-            // The exit-side fires `child_event.notify_waiters()`
-            // when any child is reaped.
-            child_event.notified().await;
+            // Any-pid parked path: block on child_event.notified(),
+            // raced against the signal arm.
+            tokio::select! {
+                _ = child_event.notified() => {}
+                _ = signal_wake.notified() => {
+                    signal_outcome = crate::sys::signal::handle_signal_arm(caller.data_mut());
+                }
+            }
+            if signal_outcome == crate::sys::signal::SignalOutcome::Interrupted {
+                return -crate::errno::EINTR;
+            }
             // Re-try the synchronous reap.
             if let Some((picked, exit_code)) = try_reap(caller, pid) {
                 return write_wstatus_and_return(caller, picked, exit_code, wstatus_ptr);
@@ -732,7 +747,11 @@ pub async fn kill(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         // pid == -1
         return -EINVAL;
     }
-    // Append to the recorded-only queue (v2.5 delivery).
+    // Append to the pending queue, then wake every parked thread in
+    // this tgid so its blocking syscall re-checks `deliverable()`
+    // (ADR 0007 §3). Snapshot the tid list under the registry lock,
+    // drop it, then fire wakes outside the lock (ADR 0001 §2).
+    let tids: Vec<i32> = registry.iter().copied().collect();
     drop(registry);
     caller
         .data()
@@ -740,6 +759,9 @@ pub async fn kill(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         .signals_pending
         .lock()
         .push(sig as i32);
+    for tid in tids {
+        caller.data().process_state.wake_signal(tid);
+    }
     0
 }
 
@@ -789,6 +811,8 @@ pub async fn tgkill(caller: &mut Caller<'_, Kernel>, a: [i64; 6]) -> i64 {
         .signals_pending
         .lock()
         .push(sig as i32);
+    // Wake the specific target thread (ADR 0007 §3).
+    caller.data().process_state.wake_signal(tid as i32);
     0
 }
 
