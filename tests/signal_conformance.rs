@@ -462,6 +462,61 @@ const NANOSLEEP_LONG_WAT: &str = r#"
           (i64.const 0))))
 "#;
 
+/// ADR 0007 §5 — `wait4(-1, ..., 0)` blocked in any-pid parking must
+/// return `-EINTR` when a signal is delivered. Pre-arm + notify_one.
+#[test]
+fn wait4_any_pid_returns_eintr_when_signal_pre_armed() -> Result<()> {
+    block_on(async {
+        let (engine, linker) = common::engine_and_linker()?;
+        let module = common::compile_wat(&engine, WAIT4_ANY_PID_WAT)?;
+        let (mut store, instance) = common::instantiate_async(&engine, &linker, &module).await?;
+
+        // Seed a fake UN-exited child so wait4 enters the parking path
+        // (it has at least one child, so ECHILD fast path is bypassed,
+        // and try_reap returns None until we re-arm `exited = true`).
+        let child_pid: i32 = 9999;
+        {
+            let mut children = store.data().process_state.children.lock();
+            children.insert(child_pid, edge_libos::kernel::ChildExitStatus::new(0));
+        }
+
+        let tid = store.data().tid;
+        store
+            .data()
+            .process_state
+            .signals_pending
+            .lock()
+            .push(10 /* SIGUSR1 */);
+        store.data().process_state.signal_wake_for(tid).notify_one();
+
+        let f = instance.get_typed_func::<(), i64>(&mut store, "wait4_any_pid")?;
+        let ret = f.call_async(&mut store, ()).await?;
+        assert_eq!(
+            ret,
+            -edge_libos::errno::EINTR,
+            "wait4 must return -EINTR when SIGUSR1 is pending"
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+}
+
+const WAIT4_ANY_PID_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "wait4_any_pid") (result i64)
+        ;; wait4(-1, NULL, 0, NULL) — any-pid blocking park.
+        (call $syscall
+          (i64.const 61) ;; NR_WAIT4
+          (i64.const -1)
+          (i64.const 0)
+          (i64.const 0)
+          (i64.const 0)
+          (i64.const 0)
+          (i64.const 0))))
+"#;
+
 #[test]
 fn nr_constants_match_linux_x86_64() {
     assert_eq!(edge_libos::sys::signal::NR_RT_SIGACTION, 13);
