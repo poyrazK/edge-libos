@@ -274,6 +274,22 @@ pub struct SocketInner {
     /// "don't re-bind" branch. Default `false` for
     /// kernel-built sockets.
     pub inherited: bool,
+    /// P3-T9 (ADR 0008): UDP host-side state. `Some(_)` for any
+    /// `SOCK_DGRAM` socket (AF_INET, AF_INET6). `None` for TCP /
+    /// AF_UNIX / freshly-created pre-bind DGRAM fds (the state
+    /// materializes lazily on the first `bind`/`sendto`/`recvfrom`).
+    /// Holds the host `tokio::net::UdpSocket` Arc, the bounded
+    /// recv queue, and the `Arc<Notify>` machinery that wakes
+    /// poll/epoll (C5).
+    pub udp: Option<crate::sys::udp::UdpSocketState>,
+    /// P3-T9 (ADR 0008): this socket was created with `AF_INET6`.
+    /// Recorded at `socket(AF_INET6, ...)` time so the bind path
+    /// can branch on family without re-parsing `bound`.
+    pub family_v6: bool,
+    /// P3-T9 (ADR 0008): `IPV6_V6ONLY` requested via `setsockopt`
+    /// (only meaningful for AF_INET6 + SOCK_DGRAM). Surfaced at
+    /// bind time to `socket2`.
+    pub ipv6_v6only: bool,
 }
 
 impl SocketInner {
@@ -301,6 +317,9 @@ impl SocketInner {
             peer_addr_unix: None,
             dgram_unix: None,
             inherited: false,
+            udp: None,
+            family_v6: false,
+            ipv6_v6only: false,
         }
     }
 
