@@ -230,7 +230,7 @@ async fn run_guest(
     Ok((entries, marker))
 }
 
-/// Read the pass/fail marker that C conformance tests write at
+/// Read the pass/fail/skip marker that C conformance tests write at
 /// `MARKER_ADDR` (offset 4096) before the final `_start` return.
 ///
 /// Returns the marker text. Empty string means "no marker written".
@@ -241,6 +241,7 @@ async fn run_guest(
 /// NOT walk the buffer until the first NUL; we read the literal prefix:
 ///   - bytes 0..4 == b"PASS"         → "PASS"
 ///   - bytes 0..5 == b"FAIL:"        → "FAIL:\<reason up to first NUL>"
+///   - bytes 0..5 == b"SKIP:"        → "SKIP:\<reason up to first NUL>"
 ///   - anything else                 → "" (no marker)
 fn read_marker(store: &Store<Kernel>) -> String {
     let mem = match store.data().memory() {
@@ -262,6 +263,15 @@ fn read_marker(store: &Store<Kernel>) -> String {
             .unwrap_or(buf.len());
         let reason_bytes = &buf[5..end];
         return format!("FAIL:{}", String::from_utf8_lossy(reason_bytes));
+    }
+    if &buf[0..5] == b"SKIP:" {
+        let end = buf[5..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|p| p + 5)
+            .unwrap_or(buf.len());
+        let reason_bytes = &buf[5..end];
+        return format!("SKIP:{}", String::from_utf8_lossy(reason_bytes));
     }
     String::new()
 }
