@@ -332,16 +332,19 @@ the last true production blocker.
 
 1. There is no Linux `getaddrinfo` syscall at any NR; musl implements
    it in libc over UDP `socket`/`sendto`/`recvmsg`/`poll`.
-2. The kernel has **no UDP layer at all** — `SocketKind::Datagram`
-   exists as an enum tag, but `sendto`/`recvfrom` are TCP-only.
-   Adding UDP is a separate, larger workstream.
+2. The kernel had **no UDP layer at all** — `SocketKind::Datagram`
+   exists as an enum tag, but `sendto`/`recvfrom` were TCP-only. The
+   Path A UDP socket layer (ADR 0008) is now landing in 8 commits
+   C0..C8; C0+C1+C2 are in (`f2b4346`/`a307df0`/`fb707ab`, draft PR
+   #33), and the rest of the path is **weeks** (pump task, snapshot,
+   /etc shim, native-musl switch), not months.
 3. wasm32-musl `EAI_*` are **negative** (`EAI_NONAME = -2`); wasm32
    `struct addrinfo` is **32 bytes** (4-byte pointers), not 48.
 
-Path A (real UDP + musl) is **months**; Path C (guest-side re-impl)
-hits the wasm32-musl `--disable-threads --without-threads
---disable-ipv6 --disable-ssl` wall. Path B (chosen) is a project-
-private `NR_RESOLVE` syscall + a tiny musl-override guest adapter.
+Path A is the long-term plan; Path B (current) is a project-private
+`NR_RESOLVE` syscall + a tiny musl-override guest adapter. Both can
+coexist: `EDGE_RESOLVE_BACKEND` knob (`hickory` default, `musl`,
+`auto`) gates which path a guest sees at link time.
 
 ### What landed
 
@@ -451,7 +454,8 @@ Accepted. Pins:
 
 ### Deferred (out of scope for v1)
 
-- **UDP socket layer in kernel** (Path A) — separate, larger workstream.
+- **UDP socket layer in kernel** (Path A) — landing now; see
+  "Path A — UDP socket layer (ADR 0008)" below.
 - **`AI_NUMERICHOST` / `AI_NUMERICSERV` hint flags** → `-EAI_BADFLAGS`
   (musl handles in libc anyway).
 - **`getservbyname()`** — v1 numeric-only service strings.
@@ -460,6 +464,88 @@ Accepted. Pins:
 - **Snapshot persistence of denylist config** — operator re-issues env
   vars on `serve`.
 - **`AI_CANONNAME` population** — v1 leaves `ai_canonname = 0`.
+
+## Path A — UDP socket layer (ADR 0008)
+
+The follow-up to ADR 0007's "Path A — UDP socket layer (deferred)" note.
+musl implements `getaddrinfo(3)` over real UDP `socket`/`sendto`/`recvmsg`/
+`poll`, so once the kernel has a UDP layer, the existing `NR_RESOLVE`
+(ADR 0007) becomes a fast path and musl's path becomes the canonical
+DNS path.
+
+### Status
+
+8-commit plan C0..C8. C0+C1+C2 are committed on `worktree-p3-udp-socket-layer`
+(tip `fb707ab`, draft PR #33):
+
+- **C0** — ADR 0008 stub + `UdpSocketState` skeleton + `SocketInner.udp`
+  field (`f2b4346`).
+- **C1** — UDP bind via `socket2` (SO_REUSEADDR + IPV6_V6ONLY pre-bind);
+  `getsockname` V6 writeback; 7 Rust sibling tests (`a307df0`).
+- **C2** — UDP `sendto` / `recvfrom` data path (lock→clone Arc→drop guard→
+  await, per ADR 0001 §2 / 0006 §4); ECONNRESET errno; canonical loopback
+  round-trip in Rust + C; 4 new Rust tests + 1 new C test (`fb707ab`).
+
+C3..C8 follow: sendmsg/recvmsg, connect + names + sockopts, poll/epoll
+pump task, virtual /etc + `--preopen` + native-musl switch, snapshot
+apply path, ADR finalize + HANDOFF regen + full DoD.
+
+### Test totals (C2 close)
+
+| Source | Pre-C2 → Post-C2 |
+|---|---|
+| Rust unit (`#[cfg(test)]` in `src/**`) | 188 → **194** (+6) |
+| Rust integration (`tests/*.rs`) | 222 → **237** (+15) |
+| C conformance (`tests/conformance/*.c`) | 108 → **109** (+1) |
+| **Grand total** | **518 → 540** |
+
+Net Rust new tests:
+- `src/sys/udp.rs::tests`: **6** unit tests (`enqueue_returns_true_when_was_empty`,
+  `dequeue_is_fifo`, `queue_overflow_drops_oldest`, `pump_cancel_is_idempotent`,
+  `shutdown_flags_default_zero`, `default_has_no_socket_no_queue`).
+- `tests/udp_conformance.rs`: **+15** integration tests across C0/C1/C2
+  (`socket_inet_dgram_*`, `udp_socket_open_then_close`, `bind_*`,
+  `sendto_*`, `sendto_then_recvfrom_roundtrips_over_loopback`).
+
+### Architectural decisions (Path A)
+
+#### ADR 0008 — UDP socket layer
+
+Proposed (finalized in C8). Pins:
+
+- **`UdpSocketState`** lives on `SocketInner.udp: Option<…>`. Holds
+  `Arc<tokio::net::UdpSocket>` + `Arc<Mutex<VecDeque<Datagram>>>` +
+  `Arc<Notify>` (read) + `Arc<Notify>` (write) + `bound_addr` +
+  `peer_addr` + `family` + `shutdown_flags` + `pump_handle` +
+  `pump_cancel: Arc<AtomicBool>`. Mirrors `pub stream: Option<TcpStream>`
+  on `SocketInner`.
+- **V6 dual-stack** — V4-only build keeps `family_v6: bool` style;
+  `socket2` sets `IPV6_V6ONLY=1` (Linux default) before bind when the
+  guest requested AF_INET6.
+- **`/etc` virtual shim** — lands in C6. `src/sys/vfs_etc.rs` synthesizes
+  `/etc/resolv.conf` from `EDGE_DNS_SERVERS` (default `[1.1.1.1, 8.8.8.8]`)
+  and `/etc/hosts` from `EDGE_HOSTS_ENTRIES` (default: loopback only).
+  Intercepted in `src/sys/path.rs::resolve_via_cwd_or_root` BEFORE
+  `vfs.open`.
+- **`NR_RESOLVE` fate** — stays. `EDGE_RESOLVE_BACKEND` env var
+  (`hickory` | `musl` | `auto`) gates which path a guest sees; default
+  stays `hickory` (faster, deterministic). Auto = hickory cache hit
+  wins, miss falls to musl UDP.
+- **Snapshot** — `SocketSnapshot` gains `udp_bound_v4/v6`, `udp_peer`,
+  `ipv6_v6only` (additive, `#[serde(default)]` per ADR 0005 precedent).
+  Apply rebuilds via `tokio::net::UdpSocket::bind` + `UdpSocket::connect`;
+  in-flight recv queue + pump task + Notify waiters dropped (documented).
+- **mDNS scope** — explicitly deferred follow-up (needs `SO_BROADCAST` +
+  multicast setsockopts).
+
+### Operational knobs
+
+- `EDGE_DNS_SERVERS` — list of nameservers for the virtual `/etc/resolv.conf`
+  (C6).
+- `EDGE_HOSTS_ENTRIES` — extra entries for the virtual `/etc/hosts` (C6).
+- `EDGE_RESOLVE_BACKEND` — `hickory` (default) | `musl` | `auto` (C6).
+- `EDGE_NATIVE_MUSL_DNS=1` — guard the resolver override at guest link
+  time so musl's own `getaddrinfo` runs over real UDP (C6).
 
 ## Repo hygiene post-merge
 
