@@ -175,6 +175,92 @@ impl UdpSocketState {
         // so it can observe the cancellation and return -EINTR or similar.
         self.notify_read.notify_waiters();
     }
+
+    // ----- C1: bind helpers -----
+
+    /// Materialize the host `UdpSocket` from `socket2` + tokio. Idempotent:
+    /// if a socket is already installed, returns the existing `Arc`.
+    ///
+    /// Pre-bind setsockopts applied here:
+    /// - `SO_REUSEADDR` (if `so_reuseaddr`)
+    /// - `IPV6_V6ONLY` (if family == V6)
+    ///
+    /// The bind call is **sync** — `tokio::net::UdpSocket::from_std`
+    /// only takes ownership; it does not `.await`. Bind itself is
+    /// `socket2::Socket::bind` which is also sync. So no parking_lot
+    /// guards need to be held across awaits on this path.
+    ///
+    /// Errors map:
+    /// - `AddrInUse` → `-EADDRINUSE`
+    /// - `AddrNotAvail` → `-EADDRNOTAVAIL`
+    /// - anything else → `-EIO`
+    pub fn ensure_bound(&self, requested: SocketAddr) -> Result<std::net::SocketAddr, i64> {
+        // Fast path: already bound.
+        if let Some(sock) = self.socket.lock().as_ref() {
+            // local_addr() is sync and always succeeds on a bound socket.
+            return sock.local_addr().map_err(|_| -crate::errno::EIO);
+        }
+
+        let domain = match self.family {
+            Family::V4 => socket2::Domain::IPV4,
+            Family::V6 => socket2::Domain::IPV6,
+        };
+        let sock_type = socket2::Type::DGRAM;
+        // protocol=0 — let the OS pick the right IPPROTO_UDP for the family.
+        let raw =
+            socket2::Socket::new(domain, sock_type, Some(socket2::Protocol::UDP)).map_err(|e| {
+                match e.kind() {
+                    std::io::ErrorKind::PermissionDenied => -crate::errno::EACCES,
+                    _ => -crate::errno::EIO,
+                }
+            })?;
+
+        // SO_REUSEADDR pre-bind (matches Linux semantics; harmless when
+        // the guest didn't ask for it).
+        if self.so_reuseaddr {
+            let _ = raw.set_reuse_address(true);
+        }
+
+        // V6-only flag — only meaningful on AF_INET6; ignored on V4.
+        if matches!(self.family, Family::V6) {
+            // IPV6_V6ONLY is the integer 26 on Linux. socket2 doesn't
+            // expose a typed setter for it; use setsockopt_int.
+            let _ = raw.set_only_v6(self.ipv6_v6only);
+        }
+
+        // Bind. Note: a V4 destination address passed to an AF_INET6
+        // socket will be mapped by the kernel to ::ffff:a.b.c.d; we
+        // accept that here and let the OS handle it (Linux does too).
+        raw.bind(&socket2::SockAddr::from(requested))
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::AddrInUse => -crate::errno::EADDRINUSE,
+                std::io::ErrorKind::AddrNotAvailable => -crate::errno::EADDRNOTAVAIL,
+                std::io::ErrorKind::PermissionDenied => -crate::errno::EACCES,
+                _ => -crate::errno::EIO,
+            })?;
+
+        // Convert to a tokio socket. `from_std` does NOT register
+        // interest in the runtime's IO driver — it only wraps the fd.
+        // For UDP, `recv_from` lazily registers on first call (C2).
+        let std_sock: std::net::UdpSocket = raw.into();
+        std_sock
+            .set_nonblocking(true)
+            .map_err(|_| -crate::errno::EIO)?;
+        let tokio_sock =
+            tokio::net::UdpSocket::from_std(std_sock).map_err(|_| -crate::errno::EIO)?;
+        let bound_addr = tokio_sock.local_addr().map_err(|_| -crate::errno::EIO)?;
+
+        let arc = Arc::new(tokio_sock);
+        *self.socket.lock() = Some(arc);
+        *self.bound_addr.lock() = Some(bound_addr);
+        Ok(bound_addr)
+    }
+
+    /// Read the current `bound_addr`. Returns `None` until `ensure_bound`
+    /// has been called.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        *self.bound_addr.lock()
+    }
 }
 
 impl Drop for UdpSocketState {
