@@ -343,6 +343,53 @@ const POLL_LONG_WAT: &str = r#"
           (i64.const 0))))
 "#;
 
+/// ADR 0007 §5 — `futex(FUTEX_WAIT)` with no wake must return `-EINTR`
+/// when a signal is delivered. Pre-arm + notify_one pattern.
+#[test]
+fn futex_wait_returns_eintr_when_signal_pre_armed() -> Result<()> {
+    block_on(async {
+        let (engine, linker) = common::engine_and_linker()?;
+        let module = common::compile_wat(&engine, FUTEX_WAIT_LONG_WAT)?;
+        let (mut store, instance) = common::instantiate_async(&engine, &linker, &module).await?;
+
+        let tid = store.data().tid;
+        store
+            .data()
+            .process_state
+            .signals_pending
+            .lock()
+            .push(10 /* SIGUSR1 */);
+        store.data().process_state.signal_wake_for(tid).notify_one();
+
+        let f = instance.get_typed_func::<(), i64>(&mut store, "futex_wait_long")?;
+        let ret = f.call_async(&mut store, ()).await?;
+        assert_eq!(
+            ret,
+            -edge_libos::errno::EINTR,
+            "futex_wait must return -EINTR when SIGUSR1 is pending"
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+}
+
+const FUTEX_WAIT_LONG_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "futex_wait_long") (result i64)
+        ;; futex(0x1000, FUTEX_WAIT=0, val=0, NULL, NULL, NULL) — parks
+        ;; on *0x1000 == 0 until a FUTEX_WAKE or signal. *0x1000 is 0,
+        ;; so the value check passes and we enter the wait.
+        (call $syscall
+          (i64.const 202) ;; NR_FUTEX
+          (i64.const 4096)
+          (i64.const 0) ;; FUTEX_WAIT
+          (i64.const 0) ;; val
+          (i64.const 0) ;; timeout_ptr (NULL → no timeout)
+          (i64.const 0) (i64.const 0))))
+"#;
+
 const EPOLL_WAIT_TIMEOUT_WAT: &str = r#"
     (module
       (import "kernel" "syscall"

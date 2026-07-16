@@ -28,6 +28,19 @@ use wasmtime::Caller;
 use crate::errno::{EINVAL, ENOSYS};
 use crate::kernel::Kernel;
 use crate::mem;
+
+/// Why `futex_wait`'s `select!` resolved — ADR 0007 §5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WakeOutcome {
+    /// The futex notify fired (real FUTEX_WAKE from another thread /
+    /// fiber). Return 0 to the guest.
+    Futex,
+    /// The deadline elapsed. Return -ETIMEDOUT.
+    Timeout,
+    /// A signal was delivered. Return -EINTR (the dispatch pre-check
+    /// handles terminating signals).
+    Signal,
+}
 use crate::snapshot::endian::LeU32;
 
 /// Linux x86-64 NR for `futex(2)`.
@@ -216,22 +229,66 @@ async fn futex_wait(
     };
     // <- parking_lot::Mutex guard dropped here.
 
-    // Phase 3: wait. If deadline is set, use `tokio::time::timeout`;
-    // otherwise `.notified().await` unconditionally.
-    let woken = match deadline {
+    // Phase 3: wait. If deadline is set, race against `tokio::time::sleep`
+    // + signal arm; otherwise race against signal arm only. ADR 0007 §5.
+    let signal_wake = crate::sys::signal::signal_wake_for(caller.data());
+    #[allow(unused_assignments)]
+    let mut signal_outcome = crate::sys::signal::SignalOutcome::None;
+    let wake_outcome = match deadline {
         None => {
-            notify.notified().await;
-            true
-        }
-        Some(deadline) => match tokio::time::timeout(deadline, notify.notified()).await {
-            Ok(()) => true,
-            Err(_) => {
-                // Timed out. Decrement waiter count; prune if zero.
-                release_waiter(caller, uaddr);
-                return -crate::errno::ETIMEDOUT;
+            tokio::select! {
+                _ = notify.notified() => WakeOutcome::Futex,
+                _ = signal_wake.notified() => {
+                    signal_outcome = crate::sys::signal::handle_signal_arm(caller.data());
+                    if signal_outcome == crate::sys::signal::SignalOutcome::Interrupted {
+                        WakeOutcome::Signal
+                    } else {
+                        WakeOutcome::Futex // spurious — re-loop
+                    }
+                }
             }
-        },
+        }
+        Some(deadline) => {
+            let deadline_instant = tokio::time::Instant::now()
+                .checked_add(deadline)
+                .unwrap_or_else(|| {
+                    // Far-future sentinel: Instant backed by SystemTime
+                    // doesn't allow overflow, so ~year 9999 is the
+                    // safest "no real deadline" stand-in.
+                    tokio::time::Instant::now()
+                        + std::time::Duration::from_secs(60 * 60 * 24 * 365 * 100)
+                });
+            tokio::select! {
+                _ = notify.notified() => WakeOutcome::Futex,
+                _ = tokio::time::sleep_until(deadline_instant) => WakeOutcome::Timeout,
+                _ = signal_wake.notified() => {
+                    signal_outcome = crate::sys::signal::handle_signal_arm(caller.data());
+                    if signal_outcome == crate::sys::signal::SignalOutcome::Interrupted {
+                        WakeOutcome::Signal
+                    } else {
+                        WakeOutcome::Futex // spurious — re-loop
+                    }
+                }
+            }
+        }
     };
+
+    // Signal-wake path: release the waiter and return -EINTR. The
+    // dispatch pre-check (C2) handles terminating signals.
+    if wake_outcome == WakeOutcome::Signal {
+        release_waiter(caller, uaddr);
+        return -crate::errno::EINTR;
+    }
+
+    // Timeout path: release the waiter and return -ETIMEDOUT.
+    if wake_outcome == WakeOutcome::Timeout {
+        release_waiter(caller, uaddr);
+        return -crate::errno::ETIMEDOUT;
+    }
+
+    // Futex wake path: release the waiter, fall through to return 0.
+    release_waiter(caller, uaddr);
+    let woken = wake_outcome == WakeOutcome::Futex;
 
     // Phase 4: wake path. Decrement waiter count; prune if zero.
     release_waiter(caller, uaddr);
