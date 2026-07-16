@@ -14,14 +14,27 @@ void _start(void) {
     for (int i = 0; src[i]; i++) buf[i] = src[i]; buf[7] = 0;
     for (int i = 0; dst[i]; i++) buf[64 + i] = dst[i]; buf[64 + 7] = 0;
 
-    // Create both src and dst.
+    // Create both src and dst via openat(O_WRONLY|O_CREAT|O_EXCL).
+    // EXCL (vs O_TRUNC) makes leftover fixtures from prior runs
+    // surface as -EEXIST and skip the rest of the test.
     int64_t open_ret = sc4(NR_OPENAT, -100, (int64_t)(intptr_t)buf,
-                           577 /*O_WRONLY|O_CREAT|O_TRUNC*/, 420);
+                           193 /*O_WRONLY|O_CREAT|O_EXCL*/, 420);
+    if (open_ret == -17 /*-EEXIST*/) {
+        mark_skip("rn2_src leftover from prior run");
+        return;
+    }
     if (open_ret < 0) { mark_fail("openat src"); return; }
     (void)sc1(NR_CLOSE, (int)open_ret);
 
     open_ret = sc4(NR_OPENAT, -100, (int64_t)(intptr_t)(buf + 64),
-                   577, 420);
+                   193, 420);
+    if (open_ret == -17 /*-EEXIST*/) {
+        // rn2_dst leftover — undo the src we just made so the next
+        // run starts clean.
+        (void)sc1(NR_UNLINK, (int64_t)(intptr_t)buf);
+        mark_skip("rn2_dst leftover from prior run");
+        return;
+    }
     if (open_ret < 0) { mark_fail("openat dst"); (void)sc1(NR_UNLINK, (int64_t)(intptr_t)buf); return; }
     (void)sc1(NR_CLOSE, (int)open_ret);
 

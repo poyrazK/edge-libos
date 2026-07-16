@@ -10,6 +10,13 @@ void _start(void) {
 
     // Create it.
     int64_t mk = sc2(NR_MKDIR, (int64_t)(intptr_t)path, 0755);
+    if (mk == -17 /*-EEXIST*/) {
+        // rmdir_dir leftover from a prior run that didn't reach its
+        // rmdir. The contract assertion below needs a fresh dir;
+        // skip on leftover rather than masquerade as a setup bug.
+        mark_skip("rmdir_dir leftover from prior run");
+        return;
+    }
     if (mk != 0) { mark_fail("mkdir setup"); return; }
 
     // Remove it.

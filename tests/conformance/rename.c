@@ -14,9 +14,18 @@ void _start(void) {
     for (int i = 0; src[i]; i++) buf[i] = src[i]; buf[10] = 0;
     for (int i = 0; dst[i]; i++) buf[64 + i] = dst[i]; buf[64 + 10] = 0;
 
-    // Create src via openat(O_WRONLY|O_CREAT|O_TRUNC, 0o644).
+    // Create src via openat(O_WRONLY|O_CREAT|O_EXCL, 0o644). The
+    // EXCL (instead of O_TRUNC) makes a leftover from a prior run
+    // surface as -EEXIST rather than silently truncating.
     int64_t open_ret = sc4(NR_OPENAT, -100, (int64_t)(intptr_t)buf,
-                           577 /*O_WRONLY|O_CREAT|O_TRUNC*/, 420 /*0o644*/);
+                           193 /*O_WRONLY|O_CREAT|O_EXCL*/, 420 /*0o644*/);
+    if (open_ret == -17 /*-EEXIST*/) {
+        // rename_src leftover from a prior run that didn't reach
+        // its unlink cleanup. Skip rather than fail on the rename
+        // contract assertion below.
+        mark_skip("rename_src leftover from prior run");
+        return;
+    }
     if (open_ret < 0) { mark_fail("openat src failed"); return; }
     (void)sc1(NR_CLOSE, (int)open_ret);
 

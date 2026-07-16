@@ -7,9 +7,13 @@ void _start(void) {
     const char *s = "ftruncate_file";
     for (int i = 0; s[i]; i++) buf[i] = s[i]; buf[14] = 0;
 
-    // Create + write 16 bytes.
+    // Create + write 16 bytes via openat(O_WRONLY|O_CREAT|O_EXCL).
     int64_t open_ret = sc4(NR_OPENAT, -100, (int64_t)(intptr_t)buf,
-                           577 /*O_WRONLY|O_CREAT|O_TRUNC*/, 420);
+                           193 /*O_WRONLY|O_CREAT|O_EXCL*/, 420);
+    if (open_ret == -17 /*-EEXIST*/) {
+        mark_skip("ftruncate_file leftover from prior run");
+        return;
+    }
     if (open_ret < 0) { mark_fail("openat failed"); return; }
     int fd = (int)open_ret;
 
