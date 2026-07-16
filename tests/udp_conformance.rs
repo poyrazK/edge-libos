@@ -340,7 +340,97 @@ const SET_REUSEADDR_WAT: &str = r#"
     )
 "#;
 
-// Helpers (extended for bind/getsockname) ------------------------------------
+/// `sendto(fd, dst_port)` — writes 4 ASCII bytes "ping" to guest offset
+/// 4096 and calls NR_SENDTO with destination sockaddr_in at 4200
+/// (port=dst_port, addr=127.0.0.1).
+///
+/// The 16-byte sockaddr_in lives at offset 4200; the data buffer at
+/// 4096. Both are pre-populated by the harness before instantiation
+/// (port is baked into the WAT).
+const SENDTO_V4_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      ;; data buffer at 4096: "ping"
+      (data (i32.const 4096) "ping")
+      (func (export "go") (param $fd i64) (param $dst_port i64) (result i64)
+        ;; sockaddr_in at 4200:
+        ;; 4200: family = AF_INET (2)  (host byte order on Linux x86)
+        ;; 4202: port (NETWORK byte order = big-endian)
+        ;; 4204: addr = 127.0.0.1
+        ;; 4208: pad[8]
+        (i32.store8 (i32.const 4200) (i32.const 0x02))   ;; family low = 2
+        (i32.store8 (i32.const 4201) (i32.const 0x00))   ;; family high = 0
+        ;; port in BE: high byte at 4202, low byte at 4203
+        (i32.store8 (i32.const 4202)
+          (i32.and
+            (i32.shr_u (i32.wrap_i64 (local.get $dst_port)) (i32.const 8))
+            (i32.const 0xff)))
+        (i32.store8 (i32.const 4203)
+          (i32.and (i32.wrap_i64 (local.get $dst_port)) (i32.const 0xff)))
+        (i32.store8 (i32.const 4204) (i32.const 0x7f))
+        (i32.store8 (i32.const 4205) (i32.const 0x00))
+        (i32.store8 (i32.const 4206) (i32.const 0x00))
+        (i32.store8 (i32.const 4207) (i32.const 0x01))
+        (call $syscall
+          (i64.const 44)             ;; NR_SENDTO
+          (local.get $fd)
+          (i64.const 4096)           ;; buf
+          (i64.const 4)              ;; len
+          (i64.const 0)              ;; flags
+          (i64.const 4200)           ;; addr (sockaddr_in)
+          (i64.const 16)))           ;; addrlen
+    )
+"#;
+
+/// `sendto(fd)` — sends 4 bytes "ping" to a fixed destination
+/// (127.0.0.1:9999). Used to verify sendto to an unbound port fails
+/// or to a wrong-family peer (C2/C4 negative tests).
+const SENDTO_V4_FIXED_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (data (i32.const 4096) "ping")
+      (data (i32.const 4200)
+        "\02\00"                    ;; family = AF_INET (2)
+        "\27\0f"                    ;; port = 9999 BE
+        "\7f\00\00\01"              ;; addr = 127.0.0.1
+        "\00\00\00\00\00\00\00\00")
+      (func (export "go") (param $fd i64) (result i64)
+        (call $syscall
+          (i64.const 44)             ;; NR_SENDTO
+          (local.get $fd)
+          (i64.const 4096)
+          (i64.const 4)
+          (i64.const 0)
+          (i64.const 4200)
+          (i64.const 16)))
+    )
+"#;
+
+/// `recvfrom(fd)` — reads up to 32 bytes into guest buffer at 4096;
+/// writes source sockaddr_in at 4224 and addrlen at 4252. Returns the
+/// number of bytes read (or -errno).
+const RECVFROM_WAT: &str = r#"
+    (module
+      (import "kernel" "syscall"
+        (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "go") (param $fd i64) (result i64)
+        (call $syscall
+          (i64.const 45)             ;; NR_RECVFROM
+          (local.get $fd)
+          (i64.const 4096)           ;; buf
+          (i64.const 32)             ;; len
+          (i64.const 0)              ;; flags
+          (i64.const 4224)           ;; src addr (sockaddr_in)
+          (i64.const 4252)))         ;; addrlen ptr
+    )
+"#;
+
+// Helpers (extended for bind/getsockname/sendto/recvfrom) ------------------
 
 async fn call_bind_v4_ephemeral(
     linker: &wasmtime::Linker<Kernel>,
@@ -386,6 +476,49 @@ async fn call_getsockname(
 }
 
 async fn call_set_reuseaddr(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    module: &wasmtime::Module,
+    fd: i64,
+) -> Result<i64> {
+    let inst = linker.instantiate_async(&mut *store, module).await?;
+    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = inst.get_typed_func::<i64, i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, fd).await?)
+}
+
+async fn call_sendto_v4(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    module: &wasmtime::Module,
+    fd: i64,
+    dst_port: i64,
+) -> Result<i64> {
+    let inst = linker.instantiate_async(&mut *store, module).await?;
+    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = inst.get_typed_func::<(i64, i64), i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, (fd, dst_port)).await?)
+}
+
+async fn call_sendto_v4_fixed(
+    linker: &wasmtime::Linker<Kernel>,
+    store: &mut wasmtime::Store<Kernel>,
+    module: &wasmtime::Module,
+    fd: i64,
+) -> Result<i64> {
+    let inst = linker.instantiate_async(&mut *store, module).await?;
+    if let Some(mem) = inst.get_memory(&mut *store, "memory") {
+        store.data_mut().attach_memory(mem);
+    }
+    let f = inst.get_typed_func::<i64, i64>(&mut *store, "go")?;
+    Ok(f.call_async(&mut *store, fd).await?)
+}
+
+async fn call_recvfrom(
     linker: &wasmtime::Linker<Kernel>,
     store: &mut wasmtime::Store<Kernel>,
     module: &wasmtime::Module,
@@ -670,6 +803,170 @@ fn bind_v6_loopback_returns_ephemeral_port() -> Result<()> {
         );
 
         let _ = call_close(&linker, &mut store, &close, fd).await?;
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+// ===== C2: UDP sendto / recvfrom ===========================================
+
+fn read_n(store: &mut wasmtime::Store<Kernel>, ptr: u32, n: usize) -> Vec<u8> {
+    let mem = *store.data().memory().expect("memory attached");
+    let mut buf = vec![0u8; n];
+    mem.read(&mut *store, ptr as usize, &mut buf).unwrap();
+    buf
+}
+
+/// C2 — end-to-end: socket A on loopback ephemeral, send 4 bytes "ping"
+/// to socket B's bound port. B receives "ping" and gets A's source addr
+/// in the sockaddr writeback.
+#[test]
+fn sendto_then_recvfrom_roundtrips_over_loopback() -> Result<()> {
+    let (engine, linker) = common::engine_and_linker()?;
+    let sock = common::compile_wat(&engine, SOCKET_WAT)?;
+    let bind = common::compile_wat(&engine, BIND_V4_EPHEMERAL_WAT)?;
+    let gsn = common::compile_wat(&engine, GETSOCKNAME_WAT)?;
+    let snd = common::compile_wat(&engine, SENDTO_V4_WAT)?;
+    let rcv = common::compile_wat(&engine, RECVFROM_WAT)?;
+    let close = common::compile_wat(&engine, CLOSE_WAT)?;
+
+    block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let fd_a = call_socket(&linker, &mut store, &sock, 2, 2).await?;
+        let fd_b = call_socket(&linker, &mut store, &sock, 2, 2).await?;
+        assert_eq!(
+            call_bind_v4_ephemeral(&linker, &mut store, &bind, fd_a).await?,
+            0
+        );
+        assert_eq!(
+            call_bind_v4_ephemeral(&linker, &mut store, &bind, fd_b).await?,
+            0
+        );
+        // Discover B's port via getsockname (writes port BE to 4098).
+        assert_eq!(call_getsockname(&linker, &mut store, &gsn, fd_b).await?, 0);
+        let b_port = read_u16_be(&mut store, 4098);
+        assert!(b_port > 0, "B's ephemeral port must be non-zero");
+
+        // A sends 4 bytes "ping" to B.
+        let snd_r = call_sendto_v4(&linker, &mut store, &snd, fd_a, b_port as i64).await?;
+        assert_eq!(snd_r, 4, "sendto must return 4 bytes sent, got {snd_r}");
+
+        // B receives. recvfrom writes source sockaddr to 4224 and addrlen to 4252.
+        let rcv_n = call_recvfrom(&linker, &mut store, &rcv, fd_b).await?;
+        assert_eq!(
+            rcv_n, 4,
+            "recvfrom must return 4 bytes received, got {rcv_n}"
+        );
+        let got = read_n(&mut store, 4096, 4);
+        assert_eq!(got, b"ping", "received bytes must match sent bytes");
+        // Source port should be A's ephemeral port.
+        let src_port = read_u16_be(&mut store, 4226);
+        assert!(src_port > 0, "source port must be non-zero");
+        let addrlen = read_u32_le(&mut store, 4252);
+        assert_eq!(addrlen, 16, "addrlen must be 16 for sockaddr_in");
+
+        let _ = call_close(&linker, &mut store, &close, fd_a).await?;
+        let _ = call_close(&linker, &mut store, &close, fd_b).await?;
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// C2 — `sendto` on a fresh socket with no addr argument and no
+/// `connect()` returns -EDESTADDRREQ (the standard Linux behavior).
+#[test]
+fn sendto_without_addr_returns_edestaddrreq() -> Result<()> {
+    let (engine, linker) = common::engine_and_linker()?;
+    let sock = common::compile_wat(&engine, SOCKET_WAT)?;
+    let bind = common::compile_wat(&engine, BIND_V4_EPHEMERAL_WAT)?;
+    let close = common::compile_wat(&engine, CLOSE_WAT)?;
+
+    const SENDTO_NO_ADDR_WAT: &str = r#"
+        (module
+          (import "kernel" "syscall"
+            (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+          (memory (export "memory") 1)
+          (data (i32.const 4096) "ping")
+          (func (export "go") (param $fd i64) (result i64)
+            (call $syscall
+              (i64.const 44)
+              (local.get $fd)
+              (i64.const 4096)
+              (i64.const 4)
+              (i64.const 0)
+              (i64.const 0)
+              (i64.const 0))))
+    "#;
+    let snd_no_addr = common::compile_wat(&engine, SENDTO_NO_ADDR_WAT)?;
+
+    block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let fd = call_socket(&linker, &mut store, &sock, 2, 2).await?;
+        let _ = call_bind_v4_ephemeral(&linker, &mut store, &bind, fd).await?;
+        let r = call_sendto_v4_fixed(&linker, &mut store, &snd_no_addr, fd).await?;
+        assert_eq!(
+            r,
+            -edge_libos::errno::EDESTADDRREQ,
+            "sendto without addr/peer must return -EDESTADDRREQ, got {r}"
+        );
+
+        let _ = call_close(&linker, &mut store, &close, fd).await?;
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// C2 — `sendto` to a fresh unbound port (no listener) returns the
+/// byte count; UDP sendto on Linux is fire-and-forget.
+#[test]
+fn sendto_to_unbound_peer_succeeds() -> Result<()> {
+    let (engine, linker) = common::engine_and_linker()?;
+    let sock = common::compile_wat(&engine, SOCKET_WAT)?;
+    let bind = common::compile_wat(&engine, BIND_V4_EPHEMERAL_WAT)?;
+    let snd = common::compile_wat(&engine, SENDTO_V4_FIXED_WAT)?;
+    let close = common::compile_wat(&engine, CLOSE_WAT)?;
+
+    block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let fd = call_socket(&linker, &mut store, &sock, 2, 2).await?;
+        let _ = call_bind_v4_ephemeral(&linker, &mut store, &bind, fd).await?;
+        let snd_r = call_sendto_v4_fixed(&linker, &mut store, &snd, fd).await?;
+        assert_eq!(
+            snd_r, 4,
+            "sendto to unbound peer should still return byte count"
+        );
+        let _ = call_close(&linker, &mut store, &close, fd).await?;
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// C2 — `recvfrom` on a fresh, never-sent-to UDP socket blocks
+/// indefinitely. Coarse but load-bearing: if the recvfrom path is
+/// stubbed (returns immediately on empty queue), this test fails.
+/// `#[ignore]`'d by default; opt-in via `cargo test -- --ignored`.
+#[test]
+#[ignore = "long-running; run explicitly with --ignored"]
+fn recvfrom_blocks_when_no_packet() -> Result<()> {
+    use std::time::Duration;
+    let (engine, linker) = common::engine_and_linker()?;
+    let sock = common::compile_wat(&engine, SOCKET_WAT)?;
+    let bind = common::compile_wat(&engine, BIND_V4_EPHEMERAL_WAT)?;
+    let rcv = common::compile_wat(&engine, RECVFROM_WAT)?;
+    let _ = common::compile_wat(&engine, CLOSE_WAT)?;
+
+    block_on(async {
+        let mut store = edge_libos::build_store(&engine, Kernel::new(vec![], vec![]));
+        let fd = call_socket(&linker, &mut store, &sock, 2, 2).await?;
+        let _ = call_bind_v4_ephemeral(&linker, &mut store, &bind, fd).await?;
+
+        let join = tokio::spawn(async move { call_recvfrom(&linker, &mut store, &rcv, fd).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !join.is_finished(),
+            "recvfrom should be parked, not finished, after 50ms idle"
+        );
+        drop(join);
         Ok::<(), anyhow::Error>(())
     })?;
     Ok(())

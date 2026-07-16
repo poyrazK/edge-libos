@@ -151,6 +151,7 @@ expected_syscall() {
         snapshot)            echo "snapshot" ;;
         getaddrinfo_loopback)   echo "resolve" ;;
         getaddrinfo_eai_noname) echo "resolve" ;;
+        udp_loopback)           echo "socket" ;;
         *) echo "UNREGISTERED: $1" >&2; return 1 ;;
     esac
 }

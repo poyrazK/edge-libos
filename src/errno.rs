@@ -44,6 +44,7 @@ pub const EADDRNOTAVAIL: i64 = 99;
 pub const ENOTCONN: i64 = 107;
 pub const ETIMEDOUT: i64 = 110;
 pub const ECONNREFUSED: i64 = 111;
+pub const ECONNRESET: i64 = 104;
 pub const EISCONN: i64 = 106;
 pub const ENOTEMPTY: i64 = 39;
 pub const ENAMETOOLONG: i64 = 36;
